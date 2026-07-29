@@ -149,6 +149,10 @@ if os.environ.get("MEDIA_BACKEND", "local") == "s3":
             "BACKEND": "storages.backends.s3.S3Storage",
             "OPTIONS": {
                 "bucket_name": os.environ.get("AWS_STORAGE_BUCKET_NAME", ""),
+                # Optional key prefix inside the bucket (e.g. "drinkquiry" to
+                # share a bucket: <bucket>/drinkquiry/questions/images/...).
+                # Empty = bucket root. Signed URLs include it automatically.
+                "location": os.environ.get("AWS_S3_LOCATION", ""),
                 "endpoint_url": os.environ.get("AWS_S3_ENDPOINT_URL") or None,
                 "region_name": os.environ.get("AWS_S3_REGION_NAME") or None,
                 "access_key": os.environ.get("AWS_S3_ACCESS_KEY_ID")
