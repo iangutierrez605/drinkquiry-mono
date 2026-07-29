@@ -15,7 +15,12 @@
 	handle /ws/* {
 		reverse_proxy api:8000
 	}
-	handle /admin/* {
+	# /admin* (no slash before the wildcard) deliberately: Caddy's `/admin/*`
+	# matches /admin/ and deeper but NOT bare /admin, which would otherwise
+	# fall through to the SPA fallback and render a blank app shell. With
+	# this, bare /admin reaches Django, whose APPEND_SLASH redirects to
+	# /admin/ as usual.
+	handle /admin* {
 		reverse_proxy api:8000
 	}
 
