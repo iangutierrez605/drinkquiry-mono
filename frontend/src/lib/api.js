@@ -153,7 +153,7 @@ export const api = {
   bulkQuestions: (token, formData) =>
     request("/api/questions/bulk/", { method: "POST", authToken: token, formData }),
 
-  // ---- Moderation (staff only; Handoff #4 §F) ----
+  // ---- Moderation (staff only; Handoff #4 §F, extended by #8 §K) ----
   moderationCounts: (token) => request("/api/moderation/counts/", { authToken: token }),
   moderationList: (token, kind, status = "pending") =>
     allPages(`/api/moderation/${kind}/?status=${status}`, token), // kind: "categories" | "questions"
@@ -161,6 +161,25 @@ export const api = {
     request(`/api/moderation/${kind}/${id}/approve/`, { method: "POST", authToken: token }),
   moderationReject: (token, kind, id, note) =>
     request(`/api/moderation/${kind}/${id}/reject/`, { method: "POST", authToken: token, body: { note } }),
+  // §K1: near-duplicate review aid — fetched per card so the queue stays snappy.
+  moderationSimilar: (token, id) =>
+    request(`/api/moderation/questions/${id}/similar/`, { authToken: token }),
+  // §K2: the Flagged tab (open host reports, grouped per question) + resolve.
+  moderationFlags: (token) => request("/api/moderation/flags/", { authToken: token }),
+  moderationFlagResolve: (token, questionId, action, note) =>
+    request(`/api/moderation/flags/${questionId}/resolve/`, {
+      method: "POST",
+      authToken: token,
+      body: note ? { action, note } : { action },
+    }),
+  // §K2: any authenticated host flags a public question (409 if they already
+  // have one open on it; the question stays playable either way).
+  reportQuestion: (token, questionId, reason) =>
+    request(`/api/questions/${questionId}/report/`, {
+      method: "POST",
+      authToken: token,
+      body: reason ? { reason } : {},
+    }),
 
   // ---- Games ----
   createGame: (token, { mode, categories, questions_per_category }) =>
@@ -171,8 +190,17 @@ export const api = {
   // answer never rides a snapshot or WS payload before reveal (rule 5).
   gameAnswer: (token, code) => request(`/api/games/${code.toUpperCase()}/answer/`, { authToken: token }),
   // Game history + post-game report (Handoff #6 §G2), host's own games only.
+  // Since #8 §I the history rows include unfinished games too (status field).
   gameHistory: (token) => allPages("/api/games/history/", token),
   gameReport: (token, code) => request(`/api/games/${code.toUpperCase()}/report/`, { authToken: token }),
+  // §I (Handoff #8): re-issue the host's own seat token so a game can be
+  // resumed from a new browser/device. Knox-authed, host-only.
+  gameHostSeat: (token, code) => request(`/api/games/${code.toUpperCase()}/host-seat/`, { authToken: token }),
+  // §J3 (Handoff #8): host-private lobby preview (questions AND answers —
+  // never any part of a snapshot) + per-cell replace (lobby only, 409 after).
+  gameBoard: (token, code) => request(`/api/games/${code.toUpperCase()}/board/`, { authToken: token }),
+  replaceCell: (token, code, cellId) =>
+    request(`/api/games/${code.toUpperCase()}/cells/${cellId}/replace/`, { method: "POST", authToken: token }),
   joinGame: (code, name, participantToken) =>
     request(`/api/games/${code.toUpperCase()}/join/`, {
       method: "POST",

@@ -48,6 +48,20 @@ class Game(models.Model):
     # (a fresh cell always starts unrevealed) and close_cell.
     answer_revealed = models.BooleanField(default=False)
 
+    # §F (Handoff #8): the transient judgment marker behind the snapshot's
+    # `current_cell.last_judgment`. Set when the host judges a buzz; cleared
+    # (both fields) at every point the verdict stops being current: open_cell,
+    # close_cell, reset_buzzer, an explicit host open_buzzer, the NEXT buzz
+    # (a new team answering supersedes the old verdict on screen), and
+    # finish_game. Judge-wrong's automatic buzzer reopen does NOT clear it —
+    # that's the moment the "✘ WRONG" banner must be visible. Because it lives
+    # in the snapshot, WS boards, polling boards and phones all render it with
+    # no hook changes (§B4).
+    judged_participant = models.ForeignKey(
+        "Participant", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    judged_correct = models.BooleanField(null=True, blank=True)
+
     # Outcome, computed once at finish_game (Handoff #6 §G1) — never derived
     # on read. Empty for abandoned games (never finished) and for finished
     # games that had no players. Ties are real: every top-scoring player is in.
@@ -97,6 +111,12 @@ class BoardCell(models.Model):
         "Participant", null=True, blank=True, on_delete=models.SET_NULL, related_name="answered_cells"
     )
     answered_correctly = models.BooleanField(null=True, blank=True)
+    # §G (Handoff #8): one drink assignment per cell, server-enforced. The
+    # check-and-set happens inside services.assign_drink's transaction (row
+    # lock on the Game); a second attempt — from the winner's phone OR the
+    # host fallback — gets the structured `drinks_already_assigned` error.
+    # First assignment wins, whichever side it came from.
+    drinks_assigned = models.BooleanField(default=False)
 
     class Meta:
         ordering = ("column__position", "row")

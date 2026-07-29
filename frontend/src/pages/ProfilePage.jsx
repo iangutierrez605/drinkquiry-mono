@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { api, errorText } from "../lib/api";
 import { clearAuth, loadAuth } from "../lib/storage";
 import { ModerationLink, Toast, UsageMeterLine } from "../components/shared";
 
 const fmtMB = (bytes) => `${Math.round((bytes / 1024 / 1024) * 10) / 10} MB`;
-import { AuthScreen } from "./HostPage";
+import { AuthScreen, resumeHostGame } from "./HostPage";
 
 /**
  * /profile (Handoff #6 §G3): the signed-in host's identity + plan block and
@@ -136,7 +136,24 @@ function HistoryRow({ game, token, onToast }) {
   const [open, setOpen] = useState(false);
   const [report, setReport] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [resuming, setResuming] = useState(false);
+  const navigate = useNavigate();
   const finished = game.status === "finished";
+
+  // §I: unfinished games get Resume — the server re-issues the host seat
+  // token (works from a brand-new browser), we store it and land on /host,
+  // where the normal connect flow reattaches with state intact.
+  const resume = async (e) => {
+    e.stopPropagation();
+    setResuming(true);
+    try {
+      await resumeHostGame(token, game.code);
+      navigate("/host");
+    } catch (err) {
+      setResuming(false);
+      onToast(errorText(err));
+    }
+  };
 
   const toggle = useCallback(async () => {
     const next = !open;
@@ -172,6 +189,17 @@ function HistoryRow({ game, token, onToast }) {
         <span className="historyrow__winners">
           {game.winners.length > 0 ? `🏆 ${game.winners.join(" & ")}` : finished ? "no winner" : "—"}
         </span>
+        {!finished && (
+          <span
+            role="button"
+            tabIndex={0}
+            className="btn btn--gold btn--sm"
+            onClick={resume}
+            onKeyDown={(e) => e.key === "Enter" && resume(e)}
+          >
+            {resuming ? "Resuming…" : "▶ Resume"}
+          </span>
+        )}
       </button>
       {open && !finished && (
         <p className="footnote history__note">

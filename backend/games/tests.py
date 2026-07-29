@@ -21,8 +21,23 @@ from rest_framework.test import APITestCase
 from accounts.models import User
 from trivia.models import Category, Question
 
-from .models import Game, GameStatus, Participant, ParticipantRole
-from .services import ActionError, close_cell, create_game, finalize_game, open_cell, reveal_answer
+from rest_framework.exceptions import ValidationError as DRFValidationError
+
+from .models import BoardCell, BoardColumn, Game, GameStatus, Participant, ParticipantRole
+from .services import (
+    ActionError,
+    StructuredActionError,
+    assign_drink,
+    close_cell,
+    create_game,
+    finalize_game,
+    judge_buzz,
+    open_cell,
+    register_buzz,
+    reset_buzzer,
+    reveal_answer,
+    set_buzzer,
+)
 
 
 def seed_category(name: str, n_questions: int = 5) -> Category:
@@ -417,5 +432,412 @@ class JoinCapAndSoundTests(GameTestBase):
         self.assertIn("buzzer_sound", joined["participant"])
         snap = self.client.get(f"/api/games/{self.game.code}/").json()
         by_name = {p["name"]: p for p in snap["participants"]}
-        self.assertEqual(by_name["Team A"]["buzzer_sound"], 1)
+        # §H1 (Handoff #8): joins are uppercased server-side, so the snapshot
+        # carries "TEAM A" for a "Team A" join.
+        self.assertEqual(by_name["TEAM A"]["buzzer_sound"], 1)
         self.assertIn("buzzer_sound", by_name["Host"])  # host seat has one, never plays it
+
+
+# ---------------------------------------------------------------------------
+# Handoff #8 §F — judging performs the reveal; the snapshot judgment marker
+# ---------------------------------------------------------------------------
+class JudgmentFlowTests(GameTestBase):
+    def setUp(self):
+        self.game = make_game(self.host, mode="drinks", n=2)
+        self.c1, self.c2 = self.cells(self.game)
+        self.a, self.b = self.add_players(self.game, "TEAM A", "TEAM B")
+        open_cell(code=self.game.code, cell_id=self.c1.id)
+
+    def snapshot(self):
+        res = self.client.get(f"/api/games/{self.game.code}/")  # unauthenticated board path
+        self.assertEqual(res.status_code, 200)
+        return res.json()
+
+    def test_judge_correct_reveals_and_sets_marker(self):
+        judge_buzz(code=self.game.code, participant_id=self.b.id, correct=True)
+        snap = self.snapshot()
+        # The reveal arrives WITH the judgment — no separate reveal action —
+        # through the one sanctioned vehicle (revealed_answer, rule 5).
+        self.assertEqual(snap["revealed_answer"], self.c1.question.answer)
+        self.assertEqual(
+            snap["current_cell"]["last_judgment"],
+            {"participant_id": self.b.id, "name": "TEAM B", "correct": True},
+        )
+        self.assertFalse(snap["buzzer_open"])  # correct locks the buzzer, as before
+
+    def test_judge_wrong_does_not_reveal_and_marker_survives_the_auto_reopen(self):
+        judge_buzz(code=self.game.code, participant_id=self.a.id, correct=False)
+        snap = self.snapshot()
+        self.assertIsNone(snap["revealed_answer"])  # question still live for other teams
+        self.assertNotIn("SECRET-", json.dumps(snap))
+        self.assertEqual(
+            snap["current_cell"]["last_judgment"],
+            {"participant_id": self.a.id, "name": "TEAM A", "correct": False},
+        )
+        # Judge-wrong's automatic reopen must NOT clear the verdict — that's
+        # the moment the "✘ WRONG" banner is on screen.
+        self.assertTrue(snap["buzzer_open"])
+
+    def test_marker_clears_at_close_and_next_cell_opens_clean(self):
+        judge_buzz(code=self.game.code, participant_id=self.b.id, correct=True)
+        close_cell(code=self.game.code)
+        self.game.refresh_from_db()
+        self.assertIsNone(self.game.judged_participant_id)
+        self.assertIsNone(self.game.judged_correct)
+        open_cell(code=self.game.code, cell_id=self.c2.id)
+        snap = self.snapshot()
+        self.assertIsNone(snap["current_cell"]["last_judgment"])
+        self.assertIsNone(snap["revealed_answer"])  # reveal never outlives its cell either
+
+    def test_marker_clears_on_reset_buzzer(self):
+        judge_buzz(code=self.game.code, participant_id=self.a.id, correct=False)
+        reset_buzzer(code=self.game.code)
+        self.assertIsNone(self.snapshot()["current_cell"]["last_judgment"])
+
+    def test_marker_clears_on_explicit_host_reopen(self):
+        judge_buzz(code=self.game.code, participant_id=self.a.id, correct=False)
+        set_buzzer(code=self.game.code, is_open=True)
+        self.assertIsNone(self.snapshot()["current_cell"]["last_judgment"])
+
+    def test_marker_clears_when_the_next_team_buzzes(self):
+        judge_buzz(code=self.game.code, participant_id=self.a.id, correct=False)  # auto-reopens
+        register_buzz(code=self.game.code, participant=self.b)
+        snap = self.snapshot()
+        self.assertIsNone(snap["current_cell"]["last_judgment"])
+        self.assertEqual(snap["current_cell"]["buzzes"][0]["participant_id"], self.b.id)
+
+    def test_lock_buzzer_keeps_the_marker(self):
+        judge_buzz(code=self.game.code, participant_id=self.a.id, correct=False)
+        set_buzzer(code=self.game.code, is_open=False)  # host locks while the banner shows
+        self.assertIsNotNone(self.snapshot()["current_cell"]["last_judgment"])
+
+    def test_judge_correct_does_not_double_reveal(self):
+        reveal_answer(code=self.game.code)  # host revealed first ("nobody got it"... then someone did)
+        judge_buzz(code=self.game.code, participant_id=self.b.id, correct=True)
+        self.assertEqual(self.snapshot()["revealed_answer"], self.c1.question.answer)
+
+
+# ---------------------------------------------------------------------------
+# Handoff #8 §G — one drink assignment per cell, from either side
+# ---------------------------------------------------------------------------
+class DrinkAssignmentTests(GameTestBase):
+    def setUp(self):
+        self.game = make_game(self.host, mode="drinks", n=2)
+        self.c1, self.c2 = self.cells(self.game)
+        self.host_seat = Participant.objects.create(game=self.game, name="QUIZMASTER", role=ParticipantRole.HOST)
+        self.a, self.b = self.add_players(self.game, "TEAM A", "TEAM B")
+        open_cell(code=self.game.code, cell_id=self.c1.id)
+        judge_buzz(code=self.game.code, participant_id=self.b.id, correct=True)
+
+    def refresh(self, *objs):
+        for o in objs:
+            o.refresh_from_db()
+
+    def snapshot(self):
+        return self.client.get(f"/api/games/{self.game.code}/").json()
+
+    def test_winner_assigns_from_their_phone(self):
+        assign_drink(code=self.game.code, actor=self.b, target_participant_id=self.a.id)
+        self.refresh(self.a, self.b, self.c1)
+        self.assertEqual(self.a.drinks_taken, self.c1.value)
+        self.assertEqual(self.b.drinks_given, self.c1.value)
+        self.assertEqual(self.b.score, self.c1.value)  # credit side unchanged
+        self.assertTrue(self.c1.drinks_assigned)
+
+    def test_second_attempt_rejected_with_exact_structured_shape_both_paths(self):
+        assign_drink(code=self.game.code, actor=self.b, target_participant_id=self.a.id)
+        for actor in (self.b, self.host_seat):  # player path AND host fallback
+            with self.assertRaises(StructuredActionError) as ctx:
+                assign_drink(code=self.game.code, actor=actor, target_participant_id=self.a.id)
+            payload = ctx.exception.payload
+            self.assertEqual(set(payload), {"detail", "code"})  # lesson C4: exact shape
+            self.assertEqual(payload["code"], "drinks_already_assigned")
+        self.refresh(self.a)
+        self.assertEqual(self.a.drinks_taken, self.c1.value)  # tally unchanged by the rejects
+
+    def test_only_the_judged_correct_winner_may_give(self):
+        with self.assertRaises(ActionError):
+            assign_drink(code=self.game.code, actor=self.a, target_participant_id=self.b.id)
+        self.refresh(self.c1)
+        self.assertFalse(self.c1.drinks_assigned)
+
+    def test_host_fallback_consumes_the_same_marker(self):
+        assign_drink(code=self.game.code, actor=self.host_seat, target_participant_id=self.a.id)
+        with self.assertRaises(StructuredActionError):
+            assign_drink(code=self.game.code, actor=self.b, target_participant_id=self.a.id)
+
+    def test_host_seat_is_a_valid_target(self):
+        assign_drink(code=self.game.code, actor=self.b, target_participant_id=self.host_seat.id)
+        self.refresh(self.host_seat, self.b)
+        self.assertEqual(self.host_seat.drinks_taken, self.c1.value)
+        self.assertEqual(self.b.drinks_given, self.c1.value)
+
+    def test_self_assignment_allowed(self):
+        assign_drink(code=self.game.code, actor=self.b, target_participant_id=self.b.id)
+        self.refresh(self.b)
+        self.assertEqual(self.b.drinks_taken, self.c1.value)
+        self.assertEqual(self.b.drinks_given, self.c1.value)
+        self.assertEqual(self.b.score, self.c1.value)
+
+    def test_snapshot_carries_assigned_state_and_attribution(self):
+        pre = self.snapshot()["current_cell"]
+        self.assertFalse(pre["drinks_assigned"])
+        self.assertIsNone(pre["drink_assignment"])
+        assign_drink(code=self.game.code, actor=self.b, target_participant_id=self.host_seat.id)
+        cell = self.snapshot()["current_cell"]
+        self.assertTrue(cell["drinks_assigned"])
+        self.assertEqual(
+            cell["drink_assignment"],
+            {
+                "from_participant_id": self.b.id,
+                "from_name": "TEAM B",
+                "to_participant_id": self.host_seat.id,
+                "to_name": "QUIZMASTER",
+                "amount": self.c1.value,
+            },
+        )
+
+    def test_requires_a_judged_correct_current_cell(self):
+        close_cell(code=self.game.code)
+        with self.assertRaises(ActionError):
+            assign_drink(code=self.game.code, actor=self.b, target_participant_id=self.a.id)
+        open_cell(code=self.game.code, cell_id=self.c2.id)  # fresh cell, not judged yet
+        with self.assertRaises(ActionError):
+            assign_drink(code=self.game.code, actor=self.b, target_participant_id=self.a.id)
+
+    def test_points_mode_has_no_drinks(self):
+        game = make_game(self.host, mode="points", n=1)
+        cell = self.cells(game)[0]
+        a, b = self.add_players(game, "P1", "P2")
+        open_cell(code=game.code, cell_id=cell.id)
+        judge_buzz(code=game.code, participant_id=b.id, correct=True)
+        with self.assertRaises(ActionError):
+            assign_drink(code=game.code, actor=b, target_participant_id=a.id)
+
+
+# ---------------------------------------------------------------------------
+# Handoff #8 §H1 — team names are ALL CAPS, normalized server-side
+# ---------------------------------------------------------------------------
+class JoinNameNormalizationTests(GameTestBase):
+    def setUp(self):
+        self.game = make_game(self.host)
+
+    def join(self, name, token=None):
+        body = {"name": name}
+        if token:
+            body["participant_token"] = token
+        return self.client.post(f"/api/games/{self.game.code}/join/", body, format="json")
+
+    def test_join_uppercases_server_side(self):
+        res = self.join("quizzy mcguinness")
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertEqual(res.json()["participant"]["name"], "QUIZZY MCGUINNESS")
+        snap = self.client.get(f"/api/games/{self.game.code}/").json()
+        self.assertIn("QUIZZY MCGUINNESS", {p["name"] for p in snap["participants"]})
+
+    def test_case_variants_collide_as_the_same_name(self):
+        self.assertEqual(self.join("team a").status_code, 201)
+        res = self.join("TEAM A")
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("name", res.json())
+        res = self.join("Team A")  # and any other casing
+        self.assertEqual(res.status_code, 400)
+
+    def test_rejoin_by_token_for_preexisting_mixed_case_seat_still_200(self):
+        # Seats from games older than §H1 keep mixed-case names; rejoin is by
+        # token, never name equality, so nothing breaks.
+        legacy = Participant.objects.create(game=self.game, name="MiXeD CaSe")
+        res = self.join("anything at all", token=legacy.token)
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(res.json()["participant"]["id"], legacy.id)
+        self.assertEqual(res.json()["participant"]["name"], "MiXeD CaSe")
+
+
+# ---------------------------------------------------------------------------
+# Handoff #8 §I — resume: history lists unfinished games; host-seat recovery
+# ---------------------------------------------------------------------------
+class ResumeTests(GameTestBase):
+    def setUp(self):
+        self.lobby_game = make_game(self.host)
+        self.active_game = make_game(self.host)
+        Game.objects.filter(pk=self.active_game.pk).update(status=GameStatus.ACTIVE)
+        self.finished_game = make_game(self.host)
+        finalize_game(code=self.finished_game.code)
+        self.host_seat = Participant.objects.create(
+            game=self.lobby_game, name="Host", role=ParticipantRole.HOST
+        )
+
+    def test_history_includes_unfinished_games_flagged_by_status(self):
+        self.as_host()
+        res = self.client.get("/api/games/history/")
+        self.assertEqual(res.status_code, 200)
+        by_code = {g["code"]: g["status"] for g in res.json()["results"]}
+        self.assertEqual(by_code[self.lobby_game.code], "lobby")
+        self.assertEqual(by_code[self.active_game.code], "active")
+        self.assertEqual(by_code[self.finished_game.code], "finished")
+
+    def test_host_seat_recovery_returns_token_and_seat(self):
+        self.as_host()
+        res = self.client.get(f"/api/games/{self.lobby_game.code}/host-seat/")
+        self.assertEqual(res.status_code, 200, res.data)
+        body = res.json()
+        self.assertEqual(set(body), {"participant", "participant_token"})
+        self.assertEqual(body["participant_token"], self.host_seat.token)
+        self.assertEqual(body["participant"]["id"], self.host_seat.id)
+        self.assertEqual(body["participant"]["role"], "host")
+
+    def test_host_seat_recovery_is_host_private(self):
+        self.as_rival()
+        res = self.client.get(f"/api/games/{self.lobby_game.code}/host-seat/")
+        self.assertEqual(res.status_code, 403)
+        self.assertNotIn(self.host_seat.token, json.dumps(res.json()))
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.get(f"/api/games/{self.lobby_game.code}/host-seat/").status_code, 401)
+
+    def test_host_seat_recovery_unknown_code_404(self):
+        self.as_host()
+        self.assertEqual(self.client.get("/api/games/ZZZZ99/host-seat/").status_code, 404)
+
+
+# ---------------------------------------------------------------------------
+# Handoff #8 §J2 — the board draw prefers questions this host hasn't used
+# ---------------------------------------------------------------------------
+class DrawPreferenceTests(GameTestBase):
+    def uniform_category(self, name, n, difficulty=1):
+        cat = Category.objects.create(owner=None, name=name)
+        return cat, [
+            Question.objects.create(
+                category=cat, owner=None,
+                question_text=f"{name} question {i}?", answer=f"SECRET-{name}-{i}",
+                difficulty=difficulty,
+            )
+            for i in range(n)
+        ]
+
+    def question_ids(self, game):
+        return set(game.cells.values_list("question_id", flat=True))
+
+    def test_next_game_avoids_this_hosts_used_questions_when_alternatives_exist(self):
+        cat, questions = self.uniform_category("Prefer", 4)
+        first = create_game(host=self.host, mode="drinks", category_ids=[cat.id], questions_per_category=2)
+        used = self.question_ids(first)
+        second = create_game(host=self.host, mode="drinks", category_ids=[cat.id], questions_per_category=2)
+        # 2 of 4 used, 2 untouched: the next draw must take the untouched 2.
+        self.assertEqual(self.question_ids(second), {q.id for q in questions} - used)
+
+    def test_falls_back_to_repeats_when_no_alternatives(self):
+        cat, questions = self.uniform_category("Repeat", 2)
+        create_game(host=self.host, mode="drinks", category_ids=[cat.id], questions_per_category=2)
+        second = create_game(host=self.host, mode="drinks", category_ids=[cat.id], questions_per_category=2)
+        self.assertEqual(self.question_ids(second), {q.id for q in questions})
+
+    def test_other_hosts_usage_only_breaks_ties(self):
+        cat, (q1, q2, q3) = self.uniform_category("Global", 3)
+        # The rival used q1 and q2 in a game of their own (rows built directly
+        # so the setup is deterministic).
+        rival_game = Game.objects.create(host=self.rival, mode="drinks")
+        column = BoardColumn.objects.create(game=rival_game, category=cat, position=0)
+        BoardCell.objects.create(game=rival_game, column=column, question=q1, row=0, value=1)
+        BoardCell.objects.create(game=rival_game, column=column, question=q2, row=1, value=2)
+        # Our host has used nothing (host_uses ties at 0), so global usage is
+        # the tiebreak: the globally-untouched q3 must be on the board.
+        game = create_game(host=self.host, mode="drinks", category_ids=[cat.id], questions_per_category=2)
+        self.assertIn(q3.id, self.question_ids(game))
+
+    def test_shortage_contract_unchanged(self):
+        cat, _ = self.uniform_category("Short", 2)
+        with self.assertRaises(DRFValidationError) as ctx:
+            create_game(host=self.host, mode="drinks", category_ids=[cat.id], questions_per_category=3)
+        detail = ctx.exception.detail["categories"][0]
+        self.assertIn("'Short' only has 2 usable question(s); 3 required.", str(detail))
+
+    def test_difficulty_slotting_still_wins_over_preference(self):
+        # A used easy question still beats an unused hard one for the top row.
+        cat = Category.objects.create(owner=None, name="Slots")
+        easy = Question.objects.create(category=cat, owner=None, question_text="easy?", answer="A", difficulty=1)
+        hard = Question.objects.create(category=cat, owner=None, question_text="hard?", answer="B", difficulty=5)
+        prior = Game.objects.create(host=self.host, mode="drinks")
+        column = BoardColumn.objects.create(game=prior, category=cat, position=0)
+        BoardCell.objects.create(game=prior, column=column, question=easy, row=0, value=1)
+        game = create_game(host=self.host, mode="drinks", category_ids=[cat.id], questions_per_category=2)
+        rows = {c.row: c.question_id for c in game.cells.all()}
+        self.assertEqual(rows, {0: easy.id, 1: hard.id})
+
+
+# ---------------------------------------------------------------------------
+# Handoff #8 §J3 — host-private lobby board detail + per-cell replace
+# ---------------------------------------------------------------------------
+class BoardDetailAndReplaceTests(GameTestBase):
+    def setUp(self):
+        self.game = make_game(self.host, n=2)
+
+    def test_board_detail_gives_the_host_questions_and_answers(self):
+        self.as_host()
+        res = self.client.get(f"/api/games/{self.game.code}/board/")
+        self.assertEqual(res.status_code, 200, res.data)
+        cells = [c for col in res.json()["columns"] for c in col["cells"]]
+        self.assertEqual(len(cells), 2)
+        for cell in cells:
+            self.assertTrue(cell["question_text"])
+            self.assertIn("SECRET-", cell["answer"])
+            self.assertIn("question_id", cell)
+
+    def test_board_detail_never_leaks_to_non_hosts(self):
+        self.as_rival()
+        res = self.client.get(f"/api/games/{self.game.code}/board/")
+        self.assertEqual(res.status_code, 403)
+        self.assertNotIn("SECRET-", json.dumps(res.json()))
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.get(f"/api/games/{self.game.code}/board/").status_code, 401)
+
+    def test_replace_redraws_same_category_closest_difficulty_excluding_board(self):
+        cat = self.game.columns.first().category
+        # Two spares: one at the outgoing question's difficulty, one far away.
+        near = Question.objects.create(
+            category=cat, owner=None, question_text="near spare?", answer="SECRET-near", difficulty=1
+        )
+        Question.objects.create(
+            category=cat, owner=None, question_text="far spare?", answer="SECRET-far", difficulty=5
+        )
+        target = self.cells(self.game)[0]  # row 0 = difficulty 1 in seed_category
+        self.assertEqual(target.question.difficulty, 1)
+        on_board_before = set(self.game.cells.values_list("question_id", flat=True))
+        self.as_host()
+        res = self.client.post(f"/api/games/{self.game.code}/cells/{target.id}/replace/")
+        self.assertEqual(res.status_code, 200, res.data)
+        body = res.json()
+        self.assertEqual(body["id"], target.id)
+        self.assertEqual(body["question_id"], near.id)  # closest difficulty wins
+        self.assertNotIn(body["question_id"], on_board_before)
+        target.refresh_from_db()
+        self.assertEqual(target.question_id, near.id)
+
+    def test_replace_409_when_category_has_nothing_left(self):
+        target = self.cells(self.game)[0]  # seed_category made exactly n questions; all on board
+        self.as_host()
+        res = self.client.post(f"/api/games/{self.game.code}/cells/{target.id}/replace/")
+        self.assertEqual(res.status_code, 409)
+        self.assertIn("detail", res.json())
+
+    def test_replace_409_after_start(self):
+        Question.objects.create(
+            category=self.game.columns.first().category, owner=None,
+            question_text="spare?", answer="SECRET-spare", difficulty=1,
+        )
+        Game.objects.filter(pk=self.game.pk).update(status=GameStatus.ACTIVE)
+        target = self.cells(self.game)[0]
+        self.as_host()
+        res = self.client.post(f"/api/games/{self.game.code}/cells/{target.id}/replace/")
+        self.assertEqual(res.status_code, 409)
+        self.assertIn("started", res.json()["detail"])
+
+    def test_replace_is_host_private(self):
+        target = self.cells(self.game)[0]
+        self.as_rival()
+        self.assertEqual(
+            self.client.post(f"/api/games/{self.game.code}/cells/{target.id}/replace/").status_code, 403
+        )
+        self.client.force_authenticate(None)
+        self.assertEqual(
+            self.client.post(f"/api/games/{self.game.code}/cells/{target.id}/replace/").status_code, 401
+        )

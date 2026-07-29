@@ -29,7 +29,16 @@ class CellSerializer(serializers.ModelSerializer):
 
 
 class OpenCellSerializer(serializers.ModelSerializer):
-    """The currently open cell, with question content (never the answer)."""
+    """The currently open cell, with question content (never the answer).
+
+    Handoff #8: also carries §F's `last_judgment` and §G's drink state
+    (`drinks_assigned` + `drink_assignment`) — snapshot fields, so WS boards,
+    polling boards and phones all render them with zero hook changes (§B4),
+    and every button's enabled/disabled state derives from here (rule 1).
+    Deliberately still NO question id: an authenticated user could resolve a
+    question id to its answer via /api/questions/, so exposing it mid-game
+    would be a rule-5 side door. The host gets ids through the host-private
+    answer/board endpoints instead."""
 
     question_text = serializers.CharField(source="question.question_text", read_only=True)
     media_type = serializers.CharField(source="question.media_type", read_only=True)
@@ -37,10 +46,51 @@ class OpenCellSerializer(serializers.ModelSerializer):
     audio = serializers.FileField(source="question.audio", read_only=True)
     video = serializers.FileField(source="question.video", read_only=True)
     buzzes = BuzzSerializer(many=True, read_only=True)
+    last_judgment = serializers.SerializerMethodField()
+    drink_assignment = serializers.SerializerMethodField()
 
     class Meta:
         model = BoardCell
-        fields = ("id", "row", "value", "state", "question_text", "media_type", "image", "audio", "video", "buzzes")
+        fields = (
+            "id", "row", "value", "state", "question_text", "media_type", "image", "audio", "video",
+            "buzzes", "last_judgment", "drinks_assigned", "drink_assignment",
+        )
+
+    def _game(self, cell):
+        # Nested use (the normal case): the root serializer's instance IS the
+        # game — no extra query. Standalone fallback: the cell's own FK.
+        root_instance = getattr(self.root, "instance", None)
+        return root_instance if isinstance(root_instance, Game) else cell.game
+
+    def get_last_judgment(self, cell):
+        """§F: {"participant_id", "name", "correct"} while a verdict is
+        current, else null. Storage is Game.judged_* (cleared on open/close/
+        reset/explicit reopen/next buzz), so it is inherently scoped to the
+        cell being shown."""
+        game = self._game(cell)
+        if game.judged_participant_id is None or game.judged_correct is None:
+            return None
+        participant = game.judged_participant
+        return {"participant_id": participant.id, "name": participant.name, "correct": game.judged_correct}
+
+    def get_drink_assignment(self, cell):
+        """§G attribution for the board line ("TEAM A sends a drink to THE
+        HOST 🍺"): the cell's assignment, or null. Oldest first so legacy
+        games that pre-date the once-per-cell rule show their first one."""
+        assignment = (
+            cell.drink_assignments.select_related("from_participant", "to_participant")
+            .order_by("created_at", "id")
+            .first()
+        )
+        if assignment is None:
+            return None
+        return {
+            "from_participant_id": assignment.from_participant_id,
+            "from_name": assignment.from_participant.name,
+            "to_participant_id": assignment.to_participant_id,
+            "to_name": assignment.to_participant.name,
+            "amount": assignment.amount,
+        }
 
 
 class ColumnSerializer(serializers.ModelSerializer):
@@ -167,3 +217,40 @@ class GameReportSerializer(serializers.ModelSerializer):
     def get_winners(self, game):
         # ids + names so the frontend can highlight rows without name-matching.
         return [{"id": w.id, "name": w.name} for w in game.winners.all()]
+
+
+# --- Host-private lobby board detail (Handoff #8 §J3) -----------------------
+# GET /api/games/{code}/board/ — the host previewing THEIR OWN board before
+# starting, with question text + answer + question id per cell (the id feeds
+# the Replace and flag actions). Host-only over Knox, exactly the §F1
+# answer-endpoint pattern extended to the whole board; rule 5 holds because
+# nothing here ever rides the public snapshot or a WS payload.
+
+
+class BoardDetailCellSerializer(serializers.ModelSerializer):
+    question_id = serializers.IntegerField(read_only=True)
+    question_text = serializers.CharField(source="question.question_text", read_only=True)
+    answer = serializers.CharField(source="question.answer", read_only=True)
+    difficulty = serializers.IntegerField(source="question.difficulty", read_only=True)
+    media_type = serializers.CharField(source="question.media_type", read_only=True)
+
+    class Meta:
+        model = BoardCell
+        fields = ("id", "row", "value", "state", "question_id", "question_text", "answer", "difficulty", "media_type")
+
+
+class BoardDetailColumnSerializer(serializers.ModelSerializer):
+    category_name = serializers.CharField(source="category.name", read_only=True)
+    cells = BoardDetailCellSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = BoardColumn
+        fields = ("id", "position", "category_name", "cells")
+
+
+class BoardDetailSerializer(serializers.ModelSerializer):
+    columns = BoardDetailColumnSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Game
+        fields = ("code", "mode", "status", "questions_per_category", "columns")

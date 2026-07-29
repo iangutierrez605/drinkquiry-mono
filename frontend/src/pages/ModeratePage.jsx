@@ -108,7 +108,7 @@ function Shell({ user, children }) {
 /* ---------------- Queue ---------------- */
 
 function ReviewQueue({ auth, profile }) {
-  const [tab, setTab] = useState("questions"); // "questions" | "categories"
+  const [tab, setTab] = useState("questions"); // "questions" | "categories" | "flagged"
   const [items, setItems] = useState(null); // pending items for the active tab
   const [counts, setCounts] = useState(null);
   const [loadError, setLoadError] = useState(null);
@@ -116,8 +116,12 @@ function ReviewQueue({ auth, profile }) {
 
   const refresh = useCallback(async () => {
     try {
+      // §K2: the Flagged tab has its own endpoint; the counts payload keeps
+      // its pinned pre-#8 shape, so the tab count comes from the list itself.
       const [list, c] = await Promise.all([
-        api.moderationList(auth.token, tab),
+        tab === "flagged"
+          ? api.moderationFlags(auth.token).then((r) => r.results)
+          : api.moderationList(auth.token, tab),
         api.moderationCounts(auth.token),
       ]);
       setItems(list);
@@ -156,21 +160,28 @@ function ReviewQueue({ auth, profile }) {
         <button className={`tab ${tab === "categories" ? "tab--on" : ""}`} onClick={() => setTab("categories")}>
           Categories{counts ? ` (${counts.categories})` : ""}
         </button>
+        <button className={`tab ${tab === "flagged" ? "tab--on" : ""}`} onClick={() => setTab("flagged")}>
+          Flagged{items && tab === "flagged" ? ` (${items.length})` : ""}
+        </button>
       </div>
 
       {loadError && <p className="formerror formerror--block">{loadError}</p>}
       {!items && !loadError && <p>Loading the queue…</p>}
       {items?.length === 0 && (
         <section className="panel panel--center">
-          <p className="footnote">Nothing pending — the chalkboard is clean. 🧽</p>
+          <p className="footnote">
+            {tab === "flagged" ? "No open flags — the regulars approve. 🍻" : "Nothing pending — the chalkboard is clean. 🧽"}
+          </p>
         </section>
       )}
 
       {items?.map((item) =>
         tab === "questions" ? (
           <QuestionCard key={item.id} auth={auth} item={item} onActed={onActed} onConflict={onConflict} onToast={setToast} />
-        ) : (
+        ) : tab === "categories" ? (
           <CategoryCard key={item.id} auth={auth} item={item} onActed={onActed} onConflict={onConflict} onToast={setToast} />
+        ) : (
+          <FlaggedCard key={item.id} auth={auth} item={item} onActed={onActed} onConflict={onConflict} onToast={setToast} />
         ),
       )}
 
@@ -253,6 +264,7 @@ function QuestionCard({ auth, item, onActed, onConflict, onToast }) {
         <span className="modcard__cat">{item.category_name}</span>
         <span>difficulty {item.difficulty}</span>
         <span>{item.visibility}</span>
+        {item.usage_count != null && <UsageBadge count={item.usage_count} />}
         <Owner item={item} />
         <span className="modcard__when">{new Date(item.created_at).toLocaleString()}</span>
       </div>
@@ -268,6 +280,7 @@ function QuestionCard({ auth, item, onActed, onConflict, onToast }) {
       {item.media_type === "video" && item.video && (
         <video className="qmedia qmedia--video" src={mediaUrl(item.video)} controls />
       )}
+      <SimilarMatches auth={auth} questionId={item.id} />
       <ReviewActions auth={auth} kind="questions" item={item} onActed={onActed} onConflict={onConflict} onToast={onToast} />
     </section>
   );
@@ -279,6 +292,7 @@ function CategoryCard({ auth, item, onActed, onConflict, onToast }) {
       <div className="modcard__meta">
         <span>category</span>
         <span>{item.visibility}</span>
+        {item.usage_count != null && <UsageBadge count={item.usage_count} noun="game" />}
         <Owner item={item} />
         <span className="modcard__when">{new Date(item.created_at).toLocaleString()}</span>
       </div>
@@ -292,6 +306,138 @@ function CategoryCard({ auth, item, onActed, onConflict, onToast }) {
         reviewed separately on the other tab.
       </p>
       <ReviewActions auth={auth} kind="categories" item={item} onActed={onActed} onConflict={onConflict} onToast={onToast} />
+    </section>
+  );
+}
+
+
+/** §J1: "used in N games / questions asked N times" chip on review cards. */
+function UsageBadge({ count, noun = "time" }) {
+  return (
+    <span className="usagebadge" title="How often this has appeared in games (all hosts)">
+      🎲 {noun === "game" ? `in ${count} game${count === 1 ? "" : "s"}` : `played ${count} ${noun}${count === 1 ? "" : "s"}`}
+    </span>
+  );
+}
+
+/**
+ * §K1: nearest existing approved questions, fetched per card (its own
+ * endpoint keeps the queue list snappy). A review AID — nothing here acts.
+ */
+function SimilarMatches({ auth, questionId }) {
+  const [similar, setSimilar] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    api
+      .moderationSimilar(auth.token, questionId)
+      .then((r) => alive && setSimilar(r.similar))
+      .catch(() => alive && setSimilar([])); // the aid is optional; approve/reject still work
+    return () => {
+      alive = false;
+    };
+  }, [auth.token, questionId]);
+
+  if (!similar) return <p className="footnote">Checking for lookalikes…</p>;
+  if (similar.length === 0) return <p className="footnote">No similar approved questions found. ✨</p>;
+  return (
+    <div className="similar">
+      <span className="similar__title">Possible duplicates already approved:</span>
+      <ul className="similar__list">
+        {similar.map((m) => (
+          <li key={m.id} className="similar__row">
+            <span className="similar__score">{Math.round(m.score * 100)}%</span>
+            <span className="similar__text">
+              {m.question_text} <em className="similar__answer">→ {m.answer}</em>
+            </span>
+            <span className="similar__usage">
+              {m.category_name} · played {m.usage_count}×
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/**
+ * §K2: one flagged question in the "Flagged" tab — the question with its
+ * open reports, §J1 usage and §K1 lookalikes, resolved by Dismiss (keep) or
+ * Reject-with-note. The copy documents what rejection actually does; games
+ * already containing the question keep their copy.
+ */
+function FlaggedCard({ auth, item, onActed, onConflict, onToast }) {
+  const [rejecting, setRejecting] = useState(false);
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const resolve = async (action, resolveNote) => {
+    setBusy(true);
+    try {
+      await api.moderationFlagResolve(auth.token, item.id, action, resolveNote);
+      onActed(item.id, action === "dismiss" ? "Flags dismissed — the question stays." : "Rejected — unlisted from public play.");
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409) onConflict(item.id);
+      else onToast(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="panel modcard modcard--flagged">
+      <div className="modcard__meta">
+        <span className="modcard__cat">{item.category_name}</span>
+        <span className="flagcount">🚩 {item.report_count} open flag{item.report_count === 1 ? "" : "s"}</span>
+        <span className={`modbadge modbadge--${item.moderation_status}`}>{item.moderation_status}</span>
+        {item.usage_count != null && <UsageBadge count={item.usage_count} />}
+        <Owner item={item} />
+      </div>
+      <p className="modcard__q">{item.question_text}</p>
+      <p className="modcard__a">
+        Answer: <strong>{item.answer}</strong>
+      </p>
+      <ul className="flagreasons">
+        {item.reports.map((r) => (
+          <li key={r.id}>
+            <strong>{r.reporter_display_name || r.reporter_email}</strong>
+            {r.reason ? `: ${r.reason}` : " (no reason given)"}
+          </li>
+        ))}
+      </ul>
+      <SimilarMatches auth={auth} questionId={item.id} />
+      {rejecting ? (
+        <div className="modcard__reject">
+          <label className="field">
+            Why is this being rejected? <span className="field__hint">(the owner sees this note)</span>
+            <textarea value={note} onChange={(e) => setNote(e.target.value)} rows={2} maxLength={500} autoFocus />
+          </label>
+          <div className="modcard__actions">
+            <button
+              className="btn btn--danger btn--sm"
+              disabled={busy || !note.trim()}
+              onClick={() => resolve("reject", note.trim())}
+            >
+              {busy ? "Rejecting…" : "Reject with note"}
+            </button>
+            <button className="btn btn--ghost btn--sm" disabled={busy} onClick={() => setRejecting(false)}>
+              Cancel
+            </button>
+          </div>
+          <p className="footnote">
+            Rejecting unlists it from public categories and future game builds. Games already built
+            keep their copy of the question.
+          </p>
+        </div>
+      ) : (
+        <div className="modcard__actions">
+          <button className="btn btn--good btn--sm" disabled={busy} onClick={() => resolve("dismiss")}>
+            {busy ? "Working…" : "Dismiss flags (keep it)"}
+          </button>
+          <button className="btn btn--ghost btn--sm" disabled={busy} onClick={() => setRejecting(true)}>
+            Reject…
+          </button>
+        </div>
+      )}
     </section>
   );
 }

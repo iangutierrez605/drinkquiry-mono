@@ -140,3 +140,48 @@ class Question(ModeratedContentMixin):
 
     def __str__(self):
         return self.question_text[:80]
+
+
+class ReportStatus(models.TextChoices):
+    OPEN = "open", "Open"
+    RESOLVED = "resolved", "Resolved"
+
+
+class QuestionReport(models.Model):
+    """§K2 (Handoff #8): a host flags a public question as "not good".
+
+    Filing a report never touches the question's moderation_status — the
+    question stays listed and playable until a moderator acts (that's the
+    feature's explicit ask). Moderators work reports from the /moderate
+    "Flagged" tab: dismiss (keep the question, resolve the reports) or reject
+    it with a note via the same field semantics the pending-queue reject uses
+    (moderation_status=rejected + moderation_note), which unlists it from
+    public categories and future game builds; games already built keep their
+    copy (cells hold a PROTECT FK and snapshots serialize the text
+    regardless of status).
+
+    The partial unique constraint (one OPEN report per question per reporter)
+    is the trivial rate limiter: re-flagging while a report is open is a 409;
+    once resolved, a host may flag again if the problem persists.
+    """
+
+    question = models.ForeignKey(Question, on_delete=models.CASCADE, related_name="reports")
+    reporter = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="question_reports"
+    )
+    reason = models.TextField(blank=True)
+    status = models.CharField(max_length=10, choices=ReportStatus.choices, default=ReportStatus.OPEN)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("created_at", "id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["question", "reporter"],
+                condition=models.Q(status="open"),
+                name="one_open_report_per_question_reporter",
+            ),
+        ]
+
+    def __str__(self):
+        return f"Report on Q{self.question_id} by {self.reporter_id} ({self.status})"

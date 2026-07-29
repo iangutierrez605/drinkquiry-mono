@@ -102,12 +102,17 @@ function JoinForm({ code, existing, onJoined, onDropSeat }) {
       >
         <label className="field">
           Team name
+          {/* §H1: caps in the VALUE (not just the rendering) via
+              toUpperCase() here, plus text-transform in CSS so it looks
+              right even mid-composition. The server normalizes again —
+              this is cosmetic (rule 4). */}
           <input
+            className="capsinput"
             value={name}
-            onChange={(e) => setName(e.target.value)}
+            onChange={(e) => setName(e.target.value.toUpperCase())}
             required
             maxLength={50}
-            placeholder="e.g. Quizzy McGuinness"
+            placeholder="e.g. QUIZZY MCGUINNESS"
             autoFocus
           />
         </label>
@@ -151,6 +156,14 @@ function BuzzerLive({ code, seat, onBadSeat }) {
     [game, seat.participantId],
   );
   const cell = game?.current_cell;
+  // §F/§G: everything below derives from the snapshot (rule 1) — the verdict
+  // marker, the once-per-cell assigned flag, and the winner check all come
+  // from server state; the server re-validates every give_drink (rule 4).
+  const judgment = cell?.last_judgment ?? null;
+  const iWon = judgment?.correct === true && judgment.participant_id === seat.participantId;
+  const iWhiffed = judgment?.correct === false && judgment.participant_id === seat.participantId;
+  const canGiveDrink =
+    game?.mode === "drinks" && iWon && cell && !cell.drinks_assigned && game.status === "active";
   const buzzes = cell?.buzzes ?? [];
   const myBuzzIndex = buzzes.findIndex((b) => b.participant_id === seat.participantId);
   const alreadyBuzzed = myBuzzIndex >= 0;
@@ -228,7 +241,46 @@ function BuzzerLive({ code, seat, onBadSeat }) {
         </button>
       </div>
 
-      {cell && buzzes.length > 0 && (
+      {judgment && (
+        <div className={`buzzverdict ${judgment.correct ? "buzzverdict--right" : "buzzverdict--wrong"}`}>
+          {iWon
+            ? "You got it! 🎉"
+            : iWhiffed
+              ? "Wrong — drink's coming 🍻"
+              : judgment.correct
+                ? `${judgment.name} got it`
+                : `${judgment.name} whiffed — buzz in!`}
+        </div>
+      )}
+
+      {canGiveDrink && (
+        <div className="drinkpick">
+          <h2 className="h2 drinkpick__title">Who drinks {cell.value} 🍺? Your call.</h2>
+          <div className="drinkpick__btns">
+            {game.participants.map((p) => (
+              <button
+                key={p.id}
+                type="button"
+                className="btn btn--drink"
+                onClick={() => send("give_drink", { target_participant_id: p.id })}
+              >
+                🍺 {p.id === seat.participantId ? `${p.name} (us!)` : p.role === "host" ? `${p.name} (the host)` : p.name}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {cell?.drink_assignment && (
+        <p className="buzzdrinkline">
+          {cell.drink_assignment.from_name} sends {cell.drink_assignment.amount} 🍺 to{" "}
+          {cell.drink_assignment.to_participant_id === seat.participantId
+            ? "YOU — drink up!"
+            : cell.drink_assignment.to_name}
+        </p>
+      )}
+
+      {cell && buzzes.length > 0 && !judgment && (
         <ol className="buzzorder">
           {buzzes.map((b, i) => (
             <li key={b.participant_id} className={b.participant_id === seat.participantId ? "buzzorder--self" : ""}>

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
+import { QRCodeSVG } from "qrcode.react";
 import { api } from "../lib/api";
 import { loadSeat } from "../lib/storage";
 import { useGameSocket } from "../lib/useGameSocket";
@@ -117,6 +118,11 @@ export default function BoardPage() {
 
   const cell = game.current_cell;
   const players = game.participants.filter((p) => p.role === "player");
+  const hostSeat = game.participants.find((p) => p.role === "host");
+  // §F: verdict straight from the snapshot (rule 1) — WS and polling boards
+  // both get it, since it's a snapshot field, not an event.
+  const judgment = cell?.last_judgment ?? null;
+  const verdictOnScreen = judgment != null || revealedAnswer != null;
 
   return (
     <div className={`tv ${flash ? "tv--flash" : ""}`}>
@@ -144,6 +150,20 @@ export default function BoardPage() {
         <div className="tv__lobby">
           <p className="tv__lede">Grab a phone per team and join with code</p>
           <div className="tv__bigcode">{game.code}</div>
+          {/* §H4: QR straight to this game's buzzer page. Origin-derived —
+              never a hardcoded domain — and rendered locally (SVG, no network
+              calls) on a white tile with quiet-zone padding so it scans from
+              a couch against the chalkboard background. */}
+          <div className="tv__qr" aria-label="Scan to join as a buzzer">
+            <QRCodeSVG
+              value={`${window.location.origin}/game/buzzer/${game.code}`}
+              size={172}
+              marginSize={2}
+              bgColor="#ffffff"
+              fgColor="#1e2621"
+            />
+            <span className="tv__qrhint">scan to grab a buzzer</span>
+          </div>
           <p className="tv__teamcount">
             {players.length}
             {game.max_players ? `/${game.max_players}` : ""} teams
@@ -166,18 +186,37 @@ export default function BoardPage() {
 
       {game.status === "active" && cell && (
         <div className="tv__question">
+          {/* §F: with a verdict (or a revealed answer) on screen, the board
+              LEADS with it and the buzzer-lock chip disappears entirely — no
+              green→red flash stealing the moment (the lock is implied). The
+              verdict + answer render before the question text so the payoff
+              owns the top of the screen. */}
+          {judgment && (
+            <div className={`tv__verdict ${judgment.correct ? "tv__verdict--right" : "tv__verdict--wrong"}`}>
+              {judgment.correct ? "✔ CORRECT" : "✘ WRONG"} — {judgment.name}
+            </div>
+          )}
+          {revealedAnswer != null && <div className="tv__answer">{revealedAnswer}</div>}
           <div className="tv__qtop">
             <span className="valuechip valuechip--tv">
               {game.mode === "drinks" ? `${cell.value} DRINKS` : `${cell.value} POINTS`}
             </span>
-            <span className={`buzzstate buzzstate--tv ${game.buzzer_open ? "buzzstate--open" : "buzzstate--locked"}`}>
-              {game.buzzer_open ? "🟢 BUZZERS OPEN" : "🔒 BUZZERS LOCKED"}
-            </span>
+            {!verdictOnScreen && (
+              <span className={`buzzstate buzzstate--tv ${game.buzzer_open ? "buzzstate--open" : "buzzstate--locked"}`}>
+                {game.buzzer_open ? "🟢 BUZZERS OPEN" : "🔒 BUZZERS LOCKED"}
+              </span>
+            )}
           </div>
           <p className="tv__qtext">{cell.question_text}</p>
           <MediaBlock cell={cell} autoPlay />
-          {revealedAnswer != null && <div className="tv__answer">{revealedAnswer}</div>}
-          {cell.buzzes.length > 0 && (
+          {/* §G attribution: who sent the drink where. */}
+          {cell.drink_assignment && (
+            <div className="tv__drinkline">
+              {cell.drink_assignment.from_name} sends {cell.drink_assignment.amount}{" "}
+              drink{cell.drink_assignment.amount === 1 ? "" : "s"} to {cell.drink_assignment.to_name} 🍺
+            </div>
+          )}
+          {!verdictOnScreen && cell.buzzes.length > 0 && (
             <ol className="tv__buzzes">
               {cell.buzzes.map((b, i) => (
                 <li key={b.participant_id}>
@@ -192,6 +231,15 @@ export default function BoardPage() {
       {game.status === "finished" && <FinalStandings game={game} />}
 
       <footer className="tv__scores">
+        {/* §G: the host is a valid drink target — show them in DRINK tallies
+            (labeled, only once they've actually taken one) but never in
+            score displays. */}
+        {game.mode === "drinks" && hostSeat && hostSeat.drinks_taken > 0 && (
+          <div className="tv__score tv__score--host">
+            <span className="tv__scorename">🎤 {hostSeat.name}</span>
+            <span className="tv__scoreval tv__scoreval--drinks">→🍻{hostSeat.drinks_taken}</span>
+          </div>
+        )}
         {players.map((p) => (
           <div key={p.id} className="tv__score">
             <span className="tv__scorename">{p.name}</span>

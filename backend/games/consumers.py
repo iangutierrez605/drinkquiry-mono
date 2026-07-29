@@ -5,6 +5,10 @@ Connect: ws://host/ws/game/<CODE>/?token=<participant_token>
 Client -> server actions (JSON {"action": ..., ...}):
   player:
     buzz                       — register a buzz for the open question
+    give_drink {target_participant_id}
+                               — §G (Handoff #8): the winning team assigns
+                                 the drink from their phone; any seat (host
+                                 included, themselves included) is a target
   host only:
     start_game                 — lobby -> active
     open_cell {cell_id}        — reveal a question; buzzer stays LOCKED
@@ -13,9 +17,11 @@ Client -> server actions (JSON {"action": ..., ...}):
     reset_buzzer               — clear buzzes for current cell and re-lock
     reveal_answer              — send answer text to host + board screens
     judge {participant_id, correct}
-                               — mark the first (or chosen) buzzer right/wrong
+                               — mark the first (or chosen) buzzer right/wrong;
+                                 §F: judging CORRECT also performs the reveal
     assign_drinks {to_participant_id}
-                               — winner makes another team drink cell.value
+                               — host fallback for give_drink (same
+                                 once-per-cell marker; first assignment wins)
     close_cell                 — return to board (marks cell answered)
     finish_game
 
@@ -23,31 +29,36 @@ Server -> clients events:
   state          — full snapshot (sent on connect and after every mutation)
   buzz           — incremental: someone buzzed {participant_id, name, order}
   answer_reveal  — {answer} (host action)
-  error          — {detail}
+  error          — {detail} (+ {code} for documented structured errors, e.g.
+                   §G's {"detail", "code": "drinks_already_assigned"})
 
 Design note: every mutation persists to the DB first, then a fresh snapshot is
 broadcast. Clients are dumb renderers of state, so reloads/reconnects are
 automatically consistent (requirement: "if a user reloads we don't want all
-data lost").
+data lost"). Handoff #8 moved the last inline mutation bodies (buzz, judge,
+buzzer open/lock/reset, drinks) into games/services.py so the suite exercises
+exactly what the socket runs.
 """
 import json
 
 from channels.db import database_sync_to_async
 from channels.generic.websocket import AsyncJsonWebsocketConsumer
-from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from .models import (
-    Buzz,
-    DrinkAssignment,
-    Game,
-    GameMode,
-    GameStatus,
-    Participant,
-    ParticipantRole,
-)
+from .models import Game, GameStatus, Participant, ParticipantRole
 from .serializers import GameStateSerializer
-from .services import ActionError, close_cell, finalize_game, open_cell, reveal_answer
+from .services import (
+    ActionError,
+    assign_drink,
+    close_cell,
+    finalize_game,
+    judge_buzz,
+    open_cell,
+    register_buzz,
+    reset_buzzer,
+    reveal_answer,
+    set_buzzer,
+)
 
 
 class GameConsumer(AsyncJsonWebsocketConsumer):
@@ -101,6 +112,13 @@ class GameConsumer(AsyncJsonWebsocketConsumer):
                         },
                     },
                 )
+            elif action == "give_drink":
+                # §G: player-initiated. assign_drink validates that the sender
+                # is the cell's judged-correct winner (the host seat comes in
+                # via assign_drinks below but would pass too) and that the cell
+                # is current + correct + not yet assigned (rule 4: the server
+                # is the gate; the phone's disabled states are cosmetic).
+                await self._assign_drink(content.get("target_participant_id"))
             elif not is_host:
                 await self.send_json({"type": "error", "detail": "Host-only action."})
                 return
@@ -126,9 +144,13 @@ class GameConsumer(AsyncJsonWebsocketConsumer):
                     self.group, {"type": "game.event", "payload": {"type": "answer_reveal", "answer": answer}}
                 )
             elif action == "judge":
+                # §F: services.judge_buzz — correct also reveals; both set the
+                # snapshot's last_judgment marker.
                 await self._host_judge(content.get("participant_id"), bool(content.get("correct")))
             elif action == "assign_drinks":
-                await self._host_assign_drinks(content.get("to_participant_id"))
+                # §G: the host fallback — same mutation, same once-per-cell
+                # marker as the player path above.
+                await self._assign_drink(content.get("to_participant_id"))
             elif action == "close_cell":
                 await self._host_close_cell()
             elif action == "finish_game":
@@ -137,7 +159,10 @@ class GameConsumer(AsyncJsonWebsocketConsumer):
                 await self.send_json({"type": "error", "detail": f"Unknown action: {action}"})
                 return
         except ActionError as exc:
-            await self.send_json({"type": "error", "detail": str(exc)})
+            # Structured errors (§G's drinks_already_assigned) carry their
+            # documented payload; plain ones stay {"detail"} exactly as before.
+            payload = getattr(exc, "payload", None) or {"detail": str(exc)}
+            await self.send_json({"type": "error", **payload})
             return
 
         await self._broadcast_state()
@@ -176,7 +201,7 @@ class GameConsumer(AsyncJsonWebsocketConsumer):
     def _snapshot(self):
         game = (
             Game.objects.prefetch_related("columns__cells", "columns__category", "participants")
-            .select_related("current_cell__question")
+            .select_related("current_cell__question", "judged_participant")
             .get(code=self.code)
         )
         data = GameStateSerializer(game).data
@@ -184,18 +209,7 @@ class GameConsumer(AsyncJsonWebsocketConsumer):
 
     @database_sync_to_async
     def _handle_buzz(self):
-        with transaction.atomic():
-            game = Game.objects.select_for_update().get(code=self.code)
-            if not game.buzzer_open or game.current_cell_id is None:
-                raise ActionError("Buzzer is locked.")
-            if self.participant.role == ParticipantRole.HOST:
-                raise ActionError("The host cannot buzz.")
-            try:
-                buzz = Buzz.objects.create(cell_id=game.current_cell_id, participant=self.participant)
-            except IntegrityError:
-                raise ActionError("You already buzzed.")
-            order = Buzz.objects.filter(cell_id=game.current_cell_id, created_at__lte=buzz.created_at).count()
-        return order
+        return register_buzz(code=self.code, participant=self.participant)
 
     @database_sync_to_async
     def _host_start_game(self):
@@ -204,27 +218,17 @@ class GameConsumer(AsyncJsonWebsocketConsumer):
     @database_sync_to_async
     def _host_open_cell(self, cell_id):
         # Body lives in services.open_cell (Handoff #6: shared with the test
-        # suite; also clears answer_revealed for the fresh cell — rule 5).
+        # suite; also clears answer_revealed for the fresh cell — rule 5 —
+        # and, since #8, the §F judgment marker).
         open_cell(code=self.code, cell_id=cell_id)
 
     @database_sync_to_async
     def _host_set_buzzer(self, is_open):
-        with transaction.atomic():
-            game = Game.objects.select_for_update().get(code=self.code)
-            if game.current_cell_id is None:
-                raise ActionError("Open a question first.")
-            game.buzzer_open = is_open
-            game.save(update_fields=["buzzer_open"])
+        set_buzzer(code=self.code, is_open=is_open)
 
     @database_sync_to_async
     def _host_reset_buzzer(self):
-        with transaction.atomic():
-            game = Game.objects.select_for_update().get(code=self.code)
-            if game.current_cell_id is None:
-                raise ActionError("No question is open.")
-            Buzz.objects.filter(cell_id=game.current_cell_id).delete()
-            game.buzzer_open = False
-            game.save(update_fields=["buzzer_open"])
+        reset_buzzer(code=self.code)
 
     @database_sync_to_async
     def _host_reveal_answer(self):
@@ -232,52 +236,14 @@ class GameConsumer(AsyncJsonWebsocketConsumer):
 
     @database_sync_to_async
     def _host_judge(self, participant_id, correct):
-        with transaction.atomic():
-            game = Game.objects.select_for_update().get(code=self.code)
-            cell = game.current_cell
-            if cell is None:
-                raise ActionError("No question is open.")
-            participant = game.participants.filter(pk=participant_id).first()
-            if participant is None:
-                raise ActionError("Unknown participant.")
-            if correct:
-                cell.answered_by = participant
-                cell.answered_correctly = True
-                cell.save(update_fields=["answered_by", "answered_correctly"])
-                if game.mode == GameMode.POINTS:
-                    participant.score += cell.value
-                    participant.save(update_fields=["score"])
-                game.buzzer_open = False
-                game.save(update_fields=["buzzer_open"])
-            else:
-                if game.mode == GameMode.POINTS:
-                    participant.score -= cell.value
-                    participant.save(update_fields=["score"])
-                # Wrong answer: that team is out of this round; reopen for others.
-                game.buzzer_open = True
-                game.save(update_fields=["buzzer_open"])
+        judge_buzz(code=self.code, participant_id=participant_id, correct=correct)
 
     @database_sync_to_async
-    def _host_assign_drinks(self, to_participant_id):
-        with transaction.atomic():
-            game = Game.objects.select_for_update().get(code=self.code)
-            cell = game.current_cell
-            if cell is None or cell.answered_by_id is None or not cell.answered_correctly:
-                raise ActionError("Drinks can only be assigned after a correct answer.")
-            if game.mode != GameMode.DRINKS:
-                raise ActionError("This game is in points mode.")
-            target = game.participants.filter(pk=to_participant_id).exclude(pk=cell.answered_by_id).first()
-            if target is None:
-                raise ActionError("Pick another team to drink.")
-            DrinkAssignment.objects.create(
-                cell=cell, from_participant_id=cell.answered_by_id, to_participant=target, amount=cell.value
-            )
-            target.drinks_taken += cell.value
-            target.save(update_fields=["drinks_taken"])
-            winner = cell.answered_by
-            winner.drinks_given += cell.value
-            winner.score += cell.value  # drinks dealt double as the leaderboard
-            winner.save(update_fields=["drinks_given", "score"])
+    def _assign_drink(self, target_participant_id):
+        # Shared by the player's give_drink and the host's assign_drinks —
+        # services.assign_drink is the single gate (winner-only for players,
+        # once per cell for everyone).
+        assign_drink(code=self.code, actor=self.participant, target_participant_id=target_participant_id)
 
     @database_sync_to_async
     def _host_close_cell(self):

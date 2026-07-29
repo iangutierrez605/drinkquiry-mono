@@ -131,13 +131,18 @@ def rest():
     ok("GET snapshot without auth (board polling path)")
 
     j = lambda body: requests.post(f"{BASE}/api/games/{code}/join/", json=body)
-    r = j({"name": "Team A"}); assert r.status_code == 201, r.text
+    # §H1 (Handoff #8): joins are uppercased SERVER-side — a lowercase name
+    # comes back caps in the join response and the snapshot.
+    r = j({"name": "team a"}); assert r.status_code == 201, r.text
+    assert r.json()["participant"]["name"] == "TEAM A", r.text
     a_tok, a_id = r.json()["participant_token"], r.json()["participant"]["id"]
     r = j({"name": "Team B"}); assert r.status_code == 201
+    assert r.json()["participant"]["name"] == "TEAM B", r.text
     b_tok, b_id = r.json()["participant_token"], r.json()["participant"]["id"]
-    ok("two teams join by name")
+    ok("two teams join by name; lowercase 'team a' comes back 'TEAM A' (§H1)")
     r = j({"name": "Team A"}); assert r.status_code == 400 and "name" in r.json()
-    ok("duplicate name → 400 name-taken")
+    r = j({"name": "team b"}); assert r.status_code == 400 and "name" in r.json()
+    ok("duplicate name → 400 name-taken, case-insensitively (§H1)")
     r = j({"name": "Team A", "participant_token": a_tok})
     assert r.status_code == 200 and r.json()["participant"]["id"] == a_id
     ok("reclaim seat with stored token → 200 same participant (reload flow)")
@@ -159,8 +164,8 @@ def rest():
     ok("reclaim still 200 AT the cap — reload flow survives a full table (§G)")
     snap = requests.get(f"{BASE}/api/games/{code}/").json()
     sounds = {p["name"]: p.get("buzzer_sound") for p in snap["participants"] if p["role"] == "player"}
-    expect = {"Team A": 1, "Team B": 2, "Team C": 3, "Team D": 4, "Team E": 1, "Team F": 2}
-    assert sounds == expect, sounds
+    expect = {"TEAM A": 1, "TEAM B": 2, "TEAM C": 3, "TEAM D": 4, "TEAM E": 1, "TEAM F": 2}
+    assert sounds == expect, sounds  # §H1: snapshot names are ALL CAPS now
     ok(f"buzzer_sound in snapshot, round-robin by join order: {[sounds[n] for n in sorted(expect)]} (§I)")
     # The extra teams C–F just prove the cap; the game keeps playing with the
     # existing two, so the downstream WS flow is untouched.
@@ -207,7 +212,7 @@ async def ws_flow(code, host_tok, a_tok, a_id, b_tok, b_id, knox, fknox):
                websockets.connect(url(a_tok), origin=ORIGIN) as pa, \
                websockets.connect(url(b_tok), origin=ORIGIN) as pb:
         s = (await latest_state(host))["game"]
-        assert {p["name"] for p in s["participants"]} >= {"Team A", "Team B"}
+        assert {p["name"] for p in s["participants"]} >= {"TEAM A", "TEAM B"}
         assert all(c["cells"][0]["value"] == 1 for c in s["columns"])
         ok("snapshot on connect; drinks-mode values = row drinks")
 
@@ -255,7 +260,7 @@ async def ws_flow(code, host_tok, a_tok, a_id, b_tok, b_id, knox, fknox):
         await asyncio.gather(drain(pa), drain(pb))
         await act(pa, "buzz"); await asyncio.sleep(0.15); await act(pb, "buzz")
         bz = await recv_until(host, "buzz")
-        assert bz["participant_id"] == a_id and bz["order"] == 1 and bz["name"] == "Team A", bz
+        assert bz["participant_id"] == a_id and bz["order"] == 1 and bz["name"] == "TEAM A", bz
         ok("incremental {type:'buzz'} event emitted (§E2; hook prefers it over the snapshot diff)")
         s = (await latest_state(host))["game"]
         assert [b["participant_id"] for b in s["current_cell"]["buzzes"]][0] == a_id
@@ -270,30 +275,67 @@ async def ws_flow(code, host_tok, a_tok, a_id, b_tok, b_id, knox, fknox):
         await drain(pa); await act(pa, "buzz")
         e = await recv_until(pa, "error"); ok(f"double buzz → '{e['detail']}'")
 
-        await act(host, "reveal_answer")
-        rv = await recv_until(host, "answer_reveal"); ok(f"answer_reveal: '{rv['answer'][:30]}…'")
-        # §F2: the polling-board path finally gets live coverage — the reveal
-        # is persisted and shows up in the unauthenticated REST snapshot.
-        polled = requests.get(f"{BASE}/api/games/{code}/").json()
-        assert polled["revealed_answer"] == rv["answer"] == the_answer, polled.get("revealed_answer")
-        ok("revealed_answer present in polled snapshot between reveal and close (§F2)")
-
-        # wrong first → buzzer reopens
+        # wrong first → buzzer reopens, verdict marker set, answer STILL hidden
         await act(host, "judge", participant_id=a_id, correct=False)
         s = (await latest_state(host))["game"]
         assert s["buzzer_open"] is True; ok("judge wrong → buzzer reopens")
-        # right second
+        lj = s["current_cell"]["last_judgment"]
+        assert lj == {"participant_id": a_id, "name": "TEAM A", "correct": False}, lj
+        assert s["revealed_answer"] is None and the_answer not in json.dumps(s)
+        ok("judge wrong → last_judgment marker set, answer still hidden (§F)")
+        # right second — §F: the reveal arrives WITH the judgment, no
+        # separate reveal action sent.
         await act(host, "judge", participant_id=b_id, correct=True)
         s = (await latest_state(host))["game"]
         cell = next(c for col in s["columns"] for c in col["cells"] if c["id"] == cell_id)
         assert cell["answered_correctly"] and cell["answered_by"] == b_id
-        ok("judge correct → cell won by Team B, buzzer locked")
+        lj = s["current_cell"]["last_judgment"]
+        assert lj == {"participant_id": b_id, "name": "TEAM B", "correct": True}, lj
+        assert s["revealed_answer"] == the_answer, s.get("revealed_answer")
+        ok("judge correct → cell won by TEAM B, buzzer locked, revealed_answer arrives WITH the judgment (§F)")
+        # §F2 live coverage for the polling-board path rides the judge-driven
+        # reveal now; the explicit host action stays for "nobody got it" and
+        # its legacy WS event is still emitted (idempotent re-reveal).
+        polled = requests.get(f"{BASE}/api/games/{code}/").json()
+        assert polled["revealed_answer"] == the_answer, polled.get("revealed_answer")
+        ok("revealed_answer present in polled snapshot after the judgment (§F2)")
+        await act(host, "reveal_answer")
+        rv = await recv_until(host, "answer_reveal")
+        assert rv["answer"] == the_answer
+        ok(f"explicit reveal still works + legacy answer_reveal event: '{rv['answer'][:30]}…'")
 
-        await act(host, "assign_drinks", to_participant_id=a_id)
+        # --- §G: the WINNING team's phone gives the drink — to the HOST ----
+        host_seat_id = next(p["id"] for p in s["participants"] if p["role"] == "host")
+        assert s["current_cell"]["drinks_assigned"] is False
+        await drain(pb)
+        await act(pb, "give_drink", target_participant_id=host_seat_id)
         s = (await latest_state(host))["game"]
         pmap = {p["id"]: p for p in s["participants"]}
-        assert pmap[a_id]["drinks_taken"] == 1 and pmap[b_id]["drinks_given"] == 1
-        ok("assign_drinks → Team A drinks 1, Team B credited")
+        assert pmap[host_seat_id]["drinks_taken"] == 1 and pmap[b_id]["drinks_given"] == 1, pmap
+        assert s["current_cell"]["drinks_assigned"] is True
+        attribution = s["current_cell"]["drink_assignment"]
+        assert attribution["from_participant_id"] == b_id and attribution["to_participant_id"] == host_seat_id
+        assert attribution["amount"] == 1
+        ok("give_drink from the winning phone → the HOST drinks 1, TEAM B credited, attribution in snapshot (§G)")
+
+        # second attempt — from the winner AND the host fallback — rejected
+        # with the exact structured shape.
+        await drain(pb)
+        await act(pb, "give_drink", target_participant_id=a_id)
+        e = json.loads(await asyncio.wait_for(pb.recv(), 5))
+        while e.get("type") != "error":
+            e = json.loads(await asyncio.wait_for(pb.recv(), 5))
+        assert e.get("code") == "drinks_already_assigned" and set(e) == {"type", "detail", "code"}, e
+        await drain(host)
+        await act(host, "assign_drinks", to_participant_id=a_id)
+        e = json.loads(await asyncio.wait_for(host.recv(), 5))
+        while e.get("type") != "error":
+            e = json.loads(await asyncio.wait_for(host.recv(), 5))
+        assert e.get("code") == "drinks_already_assigned", e
+        s = requests.get(f"{BASE}/api/games/{code}/").json()
+        pmap = {p["id"]: p for p in s["participants"]}
+        assert pmap[a_id]["drinks_taken"] == 0 and pmap[host_seat_id]["drinks_taken"] == 1
+        ok('second assignment (both paths) → {"detail", code: "drinks_already_assigned"}; tallies untouched (§G)')
 
         await act(host, "close_cell")
         s = (await latest_state(host))["game"]
@@ -308,8 +350,9 @@ async def ws_flow(code, host_tok, a_tok, a_id, b_tok, b_id, knox, fknox):
     async with websockets.connect(url(a_tok), origin=ORIGIN) as pa2:
         s = (await latest_state(pa2))["game"]
         pmap = {p["id"]: p for p in s["participants"]}
-        assert pmap[a_id]["drinks_taken"] == 1
-        ok("reconnect after 'reload' → snapshot restores tallies (reload-safe)")
+        host_row = next(p for p in s["participants"] if p["role"] == "host")
+        assert pmap[b_id]["drinks_given"] == 1 and host_row["drinks_taken"] == 1
+        ok("reconnect after 'reload' → snapshot restores tallies incl. the host's drink (reload-safe)")
 
     async with websockets.connect(url(host_tok), origin=ORIGIN) as host:
         await recv_until(host, "state")
@@ -322,16 +365,17 @@ async def ws_flow(code, host_tok, a_tok, a_id, b_tok, b_id, knox, fknox):
     r = requests.get(f"{BASE}/api/games/history/", headers=hh)
     assert r.status_code == 200 and "results" in r.json(), r.text
     row = next(g for g in r.json()["results"] if g["code"] == code)  # newest-first; host reuses this account
-    assert row["status"] == "finished" and row["finished_at"] and row["winners"] == ["Team B"], row
+    assert row["status"] == "finished" and row["finished_at"] and row["winners"] == ["TEAM B"], row
     assert row["participant_count"] == 6, row  # §G filled the table to the cap earlier
     ok(f"history lists {code} with winners {row['winners']} (§G2)")
 
     r = requests.get(f"{BASE}/api/games/{code}/report/", headers=hh)
     assert r.status_code == 200, r.text
     rep = r.json()
-    assert [w["name"] for w in rep["winners"]] == ["Team B"], rep["winners"]
+    assert [w["name"] for w in rep["winners"]] == ["TEAM B"], rep["winners"]
     pmap = {p["name"]: p for p in rep["participants"]}
-    assert pmap["Team A"]["drinks_taken"] == 1 and pmap["Team B"]["drinks_given"] == 1
+    assert pmap["TEAM B"]["drinks_given"] == 1
+    assert next(p for p in rep["participants"] if p["role"] == "host")["drinks_taken"] == 1
     qs = [q for col in rep["columns"] for q in col["questions"]]
     assert qs and all(q.get("answer") for q in qs), "finished report must include every answer"
     assert any(q["answer"] == the_answer for q in qs)

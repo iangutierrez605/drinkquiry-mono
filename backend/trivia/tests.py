@@ -18,7 +18,7 @@ from django.test import override_settings
 from rest_framework.test import APITestCase
 
 from accounts.models import User
-from trivia.models import Category, ModerationStatus, Question, Visibility
+from trivia.models import Category, ModerationStatus, Question, QuestionReport, ReportStatus, Visibility
 
 TINY_LIMITS = {
     "free": {"games_per_month": None, "categories": 0, "questions": 0},
@@ -1060,3 +1060,177 @@ class StorageQuotaTests(BaseCase):
         cat = Category.objects.get(name="Snapped")
         self.assertGreater(cat.photo_bytes, 0)
         self.assertEqual(storage_bytes_used(self.creator), cat.photo_bytes)
+
+
+# ---------------------------------------------------------------------------
+# Handoff #8 §K1 — near-duplicate ranking for reviewers
+# ---------------------------------------------------------------------------
+class SimilarQuestionsTests(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.cat = make_category(None, "Movies", public_approved=True)
+        self.dupe = Question.objects.create(
+            owner=None, category=self.cat,
+            question_text="Which actor played the Joker in The Dark Knight?",
+            answer="Heath Ledger", difficulty=2,
+            visibility=Visibility.PUBLIC, moderation_status=ModerationStatus.APPROVED,
+        )
+        self.unrelated = Question.objects.create(
+            owner=None, category=self.cat,
+            question_text="What year did the first talkie premiere?",
+            answer="1927", difficulty=3,
+            visibility=Visibility.PUBLIC, moderation_status=ModerationStatus.APPROVED,
+        )
+        self.pending = make_question(
+            self.creator, self.cat, "Who played the Joker in The Dark Knight?",
+            status=ModerationStatus.PENDING, visibility=Visibility.PUBLIC,
+        )
+
+    def test_planted_near_duplicate_ranks_first_with_usage_and_answer(self):
+        self.client.force_authenticate(self.staff)
+        res = self.client.get(f"/api/moderation/questions/{self.pending.id}/similar/")
+        self.assertEqual(res.status_code, 200, res.data)
+        similar = res.json()["similar"]
+        self.assertGreaterEqual(len(similar), 1)
+        top = similar[0]
+        self.assertEqual(top["id"], self.dupe.id)
+        self.assertEqual(top["answer"], "Heath Ledger")  # reviewers see the answer
+        self.assertEqual(top["usage_count"], 0)  # §J1 count rides along
+        self.assertGreater(top["score"], 0.5)
+        # The pending question itself is never its own match.
+        self.assertNotIn(self.pending.id, [row["id"] for row in similar])
+
+    def test_similar_is_staff_only(self):
+        self.client.force_authenticate(self.creator)
+        self.assertEqual(
+            self.client.get(f"/api/moderation/questions/{self.pending.id}/similar/").status_code, 403
+        )
+
+    def test_moderation_list_carries_usage_count(self):
+        from games.models import BoardCell, BoardColumn, Game
+
+        game = Game.objects.create(host=self.creator, mode="drinks")
+        column = BoardColumn.objects.create(game=game, category=self.cat, position=0)
+        BoardCell.objects.create(game=game, column=column, question=self.dupe, row=0, value=1)
+        self.client.force_authenticate(self.staff)
+        rows = self.client.get("/api/moderation/questions/?status=approved").json()["results"]
+        by_id = {r["id"]: r for r in rows}
+        self.assertEqual(by_id[self.dupe.id]["usage_count"], 1)
+        self.assertEqual(by_id[self.unrelated.id]["usage_count"], 0)
+
+
+# ---------------------------------------------------------------------------
+# Handoff #8 §K2 — host flags a public question; moderators work the inflow
+# ---------------------------------------------------------------------------
+class QuestionFlagTests(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.cat = make_category(None, "History", public_approved=True)
+        self.question = Question.objects.create(
+            owner=self.other, category=self.cat,
+            question_text="Approved but suspicious?", answer="Yes", difficulty=1,
+            visibility=Visibility.PUBLIC, moderation_status=ModerationStatus.APPROVED,
+        )
+
+    def flag(self, user, reason=""):
+        self.client.force_authenticate(user)
+        return self.client.post(f"/api/questions/{self.question.id}/report/", {"reason": reason}, format="json")
+
+    def test_any_authenticated_host_can_flag_even_on_the_free_plan(self):
+        res = self.flag(self.free, "The answer is just wrong.")
+        self.assertEqual(res.status_code, 201, res.data)
+        report = QuestionReport.objects.get(pk=res.json()["id"])
+        self.assertEqual(report.status, ReportStatus.OPEN)
+        self.assertEqual(report.reason, "The answer is just wrong.")
+
+    def test_second_open_flag_by_same_reporter_is_409_pinned(self):
+        self.assertEqual(self.flag(self.free).status_code, 201)
+        res = self.flag(self.free)
+        self.assertEqual(res.status_code, 409)
+        self.assertIn("detail", res.json())
+        # A different reporter still files fine — the limiter is per reporter.
+        self.assertEqual(self.flag(self.creator).status_code, 201)
+
+    def test_unauthenticated_cannot_flag(self):
+        self.client.force_authenticate(None)
+        res = self.client.post(f"/api/questions/{self.question.id}/report/", {}, format="json")
+        self.assertEqual(res.status_code, 401)
+
+    def test_flagging_never_changes_moderation_status_or_availability(self):
+        self.flag(self.free)
+        self.question.refresh_from_db()
+        self.assertEqual(self.question.moderation_status, ModerationStatus.APPROVED)
+        # Still in category listings...
+        self.client.force_authenticate(self.creator)
+        listed = self.client.get(f"/api/questions/?category={self.cat.id}").json()["results"]
+        self.assertIn(self.question.id, [q["id"] for q in listed])
+        # ...and still usable for game builds until a moderator acts.
+        from games.services import usable_questions
+
+        self.assertIn(self.question, usable_questions(self.cat, self.creator))
+
+    def test_flagged_tab_is_staff_only_and_lists_context(self):
+        self.flag(self.free, "reason one")
+        self.flag(self.creator, "reason two")
+        self.client.force_authenticate(self.creator)
+        self.assertEqual(self.client.get("/api/moderation/flags/").status_code, 403)
+        self.client.force_authenticate(self.staff)
+        res = self.client.get("/api/moderation/flags/")
+        self.assertEqual(res.status_code, 200)
+        rows = res.json()["results"]
+        self.assertEqual(len(rows), 1)  # one question, two reports
+        row = rows[0]
+        self.assertEqual(row["id"], self.question.id)
+        self.assertEqual(row["report_count"], 2)
+        self.assertEqual(len(row["reports"]), 2)
+        self.assertIn("usage_count", row)  # §J1 context on the tab
+        self.assertEqual(row["answer"], "Yes")  # reviewers see the answer
+
+    def test_resolve_dismiss_keeps_the_question_and_closes_reports(self):
+        self.flag(self.free)
+        self.client.force_authenticate(self.staff)
+        res = self.client.post(f"/api/moderation/flags/{self.question.id}/resolve/", {"action": "dismiss"}, format="json")
+        self.assertEqual(res.status_code, 200, res.data)
+        self.question.refresh_from_db()
+        self.assertEqual(self.question.moderation_status, ModerationStatus.APPROVED)
+        self.assertFalse(self.question.reports.filter(status=ReportStatus.OPEN).exists())
+        # Resolving again: nothing open → 409, mirroring the queue's double-act guard.
+        res = self.client.post(f"/api/moderation/flags/{self.question.id}/resolve/", {"action": "dismiss"}, format="json")
+        self.assertEqual(res.status_code, 409)
+        # Once resolved, the same host may flag again if the problem persists.
+        self.assertEqual(self.flag(self.free).status_code, 201)
+
+    def test_resolve_reject_applies_the_queue_reject_field_semantics(self):
+        self.flag(self.free)
+        self.client.force_authenticate(self.staff)
+        # Note required, exactly like the pending queue's reject.
+        res = self.client.post(f"/api/moderation/flags/{self.question.id}/resolve/", {"action": "reject"}, format="json")
+        self.assertEqual(res.status_code, 400)
+        res = self.client.post(
+            f"/api/moderation/flags/{self.question.id}/resolve/",
+            {"action": "reject", "note": "Answer is factually wrong."}, format="json",
+        )
+        self.assertEqual(res.status_code, 200, res.data)
+        self.question.refresh_from_db()
+        self.assertEqual(self.question.moderation_status, ModerationStatus.REJECTED)
+        self.assertEqual(self.question.moderation_note, "Answer is factually wrong.")
+        self.assertFalse(self.question.reports.filter(status=ReportStatus.OPEN).exists())
+        # Documented consequence: gone from public listings and future builds...
+        self.client.force_authenticate(self.creator)
+        listed = self.client.get(f"/api/questions/?category={self.cat.id}").json()["results"]
+        self.assertNotIn(self.question.id, [q["id"] for q in listed])
+        # ...while games already containing it keep their copy (PROTECT FK).
+        from games.models import BoardCell, BoardColumn, Game
+
+        game = Game.objects.create(host=self.creator, mode="drinks")
+        column = BoardColumn.objects.create(game=game, category=self.cat, position=0)
+        cell = BoardCell.objects.create(game=game, column=column, question=self.question, row=0, value=1)
+        self.assertEqual(cell.question_id, self.question.id)
+
+    def test_pending_queue_mechanics_untouched_by_a_flag(self):
+        # A flag on an APPROVED question must not make it actionable in the
+        # pending queue (the 409 double-act guard behaves exactly as before).
+        self.flag(self.free)
+        self.client.force_authenticate(self.staff)
+        res = self.client.post(f"/api/moderation/questions/{self.question.id}/reject/", {"note": "x"}, format="json")
+        self.assertEqual(res.status_code, 409)

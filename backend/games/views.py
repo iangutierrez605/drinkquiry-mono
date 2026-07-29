@@ -10,6 +10,8 @@ from rest_framework.views import APIView
 
 from .models import Game, GameStatus, Participant, ParticipantRole
 from .serializers import (
+    BoardDetailCellSerializer,
+    BoardDetailSerializer,
     CreateGameSerializer,
     GameHistorySerializer,
     GameReportSerializer,
@@ -17,7 +19,7 @@ from .serializers import (
     JoinGameSerializer,
     ParticipantSerializer,
 )
-from .services import create_game
+from .services import ActionError, create_game, replace_cell_question
 
 
 class GameCreateView(APIView):
@@ -70,7 +72,13 @@ class GameJoinView(APIView):
         game = get_object_or_404(Game, code=code.upper())
         serializer = JoinGameSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        name = serializer.validated_data["name"].strip()
+        # §H1 (Handoff #8): team names are ALL CAPS, normalized server-side
+        # BEFORE the uniqueness/create logic so "team a" and "TEAM A" collide
+        # as the same name — both the name-taken 400 below and the
+        # IntegrityError race path see the normalized value. Rejoin is by
+        # token (above), never by name equality, so pre-existing mixed-case
+        # seats from old games keep reclaiming fine.
+        name = serializer.validated_data["name"].strip().upper()
 
         # Rejoin: same name + provided token reclaims the seat. Checked BEFORE
         # the §G cap on purpose: that seat already exists, so a reload at a
@@ -141,7 +149,8 @@ class GameStateView(APIView):
 
     def get(self, request, code):
         game = get_object_or_404(
-            Game.objects.prefetch_related("columns__cells", "participants", "columns__category"),
+            Game.objects.prefetch_related("columns__cells", "participants", "columns__category")
+            .select_related("current_cell__question", "judged_participant"),
             code=code.upper(),
         )
         return Response(GameStateSerializer(game, context={"request": request}).data)
@@ -170,11 +179,84 @@ class GameAnswerView(APIView):
         return Response({"question_id": cell.question_id, "answer": cell.question.answer})
 
 
+class GameHostSeatView(APIView):
+    """GET /api/games/<code>/host-seat/ — re-issue the host's own seat.
+
+    §I (Handoff #8): the host's participant token normally lives only in the
+    browser's localStorage (dq_seat_{CODE}), so resuming from a NEW device
+    needs the server to hand it back. Knox auth makes this safe: only this
+    game's host (200) — a second Knox user gets 403, anonymous 401. Works for
+    any game status (host-private, harmless); the frontend only offers Resume
+    on unfinished games.
+    """
+
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def get(self, request, code):
+        game = get_object_or_404(Game, code=code.upper())
+        if game.host_id != request.user.id:
+            return Response({"detail": "Only this game's host can recover its seat."}, status=status.HTTP_403_FORBIDDEN)
+        seat = game.participants.filter(role=ParticipantRole.HOST).order_by("id").first()
+        if seat is None:  # shouldn't happen (created with the game) but stay clean
+            return Response({"detail": "This game has no host seat."}, status=status.HTTP_409_CONFLICT)
+        return Response(
+            {"participant": ParticipantSerializer(seat).data, "participant_token": seat.token}
+        )
+
+
+class GameBoardDetailView(APIView):
+    """GET /api/games/<code>/board/ — the host's own board WITH questions and
+    answers (Handoff #8 §J3: the lobby preview). Host-only over Knox — the
+    §F1 answer-endpoint pattern extended to the whole board. Never any part
+    of a snapshot or WS payload, so rule 5 holds: participants and
+    unauthenticated clients cannot see questions pre-open or answers
+    pre-reveal through this or any other path.
+    """
+
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def get(self, request, code):
+        game = get_object_or_404(
+            Game.objects.prefetch_related("columns__cells__question", "columns__category"),
+            code=code.upper(),
+        )
+        if game.host_id != request.user.id:
+            return Response({"detail": "Only this game's host can view its board."}, status=status.HTTP_403_FORBIDDEN)
+        return Response(BoardDetailSerializer(game).data)
+
+
+class CellReplaceView(APIView):
+    """POST /api/games/<code>/cells/<cell_id>/replace/ — lobby-only redraw of
+    one cell (Handoff #8 §J3). Host-only; same category, closest difficulty
+    to the outgoing question, §J2 preference order, excluding questions
+    already on the board. 409 once the game has started (or when the
+    category has nothing left to swap in). Returns the updated cell in the
+    board-detail shape so the preview list can patch in place.
+    """
+
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def post(self, request, code, cell_id):
+        game = get_object_or_404(Game, code=code.upper())
+        if game.host_id != request.user.id:
+            return Response({"detail": "Only this game's host can replace questions."}, status=status.HTTP_403_FORBIDDEN)
+        try:
+            cell = replace_cell_question(code=game.code, cell_id=cell_id, host=request.user)
+        except ActionError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        return Response(BoardDetailCellSerializer(cell).data)
+
+
 class GameHistoryView(generics.ListAPIView):
     """GET /api/games/history/ — the requesting user's hosted games,
     newest-first, DRF-paginated (Handoff #6 §G2). Registered BEFORE the
     games/<code>/ snapshot route so the static path can't be swallowed by the
-    code lookup ("history" would otherwise parse as a code)."""
+    code lookup ("history" would otherwise parse as a code).
+
+    §I (Handoff #8): unfinished games (status lobby/active) were ALWAYS in
+    this list — the queryset never filtered by status and each row carries
+    `status` — so Resume needed no backend change here, just the pinned test
+    below and the host-seat recovery endpoint above."""
 
     permission_classes = (permissions.IsAuthenticated,)
     serializer_class = GameHistorySerializer

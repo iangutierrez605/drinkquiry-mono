@@ -107,15 +107,66 @@ class _OwnerContextMixin(serializers.Serializer):
         return obj.owner.display_name if obj.owner_id else None
 
 
-class ModerationCategorySerializer(_OwnerContextMixin, CategorySerializer):
+class _UsageCountMixin(serializers.Serializer):
+    """§J1 (Handoff #8): how often this item has appeared in games, derived
+    from existing rows — cells referencing a question / board columns
+    referencing a category (BoardColumn is unique per (game, category), so
+    the column count IS the game count). The viewsets annotate `usage_count`
+    to avoid an N+1; direct serializer use falls back to counting."""
+
+    usage_count = serializers.SerializerMethodField()
+
+    def get_usage_count(self, obj):
+        count = getattr(obj, "usage_count", None)
+        if count is None:
+            relation = "boardcolumn_set" if hasattr(obj, "boardcolumn_set") else "boardcell_set"
+            count = getattr(obj, relation).count()
+        return count
+
+
+class ModerationCategorySerializer(_UsageCountMixin, _OwnerContextMixin, CategorySerializer):
     class Meta(CategorySerializer.Meta):
-        fields = CategorySerializer.Meta.fields + ("owner_email", "owner_display_name")
+        fields = CategorySerializer.Meta.fields + ("owner_email", "owner_display_name", "usage_count")
 
 
-class ModerationQuestionSerializer(_OwnerContextMixin, QuestionSerializer):
+class ModerationQuestionSerializer(_UsageCountMixin, _OwnerContextMixin, QuestionSerializer):
     # `answer` is already in QuestionSerializer — required for review. It never
     # leaks into game snapshots (OpenCellSerializer excludes it).
     category_name = serializers.CharField(source="category.name", read_only=True)
 
     class Meta(QuestionSerializer.Meta):
-        fields = QuestionSerializer.Meta.fields + ("owner_email", "owner_display_name", "category_name")
+        fields = QuestionSerializer.Meta.fields + (
+            "owner_email", "owner_display_name", "category_name", "usage_count",
+        )
+
+
+class FlaggedQuestionSerializer(ModerationQuestionSerializer):
+    """§K2: one row in the /moderate "Flagged" tab — the question (with the
+    reviewer context + §J1 usage count above) plus its OPEN reports. The
+    viewset prefetches open reports as `open_reports`."""
+
+    reports = serializers.SerializerMethodField()
+    report_count = serializers.SerializerMethodField()
+
+    class Meta(ModerationQuestionSerializer.Meta):
+        fields = ModerationQuestionSerializer.Meta.fields + ("reports", "report_count")
+
+    def _open_reports(self, obj):
+        return getattr(obj, "open_reports", None) or [
+            r for r in obj.reports.all() if r.status == "open"
+        ]
+
+    def get_report_count(self, obj):
+        return len(self._open_reports(obj))
+
+    def get_reports(self, obj):
+        return [
+            {
+                "id": r.id,
+                "reporter_email": r.reporter.email,
+                "reporter_display_name": r.reporter.display_name,
+                "reason": r.reason,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in self._open_reports(obj)
+        ]

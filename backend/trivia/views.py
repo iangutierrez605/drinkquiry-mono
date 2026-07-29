@@ -1,6 +1,6 @@
 from django.db import IntegrityError, transaction
 from django.db.models import Q
-from rest_framework import status, viewsets
+from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
@@ -13,7 +13,7 @@ from accounts.quotas import (
 
 from .bulk_upload import create_new_categories, create_rows, parse_bulk_upload
 
-from .models import Category, ModerationStatus, Question, Visibility
+from .models import Category, ModerationStatus, Question, QuestionReport, Visibility
 from .permissions import IsCreator, IsOwnerOrReadOnlyPublic
 from .serializers import CategorySerializer, QuestionSerializer
 
@@ -61,6 +61,43 @@ class CategoryViewSet(viewsets.ModelViewSet):
 class QuestionViewSet(viewsets.ModelViewSet):
     serializer_class = QuestionSerializer
     permission_classes = (IsCreator, IsOwnerOrReadOnlyPublic)
+
+    def get_permissions(self):
+        # §K2 (Handoff #8): flagging a bad question is for ANY authenticated
+        # host — it isn't content creation, so IsCreator (a paid-plan gate on
+        # non-create writes) must not apply. Visibility scoping still holds:
+        # get_object goes through get_queryset, so a user can only flag
+        # questions they can see.
+        if getattr(self, "action", None) == "report":
+            return [permissions.IsAuthenticated()]
+        return super().get_permissions()
+
+    @action(detail=True, methods=["post"], url_path="report")
+    def report(self, request, pk=None):
+        """§K2: flag a question as "not good" for moderator review. Filing a
+        report NEVER changes moderation_status — the question stays listed
+        and playable until a moderator acts from /moderate's Flagged tab
+        (that's the feature's explicit ask). One OPEN report per (question,
+        reporter) — the DB partial unique constraint is the rate limiter; a
+        second POST while one is open gets a 409 (pinned)."""
+        question = self.get_object()
+        reason = str(request.data.get("reason") or "").strip()[:2000]
+        try:
+            with transaction.atomic():
+                report = QuestionReport.objects.create(
+                    question=question, reporter=request.user, reason=reason
+                )
+        except IntegrityError:
+            # Caught OUTSIDE the atomic block (house pattern) when the partial
+            # unique constraint (one open report per reporter) fires.
+            return Response(
+                {"detail": "You've already flagged this question — a moderator will review it."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(
+            {"id": report.id, "question": question.id, "status": report.status},
+            status=status.HTTP_201_CREATED,
+        )
 
     def create(self, request, *args, **kwargs):
         if denial := quota_denial(request.user, "questions"):
