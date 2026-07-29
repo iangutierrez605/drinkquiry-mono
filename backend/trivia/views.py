@@ -1,0 +1,192 @@
+from django.db import IntegrityError, transaction
+from django.db.models import Q
+from rest_framework import status, viewsets
+from rest_framework.decorators import action
+from rest_framework.response import Response
+
+from accounts.quotas import (
+    batch_quota_denial,
+    batch_storage_quota_denial,
+    quota_denial,
+    storage_quota_denial,
+)
+
+from .bulk_upload import create_new_categories, create_rows, parse_bulk_upload
+
+from .models import Category, ModerationStatus, Question, Visibility
+from .permissions import IsCreator, IsOwnerOrReadOnlyPublic
+from .serializers import CategorySerializer, QuestionSerializer
+
+PUBLIC_APPROVED = Q(visibility=Visibility.PUBLIC, moderation_status=ModerationStatus.APPROVED)
+
+
+def _incoming_file_bytes(request) -> int:
+    """Total size of the request's uploaded files (§F3 storage check input).
+    Pre-resize sizes — a conservative upper bound on what will be stored."""
+    return sum(f.size for f in request.FILES.values())
+
+
+class CategoryViewSet(viewsets.ModelViewSet):
+    serializer_class = CategorySerializer
+    permission_classes = (IsCreator, IsOwnerOrReadOnlyPublic)
+
+    def create(self, request, *args, **kwargs):
+        # Quota gate before validation/uploads. Free plans have a limit of 0,
+        # so this is also what blocks non-creators (structured 403, D2).
+        if denial := quota_denial(request.user, "categories"):
+            return Response(denial, status=status.HTTP_403_FORBIDDEN)
+        # §F3: storage quota on the incoming photo, through the shared helper.
+        if denial := storage_quota_denial(request.user, _incoming_file_bytes(request)):
+            return Response(denial, status=status.HTTP_403_FORBIDDEN)
+        return super().create(request, *args, **kwargs)
+
+    def update(self, request, *args, **kwargs):
+        # §F3 on PATCH-with-file too. Conservative: the replaced file's old
+        # bytes still count until the row saves — never under-enforces.
+        if denial := storage_quota_denial(request.user, _incoming_file_bytes(request)):
+            return Response(denial, status=status.HTTP_403_FORBIDDEN)
+        return super().update(request, *args, **kwargs)
+
+    def get_queryset(self):
+        user = self.request.user
+        # order_by("id"): deterministic pagination (fixes the compose run's
+        # UnorderedObjectListWarning) — applied here in the list queryset, not
+        # as Meta.ordering, so no other Category caller changes behavior.
+        qs = Category.objects.all()
+        if user.is_authenticated:
+            return qs.filter(PUBLIC_APPROVED | Q(owner=user) | Q(owner__isnull=True)).distinct().order_by("id")
+        return qs.filter(PUBLIC_APPROVED | Q(owner__isnull=True)).order_by("id")
+
+
+class QuestionViewSet(viewsets.ModelViewSet):
+    serializer_class = QuestionSerializer
+    permission_classes = (IsCreator, IsOwnerOrReadOnlyPublic)
+
+    def create(self, request, *args, **kwargs):
+        if denial := quota_denial(request.user, "questions"):
+            return Response(denial, status=status.HTTP_403_FORBIDDEN)
+        # §F3: storage quota on incoming media, through the shared helper.
+        if denial := storage_quota_denial(request.user, _incoming_file_bytes(request)):
+            return Response(denial, status=status.HTTP_403_FORBIDDEN)
+        return super().create(request, *args, **kwargs)
+
+    def update(self, request, *args, **kwargs):
+        # §F3 on PATCH-with-file (see CategoryViewSet.update).
+        if denial := storage_quota_denial(request.user, _incoming_file_bytes(request)):
+            return Response(denial, status=status.HTTP_403_FORBIDDEN)
+        return super().update(request, *args, **kwargs)
+
+    @action(detail=False, methods=["post"], url_path="bulk")
+    def bulk(self, request):
+        """Bulk import — plain CSV or zip-with-media (Handoff #4 §G2, #5 §F/§G).
+
+        Parse and validate ALL rows first, then all-or-nothing in one
+        transaction — a half-imported file that consumed quota is worse than
+        "fix row 37 and re-upload". All-or-nothing spans both models: any row
+        error means zero categories AND zero questions. Row numbers in errors
+        are 1-based including the header (first data row = 2).
+        """
+        def flag(name, default):
+            return str(request.data.get(name, default)).strip().lower() in ("1", "true", "yes", "on")
+
+        official = flag("official", "false")
+        dry_run = flag("dry_run", "false")
+        skip_duplicates = flag("skip_duplicates", "true")
+        create_categories = flag("create_categories", "false")  # §F, default = v1 behavior
+
+        if official and not request.user.is_staff:
+            return Response(
+                {"detail": "Only staff can upload official content."}, status=status.HTTP_403_FORBIDDEN
+            )
+        uploaded = request.FILES.get("file")
+        if uploaded is None:
+            return Response(
+                {"detail": "Attach a CSV or zip file in the `file` field."}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        parsed = parse_bulk_upload(
+            uploaded, request.user,
+            official=official, skip_duplicates=skip_duplicates, create_categories=create_categories,
+        )
+        try:
+            if parsed.file_error:
+                return Response({"detail": parsed.file_error}, status=status.HTTP_400_BAD_REQUEST)
+            if parsed.errors:
+                return Response(
+                    {"created": 0, "errors": parsed.errors, "skipped": parsed.skipped},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            category_names = parsed.category_names
+
+            # Whole-batch quota checks (official content is quota-exempt:
+            # owner-less rows never count against anyone). Categories first,
+            # then questions — the first denial wins, each with its own code
+            # and `requested`. Applied on dry runs too, so a free user learns
+            # about the 403 before fixing 60 rows of a file.
+            if not official:
+                if parsed.new_categories:
+                    if denial := batch_quota_denial(request.user, "categories", len(parsed.new_categories)):
+                        return Response(denial, status=status.HTTP_403_FORBIDDEN)
+                if parsed.rows:
+                    if denial := batch_quota_denial(request.user, "questions", len(parsed.rows)):
+                        return Response(denial, status=status.HTTP_403_FORBIDDEN)
+                # §F3: whole-batch storage check — `requested` is the total
+                # uncompressed bytes of the media this file would store
+                # (counted per row, matching what create_rows stores; a file
+                # referenced by several rows is stored once per row).
+                if parsed.media_bytes_total:
+                    if denial := batch_storage_quota_denial(request.user, parsed.media_bytes_total):
+                        return Response(denial, status=status.HTTP_403_FORBIDDEN)
+
+            if dry_run:
+                # Nothing written — reports what WOULD happen, media included.
+                return Response(
+                    {
+                        "created": len(parsed.rows), "errors": [], "skipped": parsed.skipped,
+                        "dry_run": True,
+                        "categories_created": len(category_names), "category_names": category_names,
+                        "media_files": parsed.media_files,
+                    }
+                )
+
+            try:
+                with transaction.atomic():
+                    category_map = create_new_categories(
+                        parsed.new_categories, request.user, official=official
+                    )
+                    created = create_rows(
+                        parsed.rows, request.user,
+                        official=official, category_map=category_map, archive=parsed.archive,
+                    )
+            except IntegrityError:
+                # Concurrent upload raced unique_category_name_per_owner (§F:
+                # out of scope beyond a clean 400 — never a 500).
+                return Response(
+                    {"detail": "A category in this file was created by another upload at the same time — try again."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            return Response(
+                {
+                    "created": created, "errors": [], "skipped": parsed.skipped, "dry_run": False,
+                    "categories_created": len(category_names), "category_names": category_names,
+                },
+                status=status.HTTP_201_CREATED,
+            )
+        finally:
+            if parsed.archive is not None:
+                parsed.archive.close()
+
+    def get_queryset(self):
+        user = self.request.user
+        # order_by("id"): deterministic pagination — this list view is what
+        # tripped the compose run's UnorderedObjectListWarning (unordered
+        # pagination can duplicate/skip rows across pages). Scoped to the list
+        # queryset rather than Meta.ordering so no other Question caller
+        # (board building, bulk dedupe, moderation) changes behavior.
+        qs = Question.objects.select_related("category")
+        if category_id := self.request.query_params.get("category"):
+            qs = qs.filter(category_id=category_id)
+        if user.is_authenticated:
+            return qs.filter(PUBLIC_APPROVED | Q(owner=user) | Q(owner__isnull=True)).distinct().order_by("id")
+        return qs.filter(PUBLIC_APPROVED | Q(owner__isnull=True)).order_by("id")

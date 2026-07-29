@@ -1,0 +1,58 @@
+# Opt-in object storage for verifying MEDIA_BACKEND=s3 locally (Handoff #7
+# §F1). NOT part of the default dev stack — layer it on explicitly:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.minio.yml up --build
+#
+# What it does: runs MinIO (an S3-compatible server), creates the bucket, and
+# flips the api service into s3 media mode pointed at it. The dev default
+# (plain `docker compose up`) stays local-disk media, untouched.
+#
+# Verifying signed URLs in a BROWSER: they are signed against the endpoint
+# hostname (http://minio:9000), which containers resolve but your browser
+# doesn't. Add `127.0.0.1 minio` to your /etc/hosts and the signed URLs from
+# /create and the board open normally. (Or skip the browser and check the
+# bucket in the MinIO console at http://localhost:9001, minio / minio-secret.)
+#
+# The exact same flow against REAL DigitalOcean Spaces is in DEPLOY.md.
+services:
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio-secret
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: create the media bucket, then exit.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "mc alias set local http://minio:9000 minio minio-secret &&
+             mc mb --ignore-existing local/drinkquiry-media"
+
+  api:
+    environment:
+      MEDIA_BACKEND: s3
+      AWS_STORAGE_BUCKET_NAME: drinkquiry-media
+      AWS_S3_ENDPOINT_URL: http://minio:9000
+      AWS_S3_ACCESS_KEY_ID: minio
+      AWS_S3_SECRET_ACCESS_KEY: minio-secret
+    depends_on:
+      minio:
+        condition: service_healthy
+
+volumes:
+  minio-data:

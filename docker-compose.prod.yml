@@ -1,0 +1,85 @@
+# Production stack (Handoff #7 §H) — DigitalOcean droplet (or any Docker
+# host), HTTPS via Caddy's automatic Let's Encrypt. The dev compose file is
+# untouched; this one is selected explicitly:
+#
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Env: copy .env.production.example to .env on the droplet and fill it in
+# (compose reads `.env` automatically for the ${...} interpolations below,
+# and the api service loads it wholesale via env_file). Full walkthrough,
+# verification checklist and update/backup workflow: DEPLOY.md.
+services:
+  db:
+    image: postgres:17-alpine
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-drinkquiry}
+      POSTGRES_USER: ${POSTGRES_USER:-drinkquiry}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-drinkquiry}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ./backend
+    restart: always
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-drinkquiry}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-drinkquiry}
+      REDIS_URL: redis://redis:6379/0
+    # No source bind mount (unlike dev): the image IS the code, which is what
+    # makes `git pull && up -d --build` the whole deploy.
+    volumes:
+      - media:/app/media            # only used in MEDIA_BACKEND=local mode
+      - staticfiles:/app/staticfiles
+    expose:
+      - "8000"                      # reachable by Caddy only; no host port
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: sh /app/entrypoint.prod.sh
+
+  # Caddy: TLS (automatic Let's Encrypt), the built SPA, /static + /media
+  # file serving, and the /api + /ws + /admin reverse proxy (WebSocket
+  # upgrades are native). Built from frontend/Dockerfile with the REPO ROOT
+  # as context so the image gets both frontend/dist and the root Caddyfile —
+  # a frontend change ships on the next `up -d --build`.
+  web:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+    volumes:
+      - caddy_data:/data            # certificates — must persist across rebuilds
+      - caddy_config:/config
+      - staticfiles:/srv/static:ro  # collected by the api entrypoint
+      - media:/srv/media:ro         # only used in MEDIA_BACKEND=local mode
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+  media:
+  staticfiles:
+  caddy_data:
+  caddy_config:

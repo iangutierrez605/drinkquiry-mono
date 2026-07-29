@@ -1,0 +1,14 @@
+Django>=6.0,<6.1
+djangorestframework>=3.16
+django-cors-headers>=4.6
+django-rest-knox>=5.0
+channels[daphne]>=4.3
+channels-redis>=4.2
+# redis-py 8.x breaks channels-redis (idle blocking receive raises
+# "Timeout reading from redis:6379" after ~20s, killing every consumer).
+# Verified good: 7.4.1. Revisit when channels-redis > 4.3.0 ships.
+redis>=4.6,<8
+psycopg[binary]>=3.2
+dj-database-url>=2.3
+Pillow>=11.0
+django-storages[s3]>=1.14

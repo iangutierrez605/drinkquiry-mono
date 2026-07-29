@@ -1,0 +1,47 @@
+# Caddy config (Handoff #7 §H). {$DOMAIN} comes from the environment
+# (docker-compose.prod.yml passes it from .env). Naming a real domain here is
+# what turns on automatic HTTPS: Caddy obtains and renews the Let's Encrypt
+# certificate itself — no certbot, no cron.
+{$DOMAIN} {
+	encode zstd gzip
+
+	# Django surfaces. Caddy's reverse_proxy handles the WebSocket upgrade
+	# for /ws natively (nothing extra to configure), and sets
+	# X-Forwarded-Proto so Django (SECURE_PROXY_SSL_HEADER via
+	# DJANGO_BEHIND_PROXY=true) knows the outside world is https.
+	handle /api/* {
+		reverse_proxy api:8000
+	}
+	handle /ws/* {
+		reverse_proxy api:8000
+	}
+	handle /admin/* {
+		reverse_proxy api:8000
+	}
+
+	# Collected static (admin CSS etc.) — written by the api entrypoint into
+	# the shared staticfiles volume; served as files here because Django
+	# doesn't serve static with DEBUG=false.
+	handle_path /static/* {
+		root * /srv/static
+		file_server
+	}
+
+	# Media, LOCAL mode only (MEDIA_BACKEND=local): Django writes uploads to
+	# the shared media volume and this serves them. In Spaces mode
+	# (MEDIA_BACKEND=s3) every media URL in a snapshot is a signed absolute
+	# URL pointing at the bucket, so this block simply never matches — safe
+	# to leave in place for both modes.
+	handle_path /media/* {
+		root * /srv/media
+		file_server
+	}
+
+	# The SPA, with the BrowserRouter fallback: unknown paths (e.g. a hard
+	# reload on /host, /profile, /board/ABC123) serve index.html.
+	handle {
+		root * /srv/app
+		try_files {path} /index.html
+		file_server
+	}
+}

@@ -1,0 +1,262 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useParams } from "react-router-dom";
+import { api, errorText, ApiError } from "../lib/api";
+import { clearSeat, loadSeat, saveSeat } from "../lib/storage";
+import { useGameSocket } from "../lib/useGameSocket";
+import { ensureAudio, playBuzz } from "../lib/sounds";
+import { ScoreStrip, Toast } from "../components/shared";
+
+export default function BuzzerPage() {
+  const { code = "" } = useParams();
+  const upper = code.toUpperCase();
+  const [seat, setSeat] = useState(() => loadSeat(upper));
+
+  const dropSeat = useCallback(() => {
+    clearSeat(upper);
+    setSeat(null);
+  }, [upper]);
+
+  if (!seat?.token || !seat?.participantId)
+    return <JoinForm code={upper} existing={seat} onJoined={setSeat} onDropSeat={dropSeat} />;
+  return <BuzzerLive code={upper} seat={seat} onBadSeat={dropSeat} />;
+}
+
+/* ---------------- Join ---------------- */
+
+function JoinForm({ code, existing, onJoined, onDropSeat }) {
+  const [name, setName] = useState(existing?.name || "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [nameTaken, setNameTaken] = useState(false);
+  const [fullLimit, setFullLimit] = useState(null); // §G: server said game_full
+
+  const join = async (useToken) => {
+    setBusy(true);
+    setError(null);
+    setNameTaken(false);
+    try {
+      const res = await api.joinGame(code, name.trim(), useToken ? existing?.token : undefined);
+      const seat = {
+        token: res.participant_token,
+        participantId: res.participant.id,
+        name: res.participant.name,
+        role: res.participant.role,
+      };
+      saveSeat(code, seat);
+      onJoined(seat);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409 && err.data?.code === "game_full") {
+        // Cosmetic only (rule 4): the server is the gate; we just say it nicely.
+        setFullLimit(err.data.limit ?? 6);
+      } else if (err instanceof ApiError && err.status === 400 && err.data?.name) {
+        // Name taken: if we still hold a token for this code, offer reclaim.
+        setNameTaken(true);
+        setError(err.data.name.join(" "));
+      } else if (err instanceof ApiError && err.status === 404) {
+        setError(`No game with code ${code}. Double-check with the host.`);
+      } else {
+        setError(errorText(err));
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (fullLimit != null)
+    return (
+      <div className="page page--center page--buzzer">
+        <div className="wordmark">DRINKQUIRY</div>
+        <p className="joincode">
+          Game <strong>{code}</strong>
+        </p>
+        <div className="panel joinform">
+          <h2 className="h2">Table's full! 🍻</h2>
+          <p>
+            This game already has its {fullLimit} teams. Huddle up with one of them and share their
+            phone — one buzzer per team is the whole idea.
+          </p>
+          {existing?.token && (
+            <button type="button" className="btn btn--gold" disabled={busy} onClick={() => join(true)}>
+              We already had a seat — reclaim it
+            </button>
+          )}
+          <button type="button" className="btn btn--ghost" onClick={() => setFullLimit(null)}>
+            Back
+          </button>
+        </div>
+      </div>
+    );
+
+  return (
+    <div className="page page--center page--buzzer">
+      <div className="wordmark">DRINKQUIRY</div>
+      <p className="joincode">
+        Game <strong>{code}</strong>
+      </p>
+      <form
+        className="panel joinform"
+        onSubmit={(e) => {
+          e.preventDefault();
+          join(false);
+        }}
+      >
+        <label className="field">
+          Team name
+          <input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            required
+            maxLength={50}
+            placeholder="e.g. Quizzy McGuinness"
+            autoFocus
+          />
+        </label>
+        {error && <p className="formerror">{error}</p>}
+        {nameTaken && existing?.token && (
+          <button type="button" className="btn btn--gold" disabled={busy} onClick={() => join(true)}>
+            That's us — reclaim our seat
+          </button>
+        )}
+        <button className="btn btn--primary btn--big" disabled={busy || !name.trim()}>
+          {busy ? "Joining…" : "Join game"}
+        </button>
+        {existing?.token && !nameTaken && (
+          <button type="button" className="btn btn--ghost" onClick={onDropSeat}>
+            Forget saved seat
+          </button>
+        )}
+      </form>
+    </div>
+  );
+}
+
+/* ---------------- Live buzzer ---------------- */
+
+function BuzzerLive({ code, seat, onBadSeat }) {
+  const { game, connected, authFailed, lastError, lastBuzz, clearError, send } = useGameSocket(code, seat.token);
+
+  useEffect(() => {
+    if (authFailed) onBadSeat(); // 4001: clear token, back to the name form
+  }, [authFailed, onBadSeat]);
+
+  // Haptic + confirmation on our own buzz echo.
+  useEffect(() => {
+    if (lastBuzz && lastBuzz.participant_id === seat.participantId && navigator.vibrate) {
+      navigator.vibrate(80);
+    }
+  }, [lastBuzz, seat.participantId]);
+
+  const self = useMemo(
+    () => game?.participants.find((p) => p.id === seat.participantId),
+    [game, seat.participantId],
+  );
+  const cell = game?.current_cell;
+  const buzzes = cell?.buzzes ?? [];
+  const myBuzzIndex = buzzes.findIndex((b) => b.participant_id === seat.participantId);
+  const alreadyBuzzed = myBuzzIndex >= 0;
+  const canBuzz = game?.status === "active" && !!cell && game.buzzer_open && !alreadyBuzzed;
+
+  // Press feedback independent of network. The tap itself is the user
+  // gesture, so playing our OWN sound here (§I) satisfies autoplay policy and
+  // gives tactile feedback before the server round-trip. Sound id comes from
+  // the snapshot (server-assigned), never guessed locally.
+  const [pressed, setPressed] = useState(false);
+  const pressTimer = useRef(null);
+  const buzz = () => {
+    if (!canBuzz) return;
+    ensureAudio();
+    playBuzz(self?.buzzer_sound ?? 1);
+    send("buzz");
+    setPressed(true);
+    clearTimeout(pressTimer.current);
+    pressTimer.current = setTimeout(() => setPressed(false), 250);
+  };
+
+  if (!game)
+    return (
+      <div className="page page--center page--buzzer">
+        <div className="wordmark">DRINKQUIRY</div>
+        <p>Connecting…</p>
+      </div>
+    );
+
+  let stateLabel;
+  let stateClass;
+  if (game.status === "lobby") {
+    stateLabel = "Waiting for the host to start";
+    stateClass = "idle";
+  } else if (game.status === "finished") {
+    stateLabel = "Game over";
+    stateClass = "idle";
+  } else if (!cell) {
+    stateLabel = "Watch the board…";
+    stateClass = "idle";
+  } else if (alreadyBuzzed) {
+    stateLabel = `You buzzed ${ordinal(myBuzzIndex + 1)}`;
+    stateClass = "buzzed";
+  } else if (game.buzzer_open) {
+    stateLabel = "BUZZ!";
+    stateClass = "open";
+  } else {
+    stateLabel = "Locked — listen up";
+    stateClass = "locked";
+  }
+
+  return (
+    <div className="page page--buzzer">
+      <header className="buzzhead">
+        <span className="buzzhead__team">{self?.name ?? seat.name}</span>
+        <span className={`conn ${connected ? "conn--on" : "conn--off"}`}>
+          <span className="conn__dot" />
+          {connected ? code : "reconnecting"}
+        </span>
+      </header>
+
+      <div className="buzzstage">
+        <button
+          type="button"
+          className={`bigbuzz bigbuzz--${stateClass} ${pressed ? "bigbuzz--pressed" : ""}`}
+          disabled={!canBuzz}
+          onPointerDown={buzz}
+        >
+          <span className="bigbuzz__label">{stateLabel}</span>
+          {cell && !alreadyBuzzed && (
+            <span className="bigbuzz__value">
+              {game.mode === "drinks" ? `${cell.value} 🍺 on the line` : `${cell.value} pts on the line`}
+            </span>
+          )}
+        </button>
+      </div>
+
+      {cell && buzzes.length > 0 && (
+        <ol className="buzzorder">
+          {buzzes.map((b, i) => (
+            <li key={b.participant_id} className={b.participant_id === seat.participantId ? "buzzorder--self" : ""}>
+              <span>{i + 1}.</span> {b.name}
+            </li>
+          ))}
+        </ol>
+      )}
+
+      {game.status === "finished" && self && (
+        <p className="buzzfinal">
+          {game.mode === "points"
+            ? `Final score: ${self.score} pts`
+            : `You gave ${self.drinks_given} 🍺 and took ${self.drinks_taken} 🍻`}
+        </p>
+      )}
+
+      <footer className="buzzfoot">
+        <ScoreStrip game={game} selfId={seat.participantId} />
+      </footer>
+
+      <Toast message={lastError} onDone={clearError} />
+    </div>
+  );
+}
+
+function ordinal(n) {
+  const s = ["th", "st", "nd", "rd"];
+  const v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
