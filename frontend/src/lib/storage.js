@@ -29,8 +29,28 @@ export function clearSeat(code) {
 }
 
 // ---- Host auth token (Knox) ----
+// §F (Handoff #9): saving/clearing auth dispatches a window event so the
+// SiteNav (mounted once at the App level) updates immediately when a page's
+// inline AuthScreen logs in or a logout button fires — no polling, no prop
+// drilling across routes.
+const AUTH_EVENT = "dq-auth-changed";
+
+function announceAuthChange() {
+  try {
+    window.dispatchEvent(new Event(AUTH_EVENT));
+  } catch {
+    /* non-browser env */
+  }
+}
+
+export function onAuthChange(handler) {
+  window.addEventListener(AUTH_EVENT, handler);
+  return () => window.removeEventListener(AUTH_EVENT, handler);
+}
+
 export function saveAuth(auth) {
   localStorage.setItem("dq_auth", JSON.stringify(auth)); // {token, user}
+  announceAuthChange();
 }
 export function loadAuth() {
   try {
@@ -41,6 +61,28 @@ export function loadAuth() {
 }
 export function clearAuth() {
   localStorage.removeItem("dq_auth");
+  announceAuthChange();
+}
+
+// ---- Age gate acknowledgement (§H, Handoff #9) ----
+// Versioned key: bump to _v2 if the copy ever changes materially and every
+// browser should be re-prompted. Stores an ISO timestamp (when they agreed),
+// but any truthy value counts as acknowledged.
+const AGE_ACK_KEY = "dq_age_ack_v1";
+
+export function loadAgeAck() {
+  try {
+    return localStorage.getItem(AGE_ACK_KEY);
+  } catch {
+    return null;
+  }
+}
+export function saveAgeAck() {
+  try {
+    localStorage.setItem(AGE_ACK_KEY, new Date().toISOString());
+  } catch {
+    /* storage unavailable — the gate will just show again */
+  }
 }
 
 // ---- Host's active game (for resume after reload) ----

@@ -133,10 +133,15 @@ class ModerationQuestionSerializer(_UsageCountMixin, _OwnerContextMixin, Questio
     # `answer` is already in QuestionSerializer — required for review. It never
     # leaks into game snapshots (OpenCellSerializer excludes it).
     category_name = serializers.CharField(source="category.name", read_only=True)
+    # §I4: lifecycle context for the library — deleted_at (null = active) and
+    # the id of the revision that superseded this row, if any. Read-only,
+    # staff-only surface; the public QuestionSerializer never carries these.
+    replaced_by = serializers.PrimaryKeyRelatedField(read_only=True)
 
     class Meta(QuestionSerializer.Meta):
         fields = QuestionSerializer.Meta.fields + (
             "owner_email", "owner_display_name", "category_name", "usage_count",
+            "deleted_at", "replaced_by",
         )
 
 

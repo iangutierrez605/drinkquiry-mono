@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, ApiError, errorText, quotaError } from "../lib/api";
-import { clearAuth, loadAuth } from "../lib/storage";
-import { ModerationLink, ProfileLink, Toast, UsageMeterLine } from "../components/shared";
+import { clearAuth, loadAuth, onAuthChange } from "../lib/storage";
+import { Toast, UsageMeterLine } from "../components/shared";
 
 /**
  * /create — creator content management.
@@ -28,6 +28,8 @@ export default function CreatePage() {
   const [auth, setAuth] = useState(loadAuth());
   const [profile, setProfile] = useState(null);
   const [profileError, setProfileError] = useState(null);
+  // §F: nav logout / dead-token cleanup flips this page immediately.
+  useEffect(() => onAuthChange(() => setAuth(loadAuth())), []);
 
   useEffect(() => {
     if (!auth) return;
@@ -55,7 +57,7 @@ export default function CreatePage() {
         <section className="panel panel--center">
           <h2 className="h2">Log in first</h2>
           <p className="footnote">Creating content needs a host account.</p>
-          <Link className="btn btn--primary" to="/host">
+          <Link className="btn btn--primary" to="/login?next=/create">
             Go to login
           </Link>
         </section>
@@ -98,19 +100,7 @@ export default function CreatePage() {
 function Shell({ user, token, children }) {
   return (
     <div className="page">
-      <header className="pagehead">
-        <Link to="/" className="wordmark wordmark--small wordmark--link">
-          DRINKQUIRY
-        </Link>
-        <div className="pagehead__right">
-          {user && <span className="pagehead__user">{user.display_name || user.email}</span>}
-          {user?.is_staff && token && <ModerationLink token={token} />}
-          <ProfileLink />
-          <Link className="btn btn--ghost" to="/host">
-            Host a game
-          </Link>
-        </div>
-      </header>
+      {/* §F: identity + cross-links moved to the SiteNav. */}
       <h1 className="h1">Your content</h1>
       {children}
     </div>

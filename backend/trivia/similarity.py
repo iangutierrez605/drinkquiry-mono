@@ -49,7 +49,9 @@ def similar_questions(question: Question, *, top_n: int = TOP_N) -> list[dict]:
     everything a reviewer needs to call "duplicate" at a glance."""
     approved = Q(moderation_status=ModerationStatus.APPROVED)
     base = (
-        Question.objects.filter(approved)
+        # §I: deleted questions can't be duplicated-against — they're gone
+        # from every listing a reviewer could compare with.
+        Question.objects.filter(approved, deleted_at__isnull=True)
         .exclude(pk=question.pk)
         .annotate(usage_count=Count("boardcell", distinct=True))
         .select_related("category")

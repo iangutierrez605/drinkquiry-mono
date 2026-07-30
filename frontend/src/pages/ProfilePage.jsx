@@ -1,37 +1,36 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api, errorText } from "../lib/api";
-import { clearAuth, loadAuth } from "../lib/storage";
-import { ModerationLink, Toast, UsageMeterLine } from "../components/shared";
+import { loadAuth, onAuthChange } from "../lib/storage";
+import { Toast, UsageMeterLine } from "../components/shared";
+import AuthScreen from "../components/AuthScreen";
 
 const fmtMB = (bytes) => `${Math.round((bytes / 1024 / 1024) * 10) / 10} MB`;
-import { AuthScreen, resumeHostGame } from "./HostPage";
+import { resumeHostGame } from "./HostPage";
 
 /**
  * /profile (Handoff #6 §G3): the signed-in host's identity + plan block and
  * their game history. Knox-gated exactly like /host — same stored dq_auth,
- * same login screen (imported, not forked). Selecting a finished game loads
- * its report (participants, tallies, winners highlighted, every question with
- * its answer). Non-finished games have no report body: the backend's chosen
- * rule is 409-until-finished, so we don't even request one.
+ * same login screen (imported, not forked; it lives in components/ since
+ * §F1). Selecting a finished game loads its report (participants, tallies,
+ * winners highlighted, every question with its answer). Non-finished games
+ * have no report body: the backend's chosen rule is 409-until-finished, so
+ * we don't even request one. §K2 adds the change-password panel.
  */
 export default function ProfilePage() {
   const [auth, setAuth] = useState(loadAuth());
+  // §F: nav logout / dead-token cleanup flips this page to the login screen.
+  useEffect(() => onAuthChange(() => setAuth(loadAuth())), []);
   if (!auth) return <AuthScreen onAuthed={setAuth} />;
   return (
     <ProfileBody
       auth={auth}
       onAuthGone={() => setAuth(null)} // Knox token died mid-visit → login form
-      onLogout={() => {
-        api.logout(auth.token).catch(() => {});
-        clearAuth();
-        setAuth(null);
-      }}
     />
   );
 }
 
-function ProfileBody({ auth, onAuthGone, onLogout }) {
+function ProfileBody({ auth, onAuthGone }) {
   const [profile, setProfile] = useState(null);
   const [games, setGames] = useState(null);
   const [loadError, setLoadError] = useState(null);
@@ -58,25 +57,8 @@ function ProfileBody({ auth, onAuthGone, onLogout }) {
 
   return (
     <div className="page">
-      <header className="pagehead">
-        <Link to="/" className="wordmark wordmark--small wordmark--link">
-          DRINKQUIRY
-        </Link>
-        <div className="pagehead__right">
-          <span className="pagehead__user">{profile?.display_name || auth.user?.display_name || auth.user?.email}</span>
-          {profile?.is_staff && <ModerationLink token={auth.token} />}
-          <Link className="btn btn--ghost" to="/create">
-            Your content
-          </Link>
-          <Link className="btn btn--ghost" to="/host">
-            Host a game
-          </Link>
-          <button className="btn btn--ghost" onClick={onLogout}>
-            Log out
-          </button>
-        </div>
-      </header>
-
+      {/* §F: the old pagehead (identity, Moderation/Your content/Host links,
+          Log out) lives in the SiteNav now. */}
       <h1 className="h1">Your profile</h1>
       {loadError && <p className="formerror formerror--block">{loadError}</p>}
 
@@ -110,6 +92,8 @@ function ProfileBody({ auth, onAuthGone, onLogout }) {
         </section>
       )}
 
+      {profile && <ChangePasswordPanel token={auth.token} onToast={setToast} />}
+
       <section className="panel">
         <h2 className="h2">Game history</h2>
         {games == null && !loadError && <p className="footnote">Loading…</p>}
@@ -127,6 +111,96 @@ function ProfileBody({ auth, onAuthGone, onLogout }) {
 
       <Toast message={toast} onDone={() => setToast(null)} />
     </div>
+  );
+}
+
+/* ---------------- §K2: change password ---------------- */
+
+function ChangePasswordPanel({ token, onToast }) {
+  const [open, setOpen] = useState(false);
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (next !== confirm) {
+      setError("Those new passwords don't match.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await api.passwordChange(token, current, next);
+      // The server kept THIS session's token and revoked every other one,
+      // then emailed a heads-up — nothing to store client-side.
+      onToast("Password changed ✔ — other sessions were signed out.");
+      setOpen(false);
+      setCurrent("");
+      setNext("");
+      setConfirm("");
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="panel">
+      <h2 className="h2">Password</h2>
+      {!open ? (
+        <button type="button" className="btn btn--ghost" onClick={() => setOpen(true)}>
+          Change password…
+        </button>
+      ) : (
+        <form className="pwform" onSubmit={submit}>
+          <label className="field">
+            Current password
+            <input
+              type="password"
+              value={current}
+              onChange={(e) => setCurrent(e.target.value)}
+              required
+              autoComplete="current-password"
+              autoFocus
+            />
+          </label>
+          <label className="field">
+            New password
+            <input
+              type="password"
+              value={next}
+              onChange={(e) => setNext(e.target.value)}
+              required
+              autoComplete="new-password"
+            />
+          </label>
+          <label className="field">
+            New password, again
+            <input
+              type="password"
+              value={confirm}
+              onChange={(e) => setConfirm(e.target.value)}
+              required
+              autoComplete="new-password"
+            />
+          </label>
+          {error && <p className="formerror">{error}</p>}
+          <div className="pwform__btns">
+            <button className="btn btn--primary" disabled={busy}>
+              {busy ? "…" : "Change password"}
+            </button>
+            <button type="button" className="btn btn--ghost" disabled={busy} onClick={() => setOpen(false)}>
+              Cancel
+            </button>
+          </div>
+          <p className="footnote">This device stays signed in; every other session is signed out, and you'll get an email heads-up.</p>
+        </form>
+      )}
+    </section>
   );
 }
 

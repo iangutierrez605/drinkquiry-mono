@@ -1234,3 +1234,393 @@ class QuestionFlagTests(BaseCase):
         self.client.force_authenticate(self.staff)
         res = self.client.post(f"/api/moderation/questions/{self.question.id}/reject/", {"note": "x"}, format="json")
         self.assertEqual(res.status_code, 409)
+
+
+# ---------------------------------------------------------------------------
+# Handoff #9 §I — question lifecycle: soft delete, versioned edits, library
+# ---------------------------------------------------------------------------
+
+from django.utils import timezone as _tz  # noqa: E402
+
+from games.models import BoardCell, BoardColumn, Game  # noqa: E402
+from games.services import replace_cell_question, usable_questions  # noqa: E402
+from trivia.similarity import similar_questions  # noqa: E402
+
+
+class QuestionLifecycleBase(BaseCase):
+    """Shared fixtures: one public-approved category with approved questions,
+    and a helper that puts a question on a (played) board."""
+
+    def setUp(self):
+        super().setUp()
+        self.cat = make_category(self.creator, "History", public_approved=True)
+        self.q1 = make_question(
+            self.creator, self.cat, "Who crossed the Rubicon?",
+            status=ModerationStatus.APPROVED, visibility=Visibility.PUBLIC,
+        )
+        self.q2 = make_question(
+            self.creator, self.cat, "Who crossed the Delaware?",
+            status=ModerationStatus.APPROVED, visibility=Visibility.PUBLIC,
+        )
+
+    def play_in_game(self, question, host=None):
+        game = Game.objects.create(host=host or self.creator, mode="points")
+        column = BoardColumn.objects.create(game=game, category=question.category, position=0)
+        cell = BoardCell.objects.create(game=game, column=column, question=question, row=0, value=100)
+        return game, cell
+
+    def soft_delete(self, question):
+        question.deleted_at = _tz.now()
+        question.save(update_fields=["deleted_at"])
+        return question
+
+
+class SoftDeleteAbsenceAuditTests(QuestionLifecycleBase):
+    """§I1: one test per 'active questions' surface — a deleted question is
+    absent from each, while its undeleted siblings are unaffected."""
+
+    def setUp(self):
+        super().setUp()
+        self.soft_delete(self.q1)
+
+    def test_absent_from_public_question_listing(self):
+        self.auth(self.free)
+        ids = {q["id"] for q in self.client.get("/api/questions/").data["results"]}
+        self.assertNotIn(self.q1.id, ids)
+        self.assertIn(self.q2.id, ids)
+
+    def test_absent_from_owner_listing_and_detail_404s(self):
+        self.auth(self.creator)
+        ids = {q["id"] for q in self.client.get("/api/questions/").data["results"]}
+        self.assertNotIn(self.q1.id, ids)
+        self.assertEqual(self.client.get(f"/api/questions/{self.q1.id}/").status_code, 404)
+        self.assertEqual(self.client.patch(f"/api/questions/{self.q1.id}/", {"answer": "X"}).status_code, 404)
+
+    def test_absent_from_usable_question_count(self):
+        self.assertEqual(self.cat.usable_question_count(self.creator), 1)
+        self.assertEqual(self.cat.usable_question_count(None), 1)
+
+    def test_absent_from_game_builds_and_replace_pool(self):
+        self.assertEqual(
+            set(usable_questions(self.cat, self.creator).values_list("id", flat=True)), {self.q2.id}
+        )
+        # §J3 replace draws through the same pool: with q2 on the board and
+        # q1 deleted, there is nothing left to swap in.
+        game, cell = self.play_in_game(self.q2)
+        with self.assertRaises(Exception) as ctx:
+            replace_cell_question(code=game.code, cell_id=cell.id, host=self.creator)
+        self.assertIn("No other usable questions", str(ctx.exception))
+
+    def test_absent_from_moderation_pending_queue_and_counts(self):
+        pending = make_question(
+            self.other, self.cat, "Pending then deleted?",
+            status=ModerationStatus.PENDING, visibility=Visibility.PUBLIC,
+        )
+        self.soft_delete(pending)
+        self.auth(self.staff)
+        ids = {q["id"] for q in self.client.get("/api/moderation/questions/").data["results"]}
+        self.assertNotIn(pending.id, ids)
+        self.assertEqual(self.client.get("/api/moderation/counts/").data["questions"], 0)
+
+    def test_absent_from_flags_list(self):
+        QuestionReport.objects.create(question=self.q1, reporter=self.other, reason="stale")
+        self.auth(self.staff)
+        ids = {q["id"] for q in self.client.get("/api/moderation/flags/").data["results"]}
+        self.assertNotIn(self.q1.id, ids)
+
+    def test_absent_from_similarity_pool(self):
+        probe = make_question(
+            self.other, self.cat, "Who crossed the Rubicon river?",
+            status=ModerationStatus.PENDING, visibility=Visibility.PUBLIC,
+        )
+        matches = {m["id"] for m in similar_questions(probe)}
+        self.assertNotIn(self.q1.id, matches)
+
+    def test_absent_from_bulk_duplicate_check(self):
+        # Deleting a question then re-uploading the same text must create it,
+        # not skip it as a duplicate.
+        self.auth(self.creator)
+        row = f"History,{self.q1.question_text},Caesar,1,private\n"
+        res = self.client.post(
+            "/api/questions/bulk/", {"file": csv_file(HEADER + row), "skip_duplicates": "true"}
+        )
+        self.assertEqual(res.status_code, 201, res.content)
+        self.assertEqual(res.data["created"], 1)
+        self.assertEqual(res.data["skipped"], [])
+
+    def test_absent_from_quota_counters(self):
+        from accounts.quotas import questions_used, storage_bytes_used
+
+        self.assertEqual(questions_used(self.creator), 1)  # q2 only
+        Question.objects.filter(pk=self.q2.pk).update(media_bytes=1000)
+        Question.objects.filter(pk=self.q1.pk).update(media_bytes=5000)
+        self.assertEqual(storage_bytes_used(self.creator), 1000)
+
+
+class SoftDeleteEndpointTests(QuestionLifecycleBase):
+    def test_owner_delete_is_soft_and_survives_played_games(self):
+        """The latent ProtectedError bug: deleting an ever-played question
+        used to 500. Now it's a 204 soft delete and the game report still
+        shows the question's text."""
+        game, cell = self.play_in_game(self.q1)
+        game.status = "finished"
+        game.finished_at = _tz.now()
+        game.save(update_fields=["status", "finished_at"])
+        self.auth(self.creator)
+        res = self.client.delete(f"/api/questions/{self.q1.id}/")
+        self.assertEqual(res.status_code, 204, res.content)
+        self.q1.refresh_from_db()  # row intact, flagged deleted
+        self.assertIsNotNone(self.q1.deleted_at)
+        report = self.client.get(f"/api/games/{game.code}/report/")
+        self.assertEqual(report.status_code, 200, report.content)
+        texts = [q["question_text"] for col in report.data["columns"] for q in col["questions"]]
+        self.assertIn("Who crossed the Rubicon?", texts)
+
+    def test_staff_delete_any_owners_question_and_409_on_repeat(self):
+        self.auth(self.staff)
+        res = self.client.post(f"/api/moderation/questions/{self.q1.id}/delete/")
+        self.assertEqual(res.status_code, 200, res.content)
+        self.assertIsNotNone(res.data["deleted_at"])
+        self.assertEqual(self.client.post(f"/api/moderation/questions/{self.q1.id}/delete/").status_code, 409)
+
+    def test_staff_delete_resolves_open_flags(self):
+        QuestionReport.objects.create(question=self.q1, reporter=self.other, reason="bad")
+        self.auth(self.staff)
+        self.client.post(f"/api/moderation/questions/{self.q1.id}/delete/")
+        self.assertFalse(self.q1.reports.filter(status=ReportStatus.OPEN).exists())
+        self.assertTrue(self.q1.reports.filter(status=ReportStatus.RESOLVED).exists())
+
+    def test_new_endpoints_are_staff_only(self):
+        for user in (self.creator, self.free):
+            self.auth(user)
+            self.assertEqual(self.client.post(f"/api/moderation/questions/{self.q1.id}/delete/").status_code, 403)
+            self.assertEqual(
+                self.client.post(f"/api/moderation/questions/{self.q1.id}/revise/", {"answer": "X"}).status_code,
+                403,
+            )
+
+    def test_review_actions_409_on_deleted_question(self):
+        pending = make_question(
+            self.other, self.cat, "Deleted mid-review?",
+            status=ModerationStatus.PENDING, visibility=Visibility.PUBLIC,
+        )
+        self.soft_delete(pending)
+        self.auth(self.staff)
+        self.assertEqual(self.client.post(f"/api/moderation/questions/{pending.id}/approve/").status_code, 409)
+        self.assertEqual(
+            self.client.post(f"/api/moderation/questions/{pending.id}/reject/", {"note": "x"}).status_code, 409
+        )
+
+
+class ReviseEndpointTests(QuestionLifecycleBase):
+    def test_revise_lineage(self):
+        """Old row soft-deleted with replaced_by set; new row approved, same
+        owner/category, edits applied, untouched fields copied; open flags on
+        the old row resolved."""
+        QuestionReport.objects.create(question=self.q1, reporter=self.other, reason="typo")
+        self.auth(self.staff)
+        res = self.client.post(
+            f"/api/moderation/questions/{self.q1.id}/revise/",
+            {"question_text": "Who crossed the Rubicon in 49 BC?", "difficulty": 3},
+        )
+        self.assertEqual(res.status_code, 201, res.content)
+        new_id = res.data["id"]
+        self.assertNotEqual(new_id, self.q1.id)
+        new = Question.objects.get(pk=new_id)
+        self.q1.refresh_from_db()
+        self.assertIsNotNone(self.q1.deleted_at)
+        self.assertEqual(self.q1.replaced_by_id, new.id)
+        self.assertEqual(new.question_text, "Who crossed the Rubicon in 49 BC?")
+        self.assertEqual(new.difficulty, 3)
+        self.assertEqual(new.answer, self.q1.answer)  # untouched field copied
+        self.assertEqual(new.owner_id, self.creator.id)
+        self.assertEqual(new.category_id, self.cat.id)
+        self.assertEqual(new.moderation_status, ModerationStatus.APPROVED)
+        self.assertIsNone(new.deleted_at)
+        self.assertFalse(self.q1.reports.filter(status=ReportStatus.OPEN).exists())
+
+    def test_revise_keeps_media_by_reference(self):
+        Question.objects.filter(pk=self.q1.pk).update(image="questions/images/shared.jpg", media_type="image")
+        self.q1.refresh_from_db()
+        self.auth(self.staff)
+        res = self.client.post(f"/api/moderation/questions/{self.q1.id}/revise/", {"answer": "Julius Caesar"})
+        self.assertEqual(res.status_code, 201, res.content)
+        new = Question.objects.get(pk=res.data["id"])
+        self.assertEqual(new.image.name, "questions/images/shared.jpg")  # same file, two rows
+
+    def test_played_games_keep_the_old_text(self):
+        game, cell = self.play_in_game(self.q1)
+        self.auth(self.staff)
+        res = self.client.post(f"/api/moderation/questions/{self.q1.id}/revise/", {"question_text": "New text?"})
+        self.assertEqual(res.status_code, 201)
+        cell.refresh_from_db()
+        self.assertEqual(cell.question_id, self.q1.id)  # cell still points at the OLD row
+        self.assertEqual(cell.question.question_text, "Who crossed the Rubicon?")
+
+    def test_revise_validation_and_conflicts(self):
+        self.auth(self.staff)
+        # 400s: empty payload, blank text, out-of-range difficulty, bad visibility
+        self.assertEqual(self.client.post(f"/api/moderation/questions/{self.q1.id}/revise/", {}).status_code, 400)
+        self.assertEqual(
+            self.client.post(f"/api/moderation/questions/{self.q1.id}/revise/", {"question_text": "  "}).status_code,
+            400,
+        )
+        self.assertEqual(
+            self.client.post(f"/api/moderation/questions/{self.q1.id}/revise/", {"difficulty": 9}).status_code, 400
+        )
+        self.assertEqual(
+            self.client.post(f"/api/moderation/questions/{self.q1.id}/revise/", {"visibility": "secret"}).status_code,
+            400,
+        )
+        # 409 on already-deleted (a second revise of the same row)
+        self.client.post(f"/api/moderation/questions/{self.q1.id}/revise/", {"answer": "Caesar"})
+        self.assertEqual(
+            self.client.post(f"/api/moderation/questions/{self.q1.id}/revise/", {"answer": "Nope"}).status_code, 409
+        )
+
+
+class LibraryApiTests(QuestionLifecycleBase):
+    """§I4: search / filters / deleted view / ordering / real pagination."""
+
+    def setUp(self):
+        super().setUp()
+        self.official_cat = make_category(None, "Official Cat", public_approved=True)
+        self.official_q = Question.objects.create(
+            owner=None, category=self.official_cat, question_text="Official filler?",
+            answer="Yes", difficulty=1, visibility=Visibility.PUBLIC,
+            moderation_status=ModerationStatus.APPROVED,
+        )
+        self.deleted_q = self.soft_delete(
+            make_question(self.creator, self.cat, "Gone soon?", status=ModerationStatus.APPROVED,
+                          visibility=Visibility.PUBLIC)
+        )
+        self.auth(self.staff)
+
+    def lib(self, params):
+        res = self.client.get(f"/api/moderation/questions/?status=all&{params}")
+        self.assertEqual(res.status_code, 200, res.content)
+        return res.data
+
+    def test_search_matches_text_or_answer(self):
+        data = self.lib("search=rubicon")
+        self.assertEqual({r["id"] for r in data["results"]}, {self.q1.id})
+        data = self.lib("search=yes")  # the official row's ANSWER
+        self.assertIn(self.official_q.id, {r["id"] for r in data["results"]})
+
+    def test_owner_filter_and_official(self):
+        data = self.lib("owner=creator@")
+        self.assertEqual({r["owner_email"] for r in data["results"]}, {"creator@test.com"})
+        data = self.lib("owner=official")
+        self.assertEqual({r["id"] for r in data["results"]}, {self.official_q.id})
+
+    def test_category_and_status_filters(self):
+        data = self.lib(f"category={self.official_cat.id}")
+        self.assertEqual({r["id"] for r in data["results"]}, {self.official_q.id})
+        res = self.client.get("/api/moderation/questions/?status=approved")
+        ids = {r["id"] for r in res.data["results"]}
+        self.assertIn(self.q1.id, ids)
+        self.assertNotIn(self.deleted_q.id, ids)  # deleted default = active
+
+    def test_deleted_only_and_all(self):
+        data = self.lib("deleted=only")
+        self.assertEqual({r["id"] for r in data["results"]}, {self.deleted_q.id})
+        self.assertIsNotNone(data["results"][0]["deleted_at"])
+        self.assertIn("replaced_by", data["results"][0])
+        all_ids = {r["id"] for r in self.lib("deleted=all")["results"]}
+        self.assertIn(self.deleted_q.id, all_ids)
+        self.assertIn(self.q1.id, all_ids)
+        self.assertEqual(self.client.get("/api/moderation/questions/?deleted=bogus").status_code, 400)
+
+    def test_ordering_whitelist(self):
+        self.play_in_game(self.q2)  # q2 gets usage_count 1
+        data = self.lib("ordering=-usage_count")
+        self.assertEqual(data["results"][0]["id"], self.q2.id)
+        self.assertEqual(self.client.get("/api/moderation/questions/?ordering=answer").status_code, 400)
+
+    def test_pagination_shape_and_page_size(self):
+        for i in range(30):
+            make_question(self.creator, self.cat, f"Filler {i}?", status=ModerationStatus.APPROVED,
+                          visibility=Visibility.PUBLIC)
+        data = self.lib("")
+        self.assertEqual(set(data) >= {"results", "count", "next", "previous"}, True)
+        self.assertEqual(len(data["results"]), 25)  # explicit library page size
+        self.assertIsNotNone(data["next"])
+
+    def test_pending_queue_default_unchanged(self):
+        """The queue tabs keep their exact defaults: pending-only, active-only,
+        oldest first — no new parameter leaks into the default view."""
+        pending = make_question(self.other, self.cat, "Still queued?",
+                                status=ModerationStatus.PENDING, visibility=Visibility.PUBLIC)
+        res = self.client.get("/api/moderation/questions/")
+        self.assertEqual([r["id"] for r in res.data["results"]], [pending.id])
+
+
+# ---------------------------------------------------------------------------
+# Handoff #9 §K3 — moderation outcome emails
+# ---------------------------------------------------------------------------
+
+from django.core import mail  # noqa: E402
+
+
+class ModerationEmailTests(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.cat = make_category(self.creator, "Music", public_approved=True)
+        self.q = make_question(self.creator, self.cat, "Who wrote Hey Jude?",
+                               status=ModerationStatus.PENDING, visibility=Visibility.PUBLIC)
+        self.auth(self.staff)
+
+    def test_approve_emails_the_owner(self):
+        res = self.client.post(f"/api/moderation/questions/{self.q.id}/approve/")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(len(mail.outbox), 1)
+        msg = mail.outbox[0]
+        self.assertEqual(msg.to, ["creator@test.com"])
+        self.assertIn("approved", msg.subject)
+        self.assertIn("Who wrote Hey Jude?", msg.body)
+        self.assertIn("Music", msg.body)
+
+    def test_reject_emails_the_owner_with_the_note(self):
+        res = self.client.post(f"/api/moderation/questions/{self.q.id}/reject/", {"note": "Too easy"})
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("Too easy", mail.outbox[0].body)
+
+    def test_category_approval_emails_too(self):
+        pending_cat = Category.objects.create(
+            owner=self.creator, name="Pending Cat", visibility=Visibility.PUBLIC,
+            moderation_status=ModerationStatus.PENDING,
+        )
+        self.client.post(f"/api/moderation/categories/{pending_cat.id}/approve/")
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("category", mail.outbox[0].subject)
+        self.assertIn("Pending Cat", mail.outbox[0].body)
+
+    def test_official_content_sends_nothing(self):
+        official = make_question(None, self.cat, "Official pending?",
+                                 status=ModerationStatus.PENDING, visibility=Visibility.PUBLIC)
+        self.client.post(f"/api/moderation/questions/{official.id}/approve/")
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_self_approval_sends_nothing(self):
+        own = make_question(self.staff, self.cat, "Staff's own?",
+                            status=ModerationStatus.PENDING, visibility=Visibility.PUBLIC)
+        self.client.post(f"/api/moderation/questions/{own.id}/approve/")
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_flag_resolve_reject_emails_through_the_same_helper(self):
+        self.q.moderation_status = ModerationStatus.APPROVED
+        self.q.save(update_fields=["moderation_status"])
+        QuestionReport.objects.create(question=self.q, reporter=self.other, reason="wrong answer")
+        res = self.client.post(f"/api/moderation/flags/{self.q.id}/resolve/",
+                               {"action": "reject", "note": "Answer is wrong"})
+        self.assertEqual(res.status_code, 200, res.content)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("Answer is wrong", mail.outbox[0].body)
+
+    def test_email_failure_never_breaks_the_action(self):
+        with patch("accounts.emails.send_mail", side_effect=RuntimeError("ESP down")):
+            res = self.client.post(f"/api/moderation/questions/{self.q.id}/approve/")
+        self.assertEqual(res.status_code, 200, res.content)
+        self.q.refresh_from_db()
+        self.assertEqual(self.q.moderation_status, ModerationStatus.APPROVED)

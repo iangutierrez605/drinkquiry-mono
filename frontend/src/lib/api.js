@@ -2,6 +2,8 @@
 // The backend contract is fixed (see the handoff doc); this file is the only
 // place that knows URLs and auth header formats.
 
+import { clearAuth } from "./storage";
+
 // API base resolution (Handoff #5) — no hardcoded hosts anywhere:
 // 1. VITE_API_BASE, if set, always wins (build-time env; "" means same-origin).
 // 2. On the Vite dev server (port 5173/3000), assume Django on port 8000 of
@@ -87,10 +89,11 @@ async function request(path, { method = "GET", body, authToken, formData } = {})
   if (!res.ok) {
     // Knox tokens expire (default 10h). A 401 on an authed call means the
     // stored host login is dead — clear it so the next visit shows the login
-    // form instead of erroring forever.
+    // form instead of erroring forever. clearAuth (not a raw removeItem) so
+    // the §F SiteNav hears about it and flips to "Log in" immediately.
     if (res.status === 401 && authToken) {
       try {
-        localStorage.removeItem("dq_auth");
+        clearAuth();
       } catch {
         /* storage unavailable */
       }
@@ -125,6 +128,22 @@ export const api = {
     request("/api/auth/login/", { method: "POST", body: { email, password } }),
   logout: (token) => request("/api/auth/logout/", { method: "POST", authToken: token }),
   profile: (token) => request("/api/auth/profile/", { authToken: token }),
+
+  // ---- Password flows (§K, Handoff #9) ----
+  // forgot ALWAYS 200s with the same body (no user enumeration server-side).
+  passwordForgot: (email) =>
+    request("/api/auth/password/forgot/", { method: "POST", body: { email } }),
+  passwordReset: (uid, token, newPassword) =>
+    request("/api/auth/password/reset/", {
+      method: "POST",
+      body: { uid, token, new_password: newPassword },
+    }),
+  passwordChange: (token, currentPassword, newPassword) =>
+    request("/api/auth/password/change/", {
+      method: "POST",
+      authToken: token,
+      body: { current_password: currentPassword, new_password: newPassword },
+    }),
 
   // ---- Content ----
   categories: (token) => allPages("/api/categories/", token),
@@ -164,6 +183,38 @@ export const api = {
   // §K1: near-duplicate review aid — fetched per card so the queue stays snappy.
   moderationSimilar: (token, id) =>
     request(`/api/moderation/questions/${id}/similar/`, { authToken: token }),
+
+  // ---- §I (Handoff #9): the staff question library ----
+  // REAL pagination — returns {results, count, next, previous} as-is; never
+  // run this through allPages (the library is the "thousands of questions"
+  // surface; the pending-queue tabs keep allPages for their small worklists).
+  // `params` is a plain object; empty values are dropped.
+  moderationLibrary: (token, params = {}) => {
+    const qs = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v !== "" && v != null),
+    ).toString();
+    return request(`/api/moderation/questions/?${qs}`, { authToken: token });
+  },
+  // §I3: versioned edit — the response is the NEW question row (201).
+  moderationRevise: (token, id, changes) =>
+    request(`/api/moderation/questions/${id}/revise/`, { method: "POST", authToken: token, body: changes }),
+  // §I2: staff soft delete (any owner's question); 409 if already deleted.
+  moderationDelete: (token, id) =>
+    request(`/api/moderation/questions/${id}/delete/`, { method: "POST", authToken: token }),
+
+  // ---- §J (Handoff #9): staff user management ----
+  // Paginated like the library: {results, count, next, previous} as-is.
+  adminUsers: (token, params = {}) => {
+    const qs = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v !== "" && v != null),
+    ).toString();
+    return request(`/api/moderation/users/?${qs}`, { authToken: token });
+  },
+  // PATCH accepts plan / plan_expires_at / limit_overrides ONLY (anything
+  // else is a server-side 400 — is_staff editing stays in Django admin).
+  adminUserPatch: (token, id, changes) =>
+    request(`/api/moderation/users/${id}/`, { method: "PATCH", authToken: token, body: changes }),
+
   // §K2: the Flagged tab (open host reports, grouped per question) + resolve.
   moderationFlags: (token) => request("/api/moderation/flags/", { authToken: token }),
   moderationFlagResolve: (token, questionId, action, note) =>

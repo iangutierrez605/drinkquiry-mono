@@ -227,4 +227,24 @@ PLAN_LIMITS = {
 # snapshot's top-level `max_players` so frontends never hardcode the number.
 MAX_PLAYERS_PER_GAME = 6
 
+# --- Transactional email (Handoff #9 §K): Resend via Anymail ---------------
+# Env-driven with a console fallback, so dev and the test suite never need a
+# key (Django's test runner swaps in locmem regardless). Set RESEND_API_KEY
+# to flip to real sending. Resend API keys are ACCOUNT-scoped; domains are
+# verified per-domain within the account — the existing eventquiry key can
+# send for drinkquiry.com once that domain (+ its SPF/DKIM DNS records) is
+# added in the Resend dashboard. Until then, DEFAULT_FROM_EMAIL can point at
+# the already-verified eventquiry.com as a stopgap (works, but off-brand and
+# the from-domain/link-domain mismatch reads phishy — see CHANGES.md).
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+if RESEND_API_KEY:
+    EMAIL_BACKEND = "anymail.backends.resend.EmailBackend"
+    ANYMAIL = {"RESEND_API_KEY": RESEND_API_KEY}
+else:
+    EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
+DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "Drinkquiry <hello@drinkquiry.com>")
+# Where password-reset links point (the SPA's public origin). The dev default
+# is the Vite dev server.
+FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "http://localhost:5173").rstrip("/")
+
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"

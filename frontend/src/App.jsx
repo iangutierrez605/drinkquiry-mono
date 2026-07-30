@@ -1,4 +1,4 @@
-import { BrowserRouter, Link, Route, Routes, useNavigate } from "react-router-dom";
+import { BrowserRouter, Link, Outlet, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { useState } from "react";
 import HostPage from "./pages/HostPage";
 import CreatePage from "./pages/CreatePage";
@@ -6,6 +6,10 @@ import BoardPage from "./pages/BoardPage";
 import BuzzerPage from "./pages/BuzzerPage";
 import ModeratePage from "./pages/ModeratePage";
 import ProfilePage from "./pages/ProfilePage";
+import ResetPasswordPage from "./pages/ResetPasswordPage";
+import AuthScreen from "./components/AuthScreen";
+import SiteNav from "./components/SiteNav";
+import AgeGate from "./components/AgeGate";
 
 /**
  * §H5 (Handoff #8): a real landing page. The join-code input is still the
@@ -78,26 +82,59 @@ function Landing() {
 
       <footer className="landingfoot">
         <span className="wordmark wordmark--small">DRINKQUIRY</span>
-        <nav className="landingfoot__nav">
-          <Link to="/host">Host</Link>
-          <Link to="/create">Make questions</Link>
-          <Link to="/profile">Profile</Link>
-        </nav>
+        {/* §F3: the footer's Host/Make questions/Profile links moved to the
+            SiteNav above — keeping both would be the same list twice. */}
         <span className="landingfoot__note">Please drink responsibly — it's a quiz, not a contest. 🍻</span>
       </footer>
     </div>
   );
 }
 
+/**
+ * §F3 (Handoff #9): /login — the SiteNav's auth corner lands here. Renders
+ * the shared AuthScreen; after auth, honor ?next= (e.g. a deep link that
+ * bounced someone here), else the classic destination: /host.
+ */
+function LoginPage() {
+  const navigate = useNavigate();
+  const next = new URLSearchParams(useLocation().search).get("next");
+  return <AuthScreen onAuthed={() => navigate(next || "/host")} />;
+}
+
+/**
+ * §F (Handoff #9): chrome layout. The SiteNav renders on every routed page
+ * that nests under this layout; the two game surfaces (/board/:code TV and
+ * /game/buzzer/:code phone) sit OUTSIDE it — the TV is a clean shared
+ * display and the buzzer is a full-screen party surface for people who may
+ * have no account (the owner asked "except the game board"; extending the
+ * exception to the buzzer follows the same logic — a one-line revert if
+ * unwanted: move its Route inside this layout).
+ */
+function ChromeLayout() {
+  return (
+    <>
+      <SiteNav />
+      <Outlet />
+    </>
+  );
+}
+
 export default function App() {
   return (
     <BrowserRouter>
+      {/* §H: the age gate renders above EVERYTHING, all routes — including
+          the game surfaces. One confirm per browser (localStorage). */}
+      <AgeGate />
       <Routes>
-        <Route path="/" element={<Landing />} />
-        <Route path="/host" element={<HostPage />} />
-        <Route path="/create" element={<CreatePage />} />
-        <Route path="/moderate" element={<ModeratePage />} />
-        <Route path="/profile" element={<ProfilePage />} />
+        <Route element={<ChromeLayout />}>
+          <Route path="/" element={<Landing />} />
+          <Route path="/login" element={<LoginPage />} />
+          <Route path="/reset-password" element={<ResetPasswordPage />} />
+          <Route path="/host" element={<HostPage />} />
+          <Route path="/create" element={<CreatePage />} />
+          <Route path="/moderate" element={<ModeratePage />} />
+          <Route path="/profile" element={<ProfilePage />} />
+        </Route>
         <Route path="/board/:code" element={<BoardPage />} />
         <Route path="/game/buzzer/:code" element={<BuzzerPage />} />
       </Routes>

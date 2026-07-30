@@ -184,19 +184,54 @@ export default function BoardPage() {
 
       {game.status === "active" && !cell && <BoardGrid game={game} />}
 
-      {game.status === "active" && cell && (
-        <div className="tv__question">
-          {/* §F: with a verdict (or a revealed answer) on screen, the board
-              LEADS with it and the buzzer-lock chip disappears entirely — no
-              green→red flash stealing the moment (the lock is implied). The
-              verdict + answer render before the question text so the payoff
-              owns the top of the screen. */}
-          {judgment && (
-            <div className={`tv__verdict ${judgment.correct ? "tv__verdict--right" : "tv__verdict--wrong"}`}>
-              {judgment.correct ? "✔ CORRECT" : "✘ WRONG"} — {judgment.name}
+      {/* §G1 (Handoff #9): a CORRECT verdict hands the whole screen to the
+          moment — full overlay with the winner's name as the star, the
+          answer beneath it (§G2's card treatment), and the drink line
+          rendered LIVE (the drink is assigned while this is up). It lives
+          exactly as long as the judgment marker does; #8's clearing points
+          (close, reset, explicit reopen, next buzz, next cell) already
+          handle every exit, so there is zero backend change and both WS and
+          polling boards get it (snapshot-only inputs, §C2). */}
+      {game.status === "active" && cell && judgment?.correct && (
+        <div className="tv__takeover" role="status">
+          <div className="tv__takeoverEyebrow">✔ CORRECT</div>
+          <div className="tv__takeoverName">{judgment.name}</div>
+          {revealedAnswer != null && (
+            <div className="tv__answercard tv__answercard--takeover">
+              <span className="tv__answercardLabel">the answer</span>
+              <span className="tv__answercardText">{revealedAnswer}</span>
             </div>
           )}
-          {revealedAnswer != null && <div className="tv__answer">{revealedAnswer}</div>}
+          {cell.drink_assignment && (
+            <div className="tv__drinkline">
+              {cell.drink_assignment.from_name} sends {cell.drink_assignment.amount}{" "}
+              drink{cell.drink_assignment.amount === 1 ? "" : "s"} to {cell.drink_assignment.to_name} 🍺
+            </div>
+          )}
+        </div>
+      )}
+
+      {game.status === "active" && cell && (
+        <div className={`tv__question ${revealedAnswer != null ? "tv__question--revealed" : ""}`}>
+          {/* §F (#8): with a verdict (or a revealed answer) on screen, the
+              board LEADS with it and the buzzer-lock chip disappears — no
+              green→red flash stealing the moment. §G (#9): a CORRECT verdict
+              is now the full takeover above, so only the WRONG banner
+              renders here (wrong answers shouldn't own the room). */}
+          {judgment && !judgment.correct && (
+            <div className="tv__verdict tv__verdict--wrong">✘ WRONG — {judgment.name}</div>
+          )}
+          {/* §G2: the revealed answer gets a home (near-black card, gold
+              border + glow) while everything around it dims via the
+              --revealed modifier — pop by SUBTRACTION, not more size. Used
+              for the host's explicit "nobody got it" reveal here, and the
+              same card renders inside the §G1 takeover. */}
+          {revealedAnswer != null && (
+            <div className="tv__answercard">
+              <span className="tv__answercardLabel">the answer</span>
+              <span className="tv__answercardText">{revealedAnswer}</span>
+            </div>
+          )}
           <div className="tv__qtop">
             <span className="valuechip valuechip--tv">
               {game.mode === "drinks" ? `${cell.value} DRINKS` : `${cell.value} POINTS`}

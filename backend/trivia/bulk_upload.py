@@ -227,7 +227,12 @@ def _parse_csv_text(text, user, *, official: bool, skip_duplicates: bool,
 
     # Existing (category_id, question_text) pairs for duplicate detection.
     owner_filter = {"owner__isnull": True} if official else {"owner": user}
-    existing = set(Question.objects.filter(**owner_filter).values_list("category_id", "question_text"))
+    # §I (Handoff #9): a soft-deleted question is not a duplicate — deleting
+    # one and re-uploading the same text must work.
+    existing = set(
+        Question.objects.filter(deleted_at__isnull=True, **owner_filter)
+        .values_list("category_id", "question_text")
+    )
     seen_in_file: set[tuple, ] = set()
 
     data_rows = list(reader)

@@ -20,20 +20,54 @@ Endpoints (all `IsAdminUser` — the frontend's is_staff gate is cosmetic):
                                               reject (status=rejected + note).
                                               Both resolve all open reports.
 
+Handoff #9 additions:
+
+  GET  /api/moderation/questions/             now also the LIBRARY backend
+                                              (§I4): ?search= (text/answer
+                                              icontains), ?category=<id>,
+                                              ?status= gains "all",
+                                              ?owner= (email icontains,
+                                              "official" = owner-less),
+                                              ?deleted=active|only|all
+                                              (default active — the ONE staff
+                                              surface where deleted rows are
+                                              visible), ?ordering= whitelist
+                                              (created_at / usage_count, ±),
+                                              page_size 25.
+  POST /api/moderation/questions/{id}/delete/ §I2 staff soft delete (any
+                                              owner's); 409 if already
+                                              deleted; resolves open flags.
+  POST /api/moderation/questions/{id}/revise/ §I3 versioned edit: NEW
+                                              approved row with the edits,
+                                              old row soft-deleted +
+                                              replaced_by set, open flags
+                                              resolved. Games already built
+                                              keep the OLD text (their cells
+                                              point at the old row —
+                                              deliberate; no mid-game swaps).
+
+Approving/rejecting now emails the owner (§K3, accounts/emails.py) — skipped
+for official content and staff self-review; a send failure never breaks the
+action.
+
 Approving a category does NOT touch its questions — every item is vetted
 separately. Double-acting reviewers get a 409 (no locking; last write would
 win otherwise, and a plain status check is enough for a two-person team).
 §K deliberately does not reshape those approve/reject mechanics — the flag
 flow resolves through its own endpoint, applying the same fields.
 """
-from django.db.models import Count, Prefetch
-from rest_framework import mixins, status, viewsets
+from django.db import transaction
+from django.db.models import Count, Prefetch, Q
+from django.utils import timezone
+from rest_framework import mixins, pagination, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import Category, ModerationStatus, Question, QuestionReport, ReportStatus
+from accounts.emails import send_moderation_outcome_email
+
+from .models import Category, ModerationStatus, Question, QuestionReport, ReportStatus, Visibility
 from .serializers import (
     FlaggedQuestionSerializer,
     ModerationCategorySerializer,
@@ -53,15 +87,28 @@ class _ModerationViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, views
         if self.action != "list":
             return qs  # detail/actions must see any status so non-pending → 409, not 404
         wanted = self.request.query_params.get("status", ModerationStatus.PENDING)
+        # §I4: "all" skips the status filter (the library's default view).
+        # A NEW accepted value — the queue's default (pending) is unchanged.
+        if wanted == "all":
+            return qs
         if wanted not in VALID_STATUSES:
             # Raised as a DRF ValidationError → clean 400 with the valid choices.
             from rest_framework.exceptions import ValidationError
 
-            raise ValidationError({"status": f"Unknown status. One of: {', '.join(sorted(VALID_STATUSES))}."})
+            raise ValidationError(
+                {"status": f"Unknown status. One of: {', '.join(sorted(VALID_STATUSES | {'all'}))}."}
+            )
         return qs.filter(moderation_status=wanted)
 
     def _act(self, request, *, approve: bool):
         obj = self.get_object()
+        # §I2: a soft-deleted question can't be reviewed (categories have no
+        # deleted_at; getattr keeps this shared body model-agnostic).
+        if getattr(obj, "deleted_at", None) is not None:
+            return Response(
+                {"detail": "This question was deleted — nothing to review."},
+                status=status.HTTP_409_CONFLICT,
+            )
         if obj.moderation_status != ModerationStatus.PENDING:
             return Response(
                 {"detail": "Only pending items can be actioned — someone may have reviewed this already."},
@@ -77,6 +124,9 @@ class _ModerationViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, views
             obj.moderation_status = ModerationStatus.REJECTED
             obj.moderation_note = note
         obj.save(update_fields=["moderation_status", "moderation_note", "updated_at"])
+        # §K3: tell the owner. Skips official content and self-review inside
+        # the helper; a send failure logs a warning and never breaks the 200.
+        send_moderation_outcome_email(obj, approved=approve, actor=request.user)
         return Response(self.get_serializer(obj).data)
 
     @action(detail=True, methods=["post"])
@@ -98,14 +148,60 @@ class ModerationCategoryViewSet(_ModerationViewSet):
         return super().get_queryset().annotate(usage_count=Count("boardcolumn", distinct=True))
 
 
+class LibraryPagination(pagination.PageNumberPagination):
+    """§I4/§J2: explicit page size for the staff library surfaces — real
+    pagination is the point ("we may have thousands"); the frontend renders
+    prev/next from {results, count, next, previous} and never uses the
+    allPages helper here."""
+
+    page_size = 25
+
+
+LIBRARY_ORDERINGS = ("created_at", "-created_at", "usage_count", "-usage_count")
+
+
 class ModerationQuestionViewSet(_ModerationViewSet):
     model = Question
     serializer_class = ModerationQuestionSerializer
+    pagination_class = LibraryPagination
 
     def get_queryset(self):
         qs = super().get_queryset()
         # §J1: usage = cells referencing the question, across all games.
-        return qs.select_related("category").annotate(usage_count=Count("boardcell", distinct=True))
+        qs = qs.select_related("category").annotate(usage_count=Count("boardcell", distinct=True))
+        if self.action != "list":
+            return qs  # detail/actions see deleted rows too (revise/delete 409 cleanly)
+
+        params = self.request.query_params
+        from rest_framework.exceptions import ValidationError
+
+        # §I4 ?deleted= — default "active" keeps the pending queue exactly as
+        # it was; "only"/"all" make this the ONE staff surface where deleted
+        # rows are visible (with deleted_at + replaced_by in the serializer).
+        deleted = params.get("deleted", "active")
+        if deleted == "active":
+            qs = qs.filter(deleted_at__isnull=True)
+        elif deleted == "only":
+            qs = qs.filter(deleted_at__isnull=False)
+        elif deleted != "all":
+            raise ValidationError({"deleted": "One of: active, only, all."})
+
+        if search := params.get("search", "").strip():
+            qs = qs.filter(Q(question_text__icontains=search) | Q(answer__icontains=search))
+        if category := params.get("category", "").strip():
+            if not category.isdigit():
+                raise ValidationError({"category": "Must be a category id."})
+            qs = qs.filter(category_id=category)
+        # ?owner= — email icontains; the special value "official" means
+        # owner-less (site-provided) content.
+        if owner := params.get("owner", "").strip():
+            qs = qs.filter(owner__isnull=True) if owner == "official" else qs.filter(owner__email__icontains=owner)
+
+        if ordering := params.get("ordering", "").strip():
+            if ordering not in LIBRARY_ORDERINGS:
+                raise ValidationError({"ordering": f"One of: {', '.join(LIBRARY_ORDERINGS)}."})
+            qs = qs.order_by(ordering, "id")  # id tiebreak: deterministic pages
+        return qs
 
     @action(detail=True, methods=["get"])
     def similar(self, request, pk=None):
@@ -115,6 +211,118 @@ class ModerationQuestionViewSet(_ModerationViewSet):
         AID, not auto-rejection; works for any status so the Flagged tab can
         reuse it on approved questions."""
         return Response({"similar": similar_questions(self.get_object())})
+
+    @action(detail=True, methods=["post"], url_path="delete")
+    def soft_delete(self, request, pk=None):
+        """§I2 staff delete: soft-deletes ANY owner's question (the
+        owner-scoped QuestionViewSet.destroy won't do for staff cleanup).
+        409 if already deleted (double-act guard, same flavor as
+        approve/reject). Open flags are resolved here — the report rows
+        persist as history, but a deleted question must not linger in the
+        Flagged tab."""
+        question = self.get_object()
+        if question.deleted_at is not None:
+            return Response(
+                {"detail": "Already deleted — someone may have beaten you to it."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        with transaction.atomic():
+            question.deleted_at = timezone.now()
+            question.save(update_fields=["deleted_at", "updated_at"])
+            question.reports.filter(status=ReportStatus.OPEN).update(status=ReportStatus.RESOLVED)
+        return Response(self.get_serializer(question).data)
+
+    @action(detail=True, methods=["post"])
+    def revise(self, request, pk=None):
+        """§I3 versioned edit: never mutate a question's text in place —
+        create a NEW row carrying the edits and soft-delete the old one,
+        linking old.replaced_by = new.
+
+        Accepts any subset of {question_text, answer, difficulty,
+        visibility}. Media re-upload is punted (§M): the new row keeps the
+        old row's media FILES BY REFERENCE — two rows, one stored file, so a
+        future hard-purge must never delete files still referenced by a
+        replacement (documented in CHANGES.md).
+
+        The new row is created APPROVED: a staff member just authored/blessed
+        this exact text, so staff edits don't re-enter their own queue
+        (delegated default — flip `moderation_status` below to PENDING to
+        change it). Old open flags are resolved (the complaint was presumably
+        the reason for the edit).
+
+        Games already built keep the OLD text — their cells point at the old
+        row, and a mid-game text swap under players would be worse than a
+        stale question. New games draw the new row only.
+        """
+        old = self.get_object()
+        if old.deleted_at is not None:
+            return Response(
+                {"detail": "This question was already deleted or revised — refresh the library."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        errors = {}
+        edits = {}
+        data = request.data
+        if "question_text" in data:
+            text = str(data["question_text"] or "").strip()
+            if not text:
+                errors["question_text"] = ["Cannot be blank."]
+            edits["question_text"] = text
+        if "answer" in data:
+            answer = str(data["answer"] or "").strip()
+            if not answer:
+                errors["answer"] = ["Cannot be blank."]
+            elif len(answer) > 500:
+                errors["answer"] = ["500 characters max."]
+            edits["answer"] = answer
+        if "difficulty" in data:
+            try:
+                difficulty = int(data["difficulty"])
+                if not 1 <= difficulty <= 5:
+                    raise ValueError
+            except (TypeError, ValueError):
+                errors["difficulty"] = ["Must be an integer from 1 to 5."]
+            else:
+                edits["difficulty"] = difficulty
+        if "visibility" in data:
+            visibility = str(data["visibility"] or "")
+            if visibility not in {c.value for c in Visibility}:
+                errors["visibility"] = [f"One of: {', '.join(c.value for c in Visibility)}."]
+            edits["visibility"] = visibility
+        if errors:
+            return Response(errors, status=status.HTTP_400_BAD_REQUEST)
+        if not edits:
+            return Response(
+                {"detail": "Nothing to revise — send at least one of question_text, answer, difficulty, visibility."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            new = Question(
+                category=old.category,
+                owner=old.owner,
+                question_text=old.question_text,
+                answer=old.answer,
+                difficulty=old.difficulty,
+                visibility=old.visibility,
+                media_type=old.media_type,
+                # By-NAME assignment = by-reference copy: the file is not
+                # re-read, re-processed or re-stored (it's committed).
+                image=old.image.name if old.image else None,
+                audio=old.audio.name if old.audio else None,
+                video=old.video.name if old.video else None,
+                moderation_status=ModerationStatus.APPROVED,
+                moderation_note="",
+            )
+            for field, value in edits.items():
+                setattr(new, field, value)
+            new.save()
+            old.deleted_at = timezone.now()
+            old.replaced_by = new
+            old.save(update_fields=["deleted_at", "replaced_by", "updated_at"])
+            old.reports.filter(status=ReportStatus.OPEN).update(status=ReportStatus.RESOLVED)
+        new.usage_count = 0  # brand-new row; skip the mixin's fallback count
+        return Response(self.get_serializer(new).data, status=status.HTTP_201_CREATED)
 
 
 class ModerationFlagsView(APIView):
@@ -128,7 +336,10 @@ class ModerationFlagsView(APIView):
     def get(self, request):
         open_reports = QuestionReport.objects.filter(status=ReportStatus.OPEN)
         questions = (
-            Question.objects.filter(reports__status=ReportStatus.OPEN)
+            # §I: deleted questions never appear here. Delete/revise resolve
+            # open flags themselves, so this filter is belt-and-suspenders
+            # (e.g. rows deleted by hand in /admin).
+            Question.objects.filter(reports__status=ReportStatus.OPEN, deleted_at__isnull=True)
             .distinct()
             .select_related("category", "owner")
             .annotate(usage_count=Count("boardcell", distinct=True))
@@ -174,6 +385,9 @@ class ModerationFlagResolveView(APIView):
             question.moderation_status = ModerationStatus.REJECTED
             question.moderation_note = note
             question.save(update_fields=["moderation_status", "moderation_note", "updated_at"])
+            # §K3: flag-resolve reject goes through the same notification
+            # helper as the queue's reject (skip rules + fail-silent inside).
+            send_moderation_outcome_email(question, approved=False, actor=request.user)
         elif outcome != "dismiss":
             return Response({"action": ["Must be 'dismiss' or 'reject'."]}, status=status.HTTP_400_BAD_REQUEST)
         open_reports.update(status=ReportStatus.RESOLVED)
@@ -190,6 +404,9 @@ class ModerationCountsView(APIView):
         return Response(
             {
                 "categories": Category.objects.filter(moderation_status=pending).count(),
-                "questions": Question.objects.filter(moderation_status=pending).count(),
+                # §I: the badge must match the (deleted-filtered) queue list.
+                "questions": Question.objects.filter(
+                    moderation_status=pending, deleted_at__isnull=True
+                ).count(),
             }
         )

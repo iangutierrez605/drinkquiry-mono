@@ -197,3 +197,260 @@ class ProfileTests(QuotaTestBase):
         self.assertFalse(p["is_creator"])
         self.assertEqual(p["usage"]["questions"], {"used": 0, "limit": 0})
         self.assertIsNone(p["usage"]["games_this_month"]["limit"])  # hosting ungated today
+
+
+# ---------------------------------------------------------------------------
+# Handoff #9 §J — per-user limit overrides + the staff user-management API
+# ---------------------------------------------------------------------------
+
+from unittest.mock import patch
+
+from django.core import mail
+from django.core.cache import cache
+
+from accounts import quotas
+
+
+@override_settings(PLAN_LIMITS=TINY_LIMITS)
+class LimitOverrideTests(QuotaTestBase):
+    def test_limits_for_merge_semantics(self):
+        # replace / null-unlimited / fall-through, in one dict
+        self.paid.limit_overrides = {"questions": 10, "categories": None}
+        limits = quotas.limits_for(self.paid)
+        self.assertEqual(limits["questions"], 10)          # replaced
+        self.assertIsNone(limits["categories"])            # null = unlimited
+        self.assertIsNone(limits["games_per_month"])       # missing key → plan default
+        # untouched user: pure plan defaults
+        self.assertEqual(quotas.limits_for(self.free)["categories"], 0)
+
+    def test_free_user_with_override_hits_the_overridden_boundary(self):
+        cat = make_official_category(questions=0)
+        self.free.limit_overrides = {"questions": 2}
+        self.free.save(update_fields=["limit_overrides"])
+        self.auth(self.free)
+        for i in range(2):
+            self.assertEqual(self.create_question(cat.id, f"Q{i}?").status_code, 201)
+        res = self.create_question(cat.id, "One too many?")
+        # The structured 403 carries the OVERRIDDEN limit, not the plan's 0.
+        self.assert_quota_403(res, "quota_questions", used=2, limit=2)
+
+    def test_profile_usage_reflects_overrides(self):
+        self.free.limit_overrides = {"questions": 7, "storage_bytes": None}
+        self.free.save(update_fields=["limit_overrides"])
+        self.auth(self.free)
+        usage = self.client.get("/api/auth/profile/").data["usage"]
+        self.assertEqual(usage["questions"]["limit"], 7)
+        self.assertIsNone(usage["storage"]["limit"])
+        self.assertEqual(usage["categories"]["limit"], 0)  # untouched key
+
+    def test_overrides_survive_plan_lapse(self):
+        """Pinned as intended (§J4): an override is a grant to the USER, not
+        to the plan — it still applies after the paid plan lapses to free."""
+        self.paid.plan_expires_at = timezone.now() - timedelta(days=1)
+        self.paid.limit_overrides = {"questions": 5}
+        self.paid.save(update_fields=["plan_expires_at", "limit_overrides"])
+        self.assertEqual(self.paid.effective_plan, "free")
+        limits = quotas.limits_for(self.paid)
+        self.assertEqual(limits["questions"], 5)           # override on top of FREE base
+        self.assertEqual(limits["categories"], 0)          # free's default, not creator's
+
+    def test_validate_overrides(self):
+        quotas.validate_overrides({"questions": 0, "storage_bytes": None})  # fine
+        for bad in ({"bogus": 1}, {"questions": -1}, {"questions": True}, {"questions": "9"}, ["questions"]):
+            with self.assertRaises(ValueError):
+                quotas.validate_overrides(bad)
+
+
+class AdminUserApiTests(QuotaTestBase):
+    def setUp(self):
+        super().setUp()
+        self.staff = User.objects.create_user("staff@test.com", "sturdy-pass-123", is_staff=True)
+
+    def test_staff_only(self):
+        self.auth(self.free)
+        self.assertEqual(self.client.get("/api/moderation/users/").status_code, 403)
+        self.assertEqual(self.client.patch(f"/api/moderation/users/{self.free.id}/", {}).status_code, 403)
+        self.client.force_authenticate(user=None)
+        self.assertEqual(self.client.get("/api/moderation/users/").status_code, 401)
+        self.assertEqual(self.client.patch(f"/api/moderation/users/{self.free.id}/", {}).status_code, 401)
+
+    def test_list_shape_search_and_filters(self):
+        self.auth(self.staff)
+        res = self.client.get("/api/moderation/users/")
+        self.assertEqual(res.status_code, 200)
+        data = res.data
+        self.assertTrue(set(data) >= {"results", "count", "next", "previous"})
+        row = next(r for r in data["results"] if r["email"] == "paid@test.com")
+        expected_keys = {
+            "id", "email", "display_name", "plan", "effective_plan",
+            "plan_expires_at", "is_staff", "date_joined", "limit_overrides", "usage",
+        }
+        self.assertEqual(set(row), expected_keys)
+        self.assertEqual(set(row["usage"]), {"games_this_month", "categories", "questions", "storage"})
+        # search by email fragment and by display name
+        res = self.client.get("/api/moderation/users/?search=paid@")
+        self.assertEqual([r["email"] for r in res.data["results"]], ["paid@test.com"])
+        res = self.client.get("/api/moderation/users/?search=Free")
+        self.assertEqual([r["email"] for r in res.data["results"]], ["free@test.com"])
+        res = self.client.get("/api/moderation/users/?plan=creator")
+        self.assertEqual({r["email"] for r in res.data["results"]}, {"paid@test.com"})
+        res = self.client.get("/api/moderation/users/?is_staff=true")
+        self.assertEqual({r["email"] for r in res.data["results"]}, {"staff@test.com"})
+        self.assertEqual(self.client.get("/api/moderation/users/?plan=platinum").status_code, 400)
+
+    def test_patch_round_trip(self):
+        self.auth(self.staff)
+        expiry = (timezone.now() + timedelta(days=14)).isoformat()
+        res = self.client.patch(
+            f"/api/moderation/users/{self.free.id}/",
+            {"plan": "creator", "plan_expires_at": expiry, "limit_overrides": {"questions": 50}},
+            format="json",
+        )
+        self.assertEqual(res.status_code, 200, res.content)
+        self.assertEqual(res.data["plan"], "creator")
+        self.assertEqual(res.data["effective_plan"], "creator")
+        self.assertEqual(res.data["limit_overrides"], {"questions": 50})
+        self.free.refresh_from_db()
+        self.assertEqual(self.free.plan, "creator")
+        self.assertEqual(self.free.limit_overrides, {"questions": 50})
+        # a lapsed demo reads creator-but-effectively-free in the same row
+        past = (timezone.now() - timedelta(days=1)).isoformat()
+        res = self.client.patch(f"/api/moderation/users/{self.free.id}/",
+                                {"plan_expires_at": past}, format="json")
+        self.assertEqual(res.data["plan"], "creator")
+        self.assertEqual(res.data["effective_plan"], "free")
+
+    def test_patch_validation(self):
+        self.auth(self.staff)
+        url = f"/api/moderation/users/{self.free.id}/"
+        # unknown override key / bad value → 400
+        res = self.client.patch(url, {"limit_overrides": {"bogus": 1}}, format="json")
+        self.assertEqual(res.status_code, 400)
+        res = self.client.patch(url, {"limit_overrides": {"questions": -3}}, format="json")
+        self.assertEqual(res.status_code, 400)
+        res = self.client.patch(url, {"plan": "platinum"}, format="json")
+        self.assertEqual(res.status_code, 400)
+        # is_staff (or anything else) in the body → 400, pinned: silently
+        # ignoring a privilege-looking field would be worse than refusing.
+        res = self.client.patch(url, {"is_staff": True}, format="json")
+        self.assertEqual(res.status_code, 400)
+        self.free.refresh_from_db()
+        self.assertFalse(self.free.is_staff)
+        res = self.client.patch(url, {"email": "hijack@test.com"}, format="json")
+        self.assertEqual(res.status_code, 400)
+
+
+# ---------------------------------------------------------------------------
+# Handoff #9 §K1/§K2 — password flows
+# ---------------------------------------------------------------------------
+
+from knox.models import AuthToken  # noqa: E402
+
+
+class PasswordFlowTestBase(QuotaTestBase):
+    def setUp(self):
+        super().setUp()
+        cache.clear()  # the forgot-cooldown must never leak between tests
+
+    def knox_login(self, email, password):
+        res = self.client.post("/api/auth/login/", {"email": email, "password": password})
+        self.assertEqual(res.status_code, 200, res.content)
+        return res.data["token"]
+
+    def bearer(self, token):
+        return {"HTTP_AUTHORIZATION": f"Token {token}"}
+
+
+class ForgotPasswordTests(PasswordFlowTestBase):
+    def test_identical_200s_for_existing_and_unknown_email(self):
+        r1 = self.client.post("/api/auth/password/forgot/", {"email": "free@test.com"})
+        r2 = self.client.post("/api/auth/password/forgot/", {"email": "nobody@test.com"})
+        self.assertEqual(r1.status_code, 200)
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(r1.data, r2.data)  # no enumeration
+        self.assertEqual(len(mail.outbox), 1)  # one real send, zero for the ghost
+        self.assertEqual(mail.outbox[0].to, ["free@test.com"])
+        self.assertIn("/reset-password?uid=", mail.outbox[0].body)
+
+    def test_cooldown_skips_the_send_silently(self):
+        r1 = self.client.post("/api/auth/password/forgot/", {"email": "free@test.com"})
+        r2 = self.client.post("/api/auth/password/forgot/", {"email": "free@test.com"})
+        self.assertEqual(r1.data, r2.data)  # body identical either way
+        self.assertEqual(len(mail.outbox), 1)  # second send skipped
+
+    def test_token_round_trip_resets_and_kills_all_sessions(self):
+        token = self.knox_login("free@test.com", "sturdy-pass-123")
+        self.client.post("/api/auth/password/forgot/", {"email": "free@test.com"})
+        body = mail.outbox[0].body
+        query = body.split("/reset-password?")[1].split()[0]
+        params = dict(pair.split("=", 1) for pair in query.split("&"))
+        res = self.client.post("/api/auth/password/reset/",
+                               {"uid": params["uid"], "token": params["token"],
+                                "new_password": "fresh-pass-456"})
+        self.assertEqual(res.status_code, 200, res.content)
+        # every Knox session is dead
+        self.assertEqual(self.client.get("/api/auth/profile/", **self.bearer(token)).status_code, 401)
+        self.assertEqual(AuthToken.objects.filter(user=self.free).count(), 0)
+        # old password out, new password in
+        self.assertEqual(
+            self.client.post("/api/auth/login/", {"email": "free@test.com", "password": "sturdy-pass-123"}).status_code,
+            400,
+        )
+        self.knox_login("free@test.com", "fresh-pass-456")
+
+    def test_bad_or_expired_token_400s_generically(self):
+        self.client.post("/api/auth/password/forgot/", {"email": "free@test.com"})
+        body = mail.outbox[0].body
+        query = body.split("/reset-password?")[1].split()[0]
+        params = dict(pair.split("=", 1) for pair in query.split("&"))
+        res = self.client.post("/api/auth/password/reset/",
+                               {"uid": params["uid"], "token": "garbage-token",
+                                "new_password": "fresh-pass-456"})
+        self.assertEqual(res.status_code, 400)
+        self.assertNotIn("free@test.com", str(res.data))  # generic message
+        res = self.client.post("/api/auth/password/reset/",
+                               {"uid": "!!!!", "token": params["token"], "new_password": "fresh-pass-456"})
+        self.assertEqual(res.status_code, 400)
+        # weak password still rejected AFTER a valid token
+        res = self.client.post("/api/auth/password/reset/",
+                               {"uid": params["uid"], "token": params["token"], "new_password": "123"})
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("new_password", res.data)
+
+
+class ChangePasswordTests(PasswordFlowTestBase):
+    def test_wrong_current_400(self):
+        token = self.knox_login("free@test.com", "sturdy-pass-123")
+        res = self.client.post("/api/auth/password/change/",
+                               {"current_password": "wrong", "new_password": "fresh-pass-456"},
+                               **self.bearer(token))
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("current_password", res.data)
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_change_keeps_current_session_kills_others_and_notifies(self):
+        token_here = self.knox_login("free@test.com", "sturdy-pass-123")
+        token_elsewhere = self.knox_login("free@test.com", "sturdy-pass-123")
+        res = self.client.post("/api/auth/password/change/",
+                               {"current_password": "sturdy-pass-123", "new_password": "fresh-pass-456"},
+                               **self.bearer(token_here))
+        self.assertEqual(res.status_code, 200, res.content)
+        self.assertEqual(self.client.get("/api/auth/profile/", **self.bearer(token_here)).status_code, 200)
+        self.assertEqual(self.client.get("/api/auth/profile/", **self.bearer(token_elsewhere)).status_code, 401)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("password was changed", mail.outbox[0].subject.lower() + mail.outbox[0].body.lower())
+        self.knox_login("free@test.com", "fresh-pass-456")
+
+    def test_anonymous_401(self):
+        res = self.client.post("/api/auth/password/change/",
+                               {"current_password": "x", "new_password": "y"})
+        self.assertEqual(res.status_code, 401)
+
+    def test_email_failure_never_breaks_the_change(self):
+        token = self.knox_login("free@test.com", "sturdy-pass-123")
+        with patch("accounts.emails.send_mail", side_effect=RuntimeError("ESP down")):
+            res = self.client.post("/api/auth/password/change/",
+                                   {"current_password": "sturdy-pass-123", "new_password": "fresh-pass-456"},
+                                   **self.bearer(token))
+        self.assertEqual(res.status_code, 200, res.content)
+        self.knox_login("free@test.com", "fresh-pass-456")

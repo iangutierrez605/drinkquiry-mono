@@ -2,27 +2,30 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, errorText, quotaError } from "../lib/api";
 import {
-  clearAuth,
   clearHostGame,
   loadAuth,
   loadHostGame,
   loadSeat,
-  saveAuth,
+  onAuthChange,
   saveHostGame,
   saveSeat,
 } from "../lib/storage";
 import { useGameSocket } from "../lib/useGameSocket";
+import AuthScreen from "../components/AuthScreen";
 import {
   BoardGrid,
   BuzzList,
   ConnectionDot,
   FinalStandings,
   MediaBlock,
-  ModerationLink,
-  ProfileLink,
   ScoreStrip,
   Toast,
 } from "../components/shared";
+
+// §F1 (Handoff #9): AuthScreen moved to src/components/AuthScreen.jsx (it
+// was never host-specific — /profile imported it, /login renders it too).
+// Re-exported here so nothing that still imports it from HostPage breaks.
+export { default as AuthScreen } from "../components/AuthScreen";
 
 /**
  * §I (Handoff #8): resume a game from ANY browser — the server re-issues the
@@ -45,6 +48,9 @@ export async function resumeHostGame(authToken, code) {
 
 export default function HostPage() {
   const [auth, setAuth] = useState(loadAuth());
+  // §F: the SiteNav's logout (or a dead Knox token dropped by api.js) clears
+  // dq_auth and announces — flip straight back to the login screen.
+  useEffect(() => onAuthChange(() => setAuth(loadAuth())), []);
   // active = {code, token} once a game is created or resumed
   const [active, setActive] = useState(() => {
     const code = loadHostGame();
@@ -58,11 +64,6 @@ export default function HostPage() {
     return (
       <CreateScreen
         auth={auth}
-        onLogout={() => {
-          api.logout(auth.token).catch(() => {});
-          clearAuth();
-          setAuth(null);
-        }}
         onCreated={(code, token, participantId) => {
           saveSeat(code, { token, participantId, role: "host" });
           saveHostGame(code);
@@ -84,96 +85,13 @@ export default function HostPage() {
   );
 }
 
-/* ---------------- Auth ---------------- */
-
-// Exported so /profile can reuse the exact same login flow (Handoff #6 §G3)
-// instead of forking a near-copy.
-export function AuthScreen({ onAuthed }) {
-  const [mode, setMode] = useState("login");
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [displayName, setDisplayName] = useState("");
-  const [dob, setDob] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState(null);
-
-  const submit = async (e) => {
-    e.preventDefault();
-    setBusy(true);
-    setError(null);
-    try {
-      if (mode === "register") {
-        await api.register({
-          email,
-          password,
-          display_name: displayName,
-          ...(dob ? { date_of_birth: dob } : {}),
-        });
-      }
-      const res = await api.login(email, password); // Knox basic-auth login
-      const authed = { token: res.token, user: res.user };
-      saveAuth(authed);
-      onAuthed(authed);
-    } catch (err) {
-      setError(errorText(err));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <div className="page page--center">
-      <Wordmark />
-      <form className="panel authform" onSubmit={submit}>
-        <div className="tabs">
-          <button type="button" className={mode === "login" ? "tab tab--on" : "tab"} onClick={() => setMode("login")}>
-            Log in
-          </button>
-          <button type="button" className={mode === "register" ? "tab tab--on" : "tab"} onClick={() => setMode("register")}>
-            Create account
-          </button>
-        </div>
-        {mode === "register" && (
-          <label className="field">
-            Display name
-            <input value={displayName} onChange={(e) => setDisplayName(e.target.value)} required maxLength={50} />
-          </label>
-        )}
-        <label className="field">
-          Email
-          <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required autoComplete="email" />
-        </label>
-        <label className="field">
-          Password
-          <input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            required
-            autoComplete={mode === "login" ? "current-password" : "new-password"}
-          />
-        </label>
-        {mode === "register" && (
-          <label className="field">
-            Date of birth <span className="field__hint">(optional)</span>
-            <input type="date" value={dob} onChange={(e) => setDob(e.target.value)} />
-          </label>
-        )}
-        {error && <p className="formerror">{error}</p>}
-        <button className="btn btn--primary" disabled={busy}>
-          {busy ? "…" : mode === "login" ? "Log in" : "Create account & log in"}
-        </button>
-      </form>
-      <p className="footnote">
-        Players don't need accounts — only the host logs in. Buzzers join at <code>/game/buzzer/CODE</code>.
-      </p>
-    </div>
-  );
-}
+/* ---------------- Auth ----------------
+   The AuthScreen itself lives in src/components/AuthScreen.jsx since §F1;
+   see the re-export at the top of this file. */
 
 /* ---------------- Game creation ---------------- */
 
-function CreateScreen({ auth, onCreated, onResumed, onLogout }) {
+function CreateScreen({ auth, onCreated, onResumed }) {
   const [categories, setCategories] = useState(null);
   // §I: unfinished games this host can jump back into. Discoverability lives
   // here (the "no active game" screen) AND on /profile; both share
@@ -245,21 +163,9 @@ function CreateScreen({ auth, onCreated, onResumed, onLogout }) {
 
   return (
     <div className="page">
-      <header className="pagehead">
-        <Wordmark small />
-        <div className="pagehead__right">
-          <span className="pagehead__user">{auth.user?.display_name || auth.user?.email}</span>
-          {profile?.is_staff && <ModerationLink token={auth.token} />}
-          <ProfileLink />
-          <Link className="btn btn--ghost" to="/create">
-            Your content
-          </Link>
-          <button className="btn btn--ghost" onClick={onLogout}>
-            Log out
-          </button>
-        </div>
-      </header>
-
+      {/* §F: the old pagehead (user name, Moderation/Profile/Your content
+          links, Log out) moved wholesale into the SiteNav — one identity
+          bar per page, not two. */}
       <h1 className="h1">New game</h1>
 
       {unfinished?.length > 0 && (
@@ -443,7 +349,8 @@ function HostGame({ code, token, auth, onLeave }) {
   return (
     <div className="page page--wide">
       <header className="pagehead">
-        <Wordmark small />
+        {/* §F: wordmark lives in the SiteNav now; this bar keeps the
+            game-specific chrome (code, connection, board link, finish). */}
         <div className="pagehead__mid">
           <span className="codechip">
             Join code <strong>{game.code}</strong>

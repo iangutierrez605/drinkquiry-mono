@@ -1,7 +1,10 @@
 """Plan quota logic — the one place that counts usage against settings.PLAN_LIMITS.
 
-Limits are per-plan in settings (no per-user rows), so pricing changes are a
-settings edit, not a migration. `None` always means unlimited.
+Limits are per-plan defaults in settings plus per-user JSON overrides
+(User.limit_overrides, §J1 Handoff #9), merged solely in `limits_for()` —
+every quota check, structured 403 payload, and the profile usage block flow
+through it, so an override propagates everywhere with no other change.
+`None` always means unlimited (in PLAN_LIMITS and in overrides alike).
 
 Views call `quota_denial(user, kind)` before creating anything quota-bearing;
 a non-None return is the structured 403 body the frontend understands:
@@ -23,9 +26,37 @@ KINDS = {
 
 
 def limits_for(user) -> dict:
-    """Quota dict for the user's *effective* plan (expired paid == free)."""
+    """Quota dict for the user's *effective* plan (expired paid == free),
+    with per-user overrides merged on top (§J1). An override key replaces the
+    plan value; null = unlimited; missing = plan default. Overrides apply to
+    whatever the effective plan is — i.e. they survive a plan lapse (a grant
+    to the user, not the plan; pinned as intended behavior)."""
     plans = settings.PLAN_LIMITS
-    return plans.get(user.effective_plan, plans["free"])
+    base = dict(plans.get(user.effective_plan, plans["free"]))
+    base.update(user.limit_overrides or {})
+    return base
+
+
+# Valid override keys + the shared validator (§J2's PATCH uses this; kept
+# here so the key set can never drift from what limits_for merges).
+OVERRIDE_KEYS = ("games_per_month", "categories", "questions", "storage_bytes")
+
+
+def validate_overrides(value) -> dict:
+    """Raise ValueError on a bad §J1 overrides dict; return it normalized.
+
+    Rules: dict only; keys from OVERRIDE_KEYS; each value null (unlimited)
+    or an int >= 0 (bools are ints in Python — rejected explicitly)."""
+    if not isinstance(value, dict):
+        raise ValueError("limit_overrides must be an object.")
+    for key, v in value.items():
+        if key not in OVERRIDE_KEYS:
+            raise ValueError(f"Unknown override key '{key}'. One of: {', '.join(OVERRIDE_KEYS)}.")
+        if v is None:
+            continue
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            raise ValueError(f"Override '{key}' must be null (unlimited) or an integer >= 0.")
+    return value
 
 
 def _mb(n: int) -> str:
@@ -49,8 +80,11 @@ def categories_used(user) -> int:
 
 
 def questions_used(user) -> int:
+    # §I (Handoff #9): soft-deleted questions free their quota slot — from the
+    # owner's perspective a deleted question is gone, even though the row
+    # remains for game history.
     Question = apps.get_model("trivia", "Question")
-    return Question.objects.filter(owner=user).count()
+    return Question.objects.filter(owner=user, deleted_at__isnull=True).count()
 
 
 def storage_bytes_used(user) -> int:
@@ -61,7 +95,14 @@ def storage_bytes_used(user) -> int:
 
     Question = apps.get_model("trivia", "Question")
     Category = apps.get_model("trivia", "Category")
-    q = Question.objects.filter(owner=user).aggregate(total=Sum("media_bytes"))["total"] or 0
+    # §I: deleted questions don't count against storage either. Their files
+    # stay on disk (live snapshots of games containing them still serialize
+    # media) — a small deliberate mismatch, noted in CHANGES.md.
+    q = (
+        Question.objects.filter(owner=user, deleted_at__isnull=True)
+        .aggregate(total=Sum("media_bytes"))["total"]
+        or 0
+    )
     c = Category.objects.filter(owner=user).aggregate(total=Sum("photo_bytes"))["total"] or 0
     return q + c
 

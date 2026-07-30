@@ -430,8 +430,58 @@ def media_round_trip():
     requests.delete(f"{BASE}/api/categories/{cat.json()['id']}/", headers=h)
     ok("media round-trip cleanup: question + category deleted (storage quota freed)")
 
+def password_flows(knox, fknox):
+    """Handoff #9 §K4 — RE-RUNNABLE by construction: the smoke user's
+    password is changed and changed BACK within this run (with a re-login in
+    between to prove the change took). Runs LAST: the second change (made
+    with the new token) revokes the run's original knox token, which nothing
+    uses afterwards. No delivery assertions here — the console backend
+    prints to the server log, and that's enough for smoke."""
+    h = {"Authorization": f"Token {knox}"}
+    old_pw, new_pw = "sturdy-pass-123", "sturdy-pass-456-tmp"
+
+    # wrong current → 400, nothing changed
+    r = requests.post(f"{BASE}/api/auth/password/change/", headers=h,
+                      json={"current_password": "definitely-wrong", "new_password": new_pw})
+    assert r.status_code == 400 and "current_password" in r.json(), r.text
+    ok("change with wrong current password → 400 (§K2)")
+
+    # change → 200; THIS token survives, the old password stops working
+    r = requests.post(f"{BASE}/api/auth/password/change/", headers=h,
+                      json={"current_password": old_pw, "new_password": new_pw})
+    assert r.status_code == 200, r.text
+    r = requests.get(f"{BASE}/api/auth/profile/", headers=h)
+    assert r.status_code == 200, r.text
+    r = requests.post(f"{BASE}/api/auth/login/", json={"email": "host@test.com", "password": old_pw})
+    assert r.status_code == 400, r.text
+    ok("password change → 200; current session token survives; old password no longer logs in (§K2)")
+
+    # re-login with the NEW password, change BACK with that fresh token
+    r = requests.post(f"{BASE}/api/auth/login/", json={"email": "host@test.com", "password": new_pw})
+    assert r.status_code == 200, r.text
+    knox2 = r.json()["token"]
+    r = requests.post(f"{BASE}/api/auth/password/change/",
+                      headers={"Authorization": f"Token {knox2}"},
+                      json={"current_password": new_pw, "new_password": old_pw})
+    assert r.status_code == 200, r.text
+    r = requests.post(f"{BASE}/api/auth/login/", json={"email": "host@test.com", "password": old_pw})
+    assert r.status_code == 200, r.text
+    ok("re-login with the new password, change BACK → original password logs in again (re-runnable)")
+
+    # forgot: a real and a fake email get IDENTICAL 200s (no enumeration).
+    # The fake address is randomized so the per-email send cooldown can never
+    # make the two calls diverge across quick re-runs.
+    r1 = requests.post(f"{BASE}/api/auth/password/forgot/", json={"email": "host@test.com"})
+    r2 = requests.post(f"{BASE}/api/auth/password/forgot/",
+                       json={"email": f"ghost-{int(time.time())}@test.com"})
+    assert r1.status_code == r2.status_code == 200, (r1.text, r2.text)
+    assert r1.json() == r2.json(), (r1.json(), r2.json())
+    ok("forgot-password: existing vs unknown email → identical 200 bodies (§K1, no enumeration)")
+
+
 code, ht, at, aid, bt, bid, knox, fknox = rest()
 asyncio.run(ws_flow(code, ht, at, aid, bt, bid, knox, fknox))
+password_flows(knox, fknox)
 if os.environ.get("SMOKE_MEDIA") == "1":
     media_round_trip()
 print("\nALL SMOKE CHECKS PASSED")

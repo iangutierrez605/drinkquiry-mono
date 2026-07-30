@@ -92,8 +92,9 @@ class Category(ModeratedContentMixin):
         return self.owner_id in (None, user.id) or self.is_publicly_visible
 
     def usable_question_count(self, user=None) -> int:
-        """Questions a given user may put on a board from this category."""
-        qs = self.questions.all()
+        """Questions a given user may put on a board from this category.
+        §I1: soft-deleted questions are never usable."""
+        qs = self.questions.filter(deleted_at__isnull=True)
         public = models.Q(visibility=Visibility.PUBLIC, moderation_status=ModerationStatus.APPROVED)
         if user is not None and user.is_authenticated:
             return qs.filter(public | models.Q(owner=user)).count()
@@ -109,6 +110,20 @@ class MediaType(models.TextChoices):
 
 class Question(ModeratedContentMixin):
     category = models.ForeignKey(Category, on_delete=models.CASCADE, related_name="questions")
+    # §I1 (Handoff #9): soft delete. `deleted_at` is the ONLY liveness flag
+    # (null = active; no boolean twin). Every "active questions" surface
+    # filters deleted_at__isnull=True; deleted rows deliberately REMAIN in
+    # board cells, snapshots, finished reports and usage_count aggregates
+    # (history is history). Deleting always works now — BoardCell.question is
+    # on_delete=PROTECT, so a hard delete of any ever-played question was a
+    # guaranteed ProtectedError 500.
+    deleted_at = models.DateTimeField(null=True, blank=True)
+    # §I3: lineage pointer set when a staff revision supersedes this row —
+    # the old row is soft-deleted and points at its replacement. SET_NULL so
+    # (someday) hard-purging a replacement never cascades into history.
+    replaced_by = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="replaces"
+    )
     question_text = models.TextField()
     answer = models.CharField(max_length=500)
     difficulty = models.PositiveSmallIntegerField(

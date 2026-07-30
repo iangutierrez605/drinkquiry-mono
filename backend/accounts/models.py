@@ -52,6 +52,15 @@ class User(AbstractBaseUser, PermissionsMixin):
         blank=True,
         help_text="When the paid plan lapses (blank = never). Past dates behave as free.",
     )
+    # §J1 (Handoff #9): per-user quota overrides — same keys as a PLAN_LIMITS
+    # entry (games_per_month, categories, questions, storage_bytes), all
+    # optional. An override key REPLACES the plan's value for that key; null
+    # means unlimited (PLAN_LIMITS convention); a missing key falls through to
+    # the plan. Merged in exactly ONE place: accounts/quotas.limits_for().
+    # Note the deliberate semantics (pinned by tests): an override is a grant
+    # to the USER, not to the plan — it still applies after a paid plan lapses
+    # to free.
+    limit_overrides = models.JSONField(default=dict, blank=True)
 
     objects = UserManager()
 

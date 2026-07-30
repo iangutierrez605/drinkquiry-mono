@@ -47,11 +47,13 @@ PUBLIC_APPROVED = Q(visibility=Visibility.PUBLIC, moderation_status=ModerationSt
 
 
 def usable_questions(category: Category, user):
-    """Questions this user is allowed to put on a board from this category."""
+    """Questions this user is allowed to put on a board from this category.
+    §I (Handoff #9): soft-deleted questions never enter new boards (nor the
+    §J3 replace pool) — cells already holding one keep it (history)."""
     allowed = PUBLIC_APPROVED | Q(owner__isnull=True)
     if user and user.is_authenticated:
         allowed = allowed | Q(owner=user)
-    return category.questions.filter(allowed)
+    return category.questions.filter(allowed, deleted_at__isnull=True)
 
 
 def _preference_ordered(qs, host):

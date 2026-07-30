@@ -12,3 +12,7 @@ psycopg[binary]>=3.2
 dj-database-url>=2.3
 Pillow>=11.0
 django-storages[s3]>=1.14
+# Handoff #9 §K: transactional email (Resend). The plain package suffices —
+# the Resend backend speaks HTTP via `requests` (an anymail base dep);
+# there is no [resend] extra to install. Verified against anymail 15.0.
+django-anymail>=13

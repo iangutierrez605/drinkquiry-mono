@@ -214,6 +214,19 @@ class QuestionViewSet(viewsets.ModelViewSet):
             if parsed.archive is not None:
                 parsed.archive.close()
 
+    def perform_destroy(self, instance):
+        """§I2 (Handoff #9): owner delete is a SOFT delete — set deleted_at,
+        return the usual 204. Uniform rule, no "hard delete if never played"
+        special case: hard-deleting an ever-played question was a guaranteed
+        ProtectedError 500 (BoardCell.question is PROTECT), and one rule is
+        simpler. The row (and its media files) stays so game history, reports
+        and mid-game snapshots keep working; quota counters exclude deleted
+        rows, so the owner's slots free up. Restore is punted (§M)."""
+        from django.utils import timezone
+
+        instance.deleted_at = timezone.now()
+        instance.save(update_fields=["deleted_at", "updated_at"])
+
     def get_queryset(self):
         user = self.request.user
         # order_by("id"): deterministic pagination — this list view is what
@@ -221,7 +234,11 @@ class QuestionViewSet(viewsets.ModelViewSet):
         # pagination can duplicate/skip rows across pages). Scoped to the list
         # queryset rather than Meta.ordering so no other Question caller
         # (board building, bulk dedupe, moderation) changes behavior.
-        qs = Question.objects.select_related("category")
+        # §I: soft-deleted questions are invisible here for everyone —
+        # get_object routes through this too, so a deleted question 404s on
+        # retrieve/PATCH/DELETE/report. The one surface that can see deleted
+        # rows is the staff moderation library (?deleted=, trivia/moderation).
+        qs = Question.objects.select_related("category").filter(deleted_at__isnull=True)
         if category_id := self.request.query_params.get("category"):
             qs = qs.filter(category_id=category_id)
         if user.is_authenticated:
