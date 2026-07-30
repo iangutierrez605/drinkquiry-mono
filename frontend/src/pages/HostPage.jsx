@@ -234,7 +234,7 @@ function CreateScreen({ auth, onCreated, onResumed }) {
           <button className={`modecard ${mode === "points" ? "modecard--on" : ""}`} onClick={() => setMode("points")}>
             <span className="modecard__emoji">💯</span>
             <strong>Points</strong>
-            <span>Classic Jeopardy: +value right, −value wrong</span>
+            <span>Classic quiz-show scoring: +value right, −value wrong</span>
           </button>
         </div>
       </section>
@@ -477,7 +477,12 @@ function HostGame({ code, token, auth, onLeave }) {
             <ul className="lobbylist">
               {players.map((p) => (
                 <li key={p.id} className={p.connected ? "" : "lobbylist--offline"}>
-                  {p.name} {p.connected ? "🟢" : "⚪"}
+                  <span>
+                    {p.name} {p.connected ? "🟢" : "⚪"}
+                  </span>
+                  {/* §F (#11): kick from the lobby — wrong-code joiners and
+                      troll names die here. Server re-validates (rule 4). */}
+                  <RemovePlayerButton name={p.name} onRemove={() => send("remove_player", { participant_id: p.id })} />
                 </li>
               ))}
             </ul>
@@ -498,6 +503,22 @@ function HostGame({ code, token, auth, onLeave }) {
       {game.status === "active" && (
         <>
           <ScoreStrip game={game} />
+          {/* §F (#11): the ScoreStrip-adjacent removal surface — the table
+              that left after round one gets kicked from here. ScoreStrip
+              itself stays shared/untouched (buzzers and TVs render it too);
+              this row is host-only chrome. Snapshot-driven: a removed seat
+              vanishes from `participants`, so the row cleans itself. */}
+          <div className="manageteams">
+            {players.map((p) => (
+              <span key={p.id} className="manageteams__row">
+                <span className="manageteams__name">{p.name}</span>
+                <RemovePlayerButton
+                  name={p.name}
+                  onRemove={() => send("remove_player", { participant_id: p.id })}
+                />
+              </span>
+            ))}
+          </div>
           {!openCell && (
             <>
               {/* §H2 (Handoff #10): the board is fully played — say so and
@@ -826,6 +847,39 @@ function LobbyPreview({ auth, code, onToast }) {
         );
       })}
     </section>
+  );
+}
+
+/**
+ * §F (Handoff #11): inline-confirm kick — the standing DeleteButton /
+ * confirmrow pattern (arm, 3.5s auto-disarm), reused not reinvented. The
+ * click sends `remove_player`; everything after that re-renders from the
+ * snapshot (the seat vanishes from `participants`), so there's no local
+ * "removed" state to manage.
+ */
+function RemovePlayerButton({ name, onRemove }) {
+  const [arming, setArming] = useState(false);
+  useEffect(() => {
+    if (!arming) return undefined;
+    const t = setTimeout(() => setArming(false), 3500);
+    return () => clearTimeout(t);
+  }, [arming]);
+  return arming ? (
+    <button
+      type="button"
+      className="btn btn--danger btn--sm"
+      title={`Really remove ${name} from the game`}
+      onClick={() => {
+        onRemove();
+        setArming(false);
+      }}
+    >
+      Confirm remove
+    </button>
+  ) : (
+    <button type="button" className="btn btn--ghost btn--sm" onClick={() => setArming(true)}>
+      ✕ remove
+    </button>
   );
 }
 

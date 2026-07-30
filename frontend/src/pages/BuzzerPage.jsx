@@ -29,6 +29,25 @@ function JoinForm({ code, existing, onJoined, onDropSeat }) {
   const [error, setError] = useState(null);
   const [nameTaken, setNameTaken] = useState(false);
   const [fullLimit, setFullLimit] = useState(null); // §G: server said game_full
+  // §H (#11): the brand line under the wordmark ("hosted by THE KINGS
+  // ARMS"). Pre-join there's no socket yet, so one unauthenticated snapshot
+  // fetch supplies it — optional sugar, a failure just shows nothing.
+  const [brand, setBrand] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    api
+      .gameSnapshot(code)
+      .then((snap) => alive && setBrand(snap.brand ?? null))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [code]);
+  const brandLine = brand?.name ? (
+    <p className="joinbrand">
+      hosted by <strong>{brand.name}</strong>
+    </p>
+  ) : null;
 
   const join = async (useToken) => {
     setBusy(true);
@@ -66,6 +85,7 @@ function JoinForm({ code, existing, onJoined, onDropSeat }) {
     return (
       <div className="page page--center page--buzzer">
         <div className="wordmark">DRINKQUIRY</div>
+        {brandLine}
         <p className="joincode">
           Game <strong>{code}</strong>
         </p>
@@ -90,6 +110,7 @@ function JoinForm({ code, existing, onJoined, onDropSeat }) {
   return (
     <div className="page page--center page--buzzer">
       <div className="wordmark">DRINKQUIRY</div>
+      {brandLine}
       <p className="joincode">
         Game <strong>{code}</strong>
       </p>
@@ -138,11 +159,23 @@ function JoinForm({ code, existing, onJoined, onDropSeat }) {
 /* ---------------- Live buzzer ---------------- */
 
 function BuzzerLive({ code, seat, onBadSeat }) {
-  const { game, connected, authFailed, lastError, lastBuzz, clearError, send } = useGameSocket(code, seat.token);
+  const { game, connected, authFailed, removed, lastError, lastBuzz, clearError, send } =
+    useGameSocket(code, seat.token);
 
   useEffect(() => {
     if (authFailed) onBadSeat(); // 4001: clear token, back to the name form
   }, [authFailed, onBadSeat]);
+
+  // §F (Handoff #11): the host kicked this seat. Three detection paths (C2
+  // thinking — WS error/close AND the snapshot itself): the structured
+  // `player_removed` error, close code 4003 (both via the hook's `removed`),
+  // or our participantId simply missing from a fresh snapshot — removed
+  // seats are excluded from `participants` entirely.
+  const kicked =
+    removed || (game != null && !game.participants.some((p) => p.id === seat.participantId));
+  useEffect(() => {
+    if (kicked) clearSeat(code); // the token is dead server-side; drop it now
+  }, [kicked, code]);
 
   // Haptic + confirmation on our own buzz echo.
   useEffect(() => {
@@ -184,6 +217,26 @@ function BuzzerLive({ code, seat, onBadSeat }) {
     clearTimeout(pressTimer.current);
     pressTimer.current = setTimeout(() => setPressed(false), 250);
   };
+
+  // §F (#11): the kicked card wins over everything (all hooks above have
+  // already run, so this early return is hook-order safe). No shaming copy —
+  // hosts kick for lots of reasons.
+  if (kicked)
+    return (
+      <div className="page page--center page--buzzer">
+        <div className="wordmark">DRINKQUIRY</div>
+        <div className="panel joinform kickedcard">
+          <h2 className="h2">This buzzer was removed 🍃</h2>
+          <p>
+            The host removed this buzzer from game <strong>{code}</strong> — grab a teammate's
+            phone, or rejoin with a new name.
+          </p>
+          <button type="button" className="btn btn--primary btn--big" onClick={onBadSeat}>
+            Join again
+          </button>
+        </div>
+      </div>
+    );
 
   if (!game)
     return (

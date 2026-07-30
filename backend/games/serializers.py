@@ -108,7 +108,17 @@ class GameStateSerializer(serializers.ModelSerializer):
     which is what makes a page reload lossless."""
 
     columns = ColumnSerializer(many=True, read_only=True)
-    participants = ParticipantSerializer(many=True, read_only=True)
+    # §F (Handoff #11): REMOVED participants are excluded from `participants`
+    # entirely — clients are dumb renderers, so a kicked seat simply stops
+    # existing on every screen (ScoreStrip, FinalStandings, lobby lists,
+    # drink pickers all clean themselves with zero component changes).
+    participants = serializers.SerializerMethodField()
+    # §F/§G (Handoff #11): removed players who still hold a cell attribution
+    # (BoardCell.answered_by) — just enough for §G's answered-cell names to
+    # resolve an id the `participants` list no longer carries. Derived from
+    # the SAME prefetched participants + columns__cells every snapshot caller
+    # already loads (the cells_remaining pattern) — no fresh queries.
+    former_players = serializers.SerializerMethodField()
     current_cell = OpenCellSerializer(read_only=True)
     # Handoff #6 §F2: null at all times EXCEPT between the host's reveal and
     # close_cell — this is the one sanctioned way an answer enters a snapshot
@@ -119,6 +129,14 @@ class GameStateSerializer(serializers.ModelSerializer):
     # §G: the player cap, surfaced in the snapshot so lobby copy ("N/6 teams")
     # stays a dumb render of server state (rule 1) instead of a hardcoded 6.
     max_players = serializers.SerializerMethodField()
+    # §H (Handoff #11): venue branding — {"name", "logo"} from the HOST's
+    # profile, or null. Served ONLY while the host's EFFECTIVE plan is
+    # creator (a lapsed plan turns branding off without destroying the
+    # upload) and something is actually set. A snapshot field, so the TV
+    # lobby, the in-play header and the buzzer join line all get it over
+    # BOTH transports for free (C2). Every snapshot caller select_related's
+    # "host" (checked for N+1 like cells_remaining was).
+    brand = serializers.SerializerMethodField()
     # §H1 (Handoff #10): cells not yet ANSWERED — derived here, never stored,
     # so the snapshot stays the source of truth and BOTH transports (WS and
     # the polling board) get it for free (C2). An OPEN cell still counts as
@@ -132,8 +150,46 @@ class GameStateSerializer(serializers.ModelSerializer):
         model = Game
         fields = (
             "code", "mode", "status", "questions_per_category", "max_players", "cells_remaining",
-            "buzzer_open", "current_cell", "revealed_answer", "columns", "participants", "created_at",
+            "buzzer_open", "current_cell", "revealed_answer", "columns", "participants",
+            "former_players", "brand", "created_at",
         )
+
+    def get_participants(self, game):
+        # Filtered in Python over the prefetched list (never .filter(), which
+        # would re-query and defeat every caller's prefetch_related).
+        active = [p for p in game.participants.all() if p.removed_at is None]
+        return ParticipantSerializer(active, many=True).data
+
+    def get_former_players(self, game):
+        # Ids holding an attribution, from the prefetched columns__cells —
+        # same pass `columns` serializes (the cells_remaining pattern).
+        answered_ids = {
+            cell.answered_by_id
+            for column in game.columns.all()
+            for cell in column.cells.all()
+            if cell.answered_by_id is not None
+        }
+        return [
+            {"id": p.id, "name": p.name}
+            for p in game.participants.all()
+            if p.removed_at is not None and p.id in answered_ids
+        ]
+
+    def get_brand(self, game):
+        host = game.host
+        if not host.is_creator:  # effective plan — expiry collapses to free
+            return None
+        name = host.brand_name or None
+        logo = host.brand_logo or None
+        if name is None and logo is None:
+            return None
+        url = None
+        if logo:
+            url = logo.url
+            request = self.context.get("request")
+            if request is not None:  # WS snapshots have no request; root-relative is fine (C2)
+                url = request.build_absolute_uri(url)
+        return {"name": name, "logo": url}
 
     def get_cells_remaining(self, game):
         # Counted from the SAME prefetched columns/cells `columns` serializes
@@ -191,7 +247,8 @@ class GameHistorySerializer(serializers.ModelSerializer):
     def get_participant_count(self, game):
         count = getattr(game, "player_count", None)
         if count is None:  # direct serializer use without the annotation
-            count = game.participants.filter(role="player").count()
+            # §F (#11): active players only, matching the view's annotation.
+            count = game.participants.filter(role="player", removed_at__isnull=True).count()
         return count
 
 
@@ -218,10 +275,25 @@ class ReportColumnSerializer(serializers.ModelSerializer):
         fields = ("id", "position", "category_name", "questions")
 
 
+class ReportParticipantSerializer(ParticipantSerializer):
+    """§F (Handoff #11): the host-private report keeps ALL participants —
+    full history — and flags kicked seats so the frontend can badge them.
+    The live snapshot's `participants` (above) excludes removed seats
+    entirely; this serializer never rides a snapshot."""
+
+    removed = serializers.SerializerMethodField()
+
+    class Meta(ParticipantSerializer.Meta):
+        fields = ParticipantSerializer.Meta.fields + ("removed",)
+
+    def get_removed(self, participant):
+        return participant.removed_at is not None
+
+
 class GameReportSerializer(serializers.ModelSerializer):
     """GET /api/games/{code}/report/ — full post-game detail, host-only."""
 
-    participants = ParticipantSerializer(many=True, read_only=True)
+    participants = ReportParticipantSerializer(many=True, read_only=True)
     winners = serializers.SerializerMethodField()
     columns = ReportColumnSerializer(many=True, read_only=True)
 

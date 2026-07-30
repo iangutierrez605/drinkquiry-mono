@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { api, errorText } from "../lib/api";
+import { api, errorText, mediaUrl } from "../lib/api";
 import { loadAuth, onAuthChange } from "../lib/storage";
 import { Toast, UsageMeterLine } from "../components/shared";
 import AuthScreen from "../components/AuthScreen";
@@ -92,6 +92,15 @@ function ProfileBody({ auth, onAuthGone }) {
         </section>
       )}
 
+      {profile && (
+        <BrandingPanel
+          token={auth.token}
+          profile={profile}
+          onSaved={setProfile}
+          onToast={setToast}
+        />
+      )}
+
       {profile && <ChangePasswordPanel token={auth.token} onToast={setToast} />}
 
       <section className="panel">
@@ -111,6 +120,106 @@ function ProfileBody({ auth, onAuthGone }) {
 
       <Toast message={toast} onDone={() => setToast(null)} />
     </div>
+  );
+}
+
+/* ---------------- §H (Handoff #11): venue branding ---------------- */
+
+/**
+ * Creator-plan feature: a brand name + logo that every game this account
+ * hosts carries (TV lobby, in-play header, buzzer join line — all served
+ * from the snapshot's `brand`). Free plans see the standard upsell card;
+ * the server is the real gate on writes (rule 4). Logo uploads ride the
+ * same media pipeline + storage quota as category photos.
+ */
+function BrandingPanel({ token, profile, onSaved, onToast }) {
+  const [name, setName] = useState(profile.brand_name ?? "");
+  const [file, setFile] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const isCreator = profile.plan !== "free";
+
+  if (!isCreator)
+    return (
+      <section className="panel panel--center upsell">
+        <span className="upsell__emoji">🏷️</span>
+        <p>
+          <strong>Brand your games.</strong> Venues on the creator plan put their name and logo on
+          the TV, the lobby and every buzzer — ask an admin about the venue package.
+        </p>
+      </section>
+    );
+
+  const save = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      let fresh;
+      if (file) {
+        const fd = new FormData();
+        fd.append("brand_name", name);
+        fd.append("brand_logo", file);
+        fresh = await api.updateProfile(token, fd);
+      } else {
+        fresh = await api.updateProfile(token, { brand_name: name });
+      }
+      onSaved(fresh);
+      setFile(null);
+      onToast("Branding saved ✔ — it's on your games' screens from the next snapshot.");
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const clearLogo = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const fresh = await api.updateProfile(token, { brand_logo_clear: true });
+      onSaved(fresh);
+      onToast("Logo cleared — its storage quota is freed.");
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="panel">
+      <h2 className="h2">Branding</h2>
+      <p className="footnote">
+        Your name and logo show on the TV lobby next to the join code, in the in-play header, and
+        on every buzzer's join screen — for every game you host.
+      </p>
+      <label className="field">
+        Brand name <span className="field__hint">(e.g. THE KINGS ARMS — blank to remove)</span>
+        <input value={name} maxLength={60} onChange={(e) => setName(e.target.value)} />
+      </label>
+      <div className="brandpanel__logo">
+        {profile.brand_logo && !file && (
+          <img src={mediaUrl(profile.brand_logo)} alt="Your brand logo" className="brandlogo brandlogo--preview" />
+        )}
+        {file && <img src={URL.createObjectURL(file)} alt="New logo preview" className="brandlogo brandlogo--preview" />}
+        <label className="field">
+          Logo <span className="field__hint">(PNG/JPG/WebP, resized automatically, counts toward your media storage)</span>
+          <input type="file" accept="image/*" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
+        </label>
+      </div>
+      {error && <p className="formerror">{error}</p>}
+      <div className="pwform__btns">
+        <button className="btn btn--primary btn--sm" disabled={busy} onClick={save}>
+          {busy ? "Saving…" : "Save branding"}
+        </button>
+        {profile.brand_logo && (
+          <button className="btn btn--ghost btn--sm" disabled={busy} onClick={clearLogo}>
+            Clear logo
+          </button>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -301,6 +410,9 @@ function Report({ report }) {
               <span className="final__name">
                 {winnerIds.has(p.id) && "🏆 "}
                 {p.name}
+                {/* §F (#11): the report keeps kicked seats (full history) —
+                    badge them so the tallies read right. */}
+                {p.removed && <span className="removedbadge">removed</span>}
               </span>
               <span className="final__stat">
                 {report.mode === "points" ? `${p.score} pts` : `gave ${p.drinks_given} · took ${p.drinks_taken}`}

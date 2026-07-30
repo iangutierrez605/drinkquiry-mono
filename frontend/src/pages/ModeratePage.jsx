@@ -884,8 +884,27 @@ function UserRow({ auth, user, onToast, onSaved }) {
     return state;
   });
   const [busy, setBusy] = useState(false);
+  // §H (#11): brand oversight — staff can blank a bad name (rides the normal
+  // Save PATCH) and clear a bad logo (its own immediate PATCH below). Both
+  // keys are on the server's whitelist; staff never UPLOAD a logo.
+  const [brandName, setBrandName] = useState(user.brand_name ?? "");
+  const [clearArming, setClearArming] = useState(false);
 
   const lapsed = user.plan !== "free" && user.effective_plan === "free";
+
+  const clearLogo = async () => {
+    setBusy(true);
+    setClearArming(false);
+    try {
+      const fresh = await api.adminUserPatch(auth.token, user.id, { brand_logo_clear: true });
+      onSaved(fresh);
+      onToast(`Cleared ${fresh.email}'s brand logo.`);
+    } catch (err) {
+      onToast(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const save = async () => {
     setBusy(true);
@@ -900,6 +919,7 @@ function UserRow({ auth, user, onToast, onSaved }) {
         plan,
         plan_expires_at: expiry ? new Date(`${expiry}T23:59:59`).toISOString() : null,
         limit_overrides: builtOverrides,
+        brand_name: brandName, // §H: staff may blank/fix a venue's brand name
       });
       onSaved(fresh);
       onToast(`Saved ${fresh.email} — plan ${fresh.plan}${fresh.plan_expires_at ? " (expiring)" : ""}.`);
@@ -989,6 +1009,29 @@ function UserRow({ auth, user, onToast, onSaved }) {
             The number shown grey is the plan default; typing a value overrides it for this user only (and survives
             plan changes). Blank = plan default.
           </p>
+          <h3 className="h2">Branding</h3>
+          <div className="userrow__brand">
+            <label className="field">
+              Brand name <span className="field__hint">(shown on their game's TV — blank to remove)</span>
+              <input value={brandName} maxLength={60} onChange={(e) => setBrandName(e.target.value)} />
+            </label>
+            {user.brand_logo ? (
+              <div className="userrow__brandlogo">
+                <img src={mediaUrl(user.brand_logo)} alt="Brand logo" className="brandlogo brandlogo--thumb" />
+                {clearArming ? (
+                  <button type="button" className="btn btn--danger btn--sm" disabled={busy} onClick={clearLogo}>
+                    Confirm clear
+                  </button>
+                ) : (
+                  <button type="button" className="btn btn--ghost btn--sm" onClick={() => setClearArming(true)}>
+                    Clear logo
+                  </button>
+                )}
+              </div>
+            ) : (
+              <span className="footnote">No logo uploaded.</span>
+            )}
+          </div>
           <button className="btn btn--primary btn--sm" disabled={busy} onClick={save}>
             {busy ? "Saving…" : "Save"}
           </button>

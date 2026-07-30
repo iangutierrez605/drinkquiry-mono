@@ -18,13 +18,18 @@ import { API_BASE, WS_BASE } from "./api";
  * connection that hijacks wsRef while the old one kept feeding snapshots:
  * the UI looked live but every send() went into a dead socket.
  *
- * Returns {game, connected, authFailed, lastError, lastBuzz, revealedAnswer,
- *          clearError, send}.
+ * Returns {game, connected, authFailed, removed, lastError, lastBuzz,
+ *          revealedAnswer, clearError, send}.
  */
 export function useGameSocket(code, token) {
   const [game, setGame] = useState(null);
   const [connected, setConnected] = useState(false);
   const [authFailed, setAuthFailed] = useState(false);
+  // §F (Handoff #11): the host kicked this seat. Set by the documented
+  // structured error {code: "player_removed"} or the app close code 4003.
+  // (A kicked seat's RECONNECT attempts land on the 4001/authFailed path
+  // instead — the server filters removed tokens at connect.)
+  const [removed, setRemoved] = useState(false);
   const [lastError, setLastError] = useState(null);
   const [lastBuzz, setLastBuzz] = useState(null); // {participant_id, name, order, at}
   const [revealedAnswer, setRevealedAnswer] = useState(null);
@@ -102,6 +107,7 @@ export function useGameSocket(code, token) {
         } else if (msg.type === "answer_reveal") {
           setRevealedAnswer(msg.answer);
         } else if (msg.type === "error") {
+          if (msg.code === "player_removed") setRemoved(true); // §F (#11)
           setLastError(msg.detail || "Action failed.");
         }
       };
@@ -114,6 +120,10 @@ export function useGameSocket(code, token) {
         if (closedByUs.current) return;
         if (evt.code === 4001) {
           setAuthFailed(true); // bad/expired participant token — caller clears seat
+          return;
+        }
+        if (evt.code === 4003) {
+          setRemoved(true); // §F (#11): the host removed this seat — no retry
           return;
         }
 
@@ -175,5 +185,5 @@ export function useGameSocket(code, token) {
 
   const clearError = useCallback(() => setLastError(null), []);
 
-  return { game, connected, authFailed, lastError, lastBuzz, revealedAnswer, clearError, send };
+  return { game, connected, authFailed, removed, lastError, lastBuzz, revealedAnswer, clearError, send };
 }

@@ -54,7 +54,9 @@ class QuotaTestBase(APITestCase):
         return self.client.post(
             "/api/questions/",
             {
-                "category": category_id,
+                # §K1 (#11): the single-`category` alias is gone — the real
+                # contract is `categories` (a form list posts as repeated keys).
+                "categories": [category_id],
                 "question_text": text,
                 "answer": "That",
                 "difficulty": 2,
@@ -284,6 +286,9 @@ class AdminUserApiTests(QuotaTestBase):
         expected_keys = {
             "id", "email", "display_name", "plan", "effective_plan",
             "plan_expires_at", "is_staff", "date_joined", "limit_overrides", "usage",
+            # §H (Handoff #11): brand oversight fields (shape extended, not
+            # mutated — the C4-safe direction).
+            "brand_name", "brand_logo",
         }
         self.assertEqual(set(row), expected_keys)
         self.assertEqual(set(row["usage"]), {"games_this_month", "categories", "questions", "storage"})
@@ -604,3 +609,178 @@ class HealthCheckTests(APITestCase):
             res = self.client.get("/api/health/")
         self.assertEqual(res.status_code, 503)
         self.assertEqual(res.json()["status"], "degraded")
+
+
+# ---------------------------------------------------------------------------
+# §H (Handoff #11) — venue branding: profile writes, quota, plan gating,
+# snapshot serving, staff oversight
+# ---------------------------------------------------------------------------
+import io
+import os
+import shutil
+import tempfile
+
+from django.core.files.uploadedfile import SimpleUploadedFile
+from PIL import Image
+
+BRAND_TMP_MEDIA = tempfile.mkdtemp(prefix="dq-test-brand-media-")
+
+
+def brand_png(kb=8):
+    """Incompressible noise PNG (tiny dims, under the resize threshold) so
+    the stored size ≈ the requested size — same trick as trivia's quota
+    tests."""
+    img = Image.frombytes("L", (256, kb * 4), os.urandom(256 * kb * 4))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return SimpleUploadedFile("logo.png", buf.getvalue(), content_type="image/png")
+
+
+@override_settings(MEDIA_ROOT=BRAND_TMP_MEDIA)
+class BrandingTests(QuotaTestBase):
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(BRAND_TMP_MEDIA, ignore_errors=True)
+        super().tearDownClass()
+
+    def patch_profile(self, data):
+        return self.client.patch("/api/auth/profile/", data, format="multipart")
+
+    def make_game(self, host):
+        from games.services import create_game
+        from trivia.models import Category, Question
+
+        cat = Category.objects.create(owner=None, name=f"BrandCat-{Category.objects.count()}")
+        for i in range(2):
+            q = Question.objects.create(
+                owner=None, question_text=f"B{i}?", answer=f"A{i}", difficulty=1
+            )
+            q.categories.add(cat)
+        return create_game(host=host, mode="points", category_ids=[cat.id], questions_per_category=2)
+
+    def snapshot(self, game):
+        res = self.client.get(f"/api/games/{game.code}/")
+        self.assertEqual(res.status_code, 200)
+        return res.json()
+
+    def test_creator_sets_both_fields_multipart(self):
+        self.auth(self.paid)
+        res = self.patch_profile({"brand_name": "THE KINGS ARMS", "brand_logo": brand_png()})
+        self.assertEqual(res.status_code, 200, res.content)
+        self.paid.refresh_from_db()
+        self.assertEqual(self.paid.brand_name, "THE KINGS ARMS")
+        self.assertTrue(self.paid.brand_logo)
+        self.assertGreater(self.paid.brand_logo_bytes, 0)
+        self.assertEqual(self.paid.brand_logo_bytes, self.paid.brand_logo.size)
+        # The profile READS the fields back.
+        p = self.client.get("/api/auth/profile/").json()
+        self.assertEqual(p["brand_name"], "THE KINGS ARMS")
+        self.assertTrue(p["brand_logo"])
+
+    def test_free_plan_write_plain_403_reads_fine(self):
+        self.auth(self.free)
+        res = self.patch_profile({"brand_name": "SNEAKY"})
+        self.assertEqual(res.status_code, 403)
+        self.assertEqual(res.json(), {"detail": "Branding is part of the creator plan."})
+        res = self.patch_profile({"brand_logo": brand_png()})
+        self.assertEqual(res.status_code, 403)
+        # Reads are fine — and a brand-free PATCH still works for free users.
+        self.assertEqual(self.client.get("/api/auth/profile/").status_code, 200)
+        res = self.client.patch("/api/auth/profile/", {"display_name": "Still Free"}, format="json")
+        self.assertEqual(res.status_code, 200, res.content)
+
+    def test_register_cannot_set_branding(self):
+        self.client.force_authenticate(user=None)
+        res = self.client.post(
+            "/api/auth/register/",
+            {"email": "venue@test.com", "password": "sturdy-pass-123", "brand_name": "SNEAKY"},
+            format="json",
+        )
+        self.assertEqual(res.status_code, 201, res.content)
+        self.assertEqual(User.objects.get(email="venue@test.com").brand_name, "")
+
+    def test_storage_quota_applies_and_frees_on_clear(self):
+        from accounts.quotas import storage_bytes_used
+
+        self.auth(self.paid)
+        self.assertEqual(self.patch_profile({"brand_logo": brand_png(8)}).status_code, 200)
+        self.paid.refresh_from_db()
+        used = self.paid.brand_logo_bytes
+        self.assertEqual(storage_bytes_used(self.paid), used)
+        # A cap below the next upload → the standard structured quota_storage 403.
+        with override_settings(
+            PLAN_LIMITS={
+                "free": {"games_per_month": None, "categories": 0, "questions": 0, "storage_bytes": 0},
+                "creator": {"games_per_month": None, "categories": 25, "questions": 500, "storage_bytes": used + 100},
+            }
+        ):
+            res = self.patch_profile({"brand_logo": brand_png(8)})
+            self.assert_quota_403(res, "quota_storage", used, used + 100)
+        # Clearing frees the bytes (the column goes to 0 with it).
+        res = self.patch_profile({"brand_logo_clear": "true"})
+        self.assertEqual(res.status_code, 200, res.content)
+        self.paid.refresh_from_db()
+        self.assertFalse(self.paid.brand_logo)
+        self.assertEqual(self.paid.brand_logo_bytes, 0)
+        self.assertEqual(storage_bytes_used(self.paid), 0)
+
+    def test_snapshot_brand_shape_and_gating(self):
+        self.auth(self.paid)
+        game = self.make_game(self.paid)
+        # Nothing set → null.
+        self.assertIsNone(self.snapshot(game)["brand"])
+        self.assertEqual(self.patch_profile({"brand_name": "THE KINGS ARMS", "brand_logo": brand_png()}).status_code, 200)
+        snap = self.snapshot(game)
+        self.assertEqual(set(snap["brand"]), {"name", "logo"})
+        self.assertEqual(snap["brand"]["name"], "THE KINGS ARMS")
+        self.assertIn("/media/brands/", snap["brand"]["logo"])
+        # A free host's game never carries a brand.
+        free_game = self.make_game(self.free)
+        self.assertIsNone(self.snapshot(free_game)["brand"])
+
+    def test_plan_lapse_hides_brand_but_fields_persist(self):
+        self.auth(self.paid)
+        game = self.make_game(self.paid)
+        self.assertEqual(self.patch_profile({"brand_name": "THE KINGS ARMS"}).status_code, 200)
+        self.assertEqual(self.snapshot(game)["brand"], {"name": "THE KINGS ARMS", "logo": None})
+        # Lapse: brand disappears from NEW snapshots; the fields remain.
+        self.paid.plan_expires_at = timezone.now() - timedelta(days=1)
+        self.paid.save(update_fields=["plan_expires_at"])
+        self.assertIsNone(self.snapshot(game)["brand"])
+        self.paid.refresh_from_db()
+        self.assertEqual(self.paid.brand_name, "THE KINGS ARMS")
+        # Flip back → it returns (§N step 5).
+        self.paid.plan_expires_at = None
+        self.paid.save(update_fields=["plan_expires_at"])
+        self.assertEqual(self.snapshot(game)["brand"], {"name": "THE KINGS ARMS", "logo": None})
+
+    def test_staff_patch_whitelist_extended_not_loosened(self):
+        staff = User.objects.create_user("brandstaff@test.com", "sturdy-pass-123", is_staff=True)
+        self.paid.brand_name = "THE KINGS ARMS"
+        self.paid.brand_logo = brand_png()
+        self.paid.save()
+        self.assertGreater(self.paid.brand_logo_bytes, 0)
+        self.auth(staff)
+        url = f"/api/moderation/users/{self.paid.id}/"
+        # The two NEW keys are accepted…
+        res = self.client.patch(url, {"brand_name": "", "brand_logo_clear": True}, format="json")
+        self.assertEqual(res.status_code, 200, res.content)
+        self.paid.refresh_from_db()
+        self.assertEqual(self.paid.brand_name, "")
+        self.assertFalse(self.paid.brand_logo)
+        self.assertEqual(self.paid.brand_logo_bytes, 0)
+        # …and everything else still 400s (the pinned whitelist shape).
+        res = self.client.patch(url, {"is_staff": True}, format="json")
+        self.assertEqual(res.status_code, 400)
+        res = self.client.patch(url, {"brand_logo": "hax"}, format="json")
+        self.assertEqual(res.status_code, 400)
+
+    def test_admin_list_shows_brand_fields(self):
+        staff = User.objects.create_user("brandstaff2@test.com", "sturdy-pass-123", is_staff=True)
+        self.paid.brand_name = "THE KINGS ARMS"
+        self.paid.save(update_fields=["brand_name"])
+        self.auth(staff)
+        res = self.client.get("/api/moderation/users/?search=paid@")
+        row = res.data["results"][0]
+        self.assertEqual(row["brand_name"], "THE KINGS ARMS")
+        self.assertIn("brand_logo", row)

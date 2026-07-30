@@ -4,6 +4,12 @@ from django.db import models
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
+# §H (Handoff #11): the brand logo rides the SAME validation + resize
+# pipeline as every other image (trivia/validators.py + trivia/images.py).
+# Module-level import is safe: trivia.validators only touches settings and
+# ValidationError at import time (the PIL import inside it is deferred).
+from trivia.validators import validate_image
+
 
 class Plan(models.TextChoices):
     FREE = "free", "Free"
@@ -62,10 +68,44 @@ class User(AbstractBaseUser, PermissionsMixin):
     # to free.
     limit_overrides = models.JSONField(default=dict, blank=True)
 
+    # --- §H (Handoff #11): venue branding -------------------------------
+    # The brand lives on the USER, not the game: every game this user hosts
+    # is branded (that's what a venue wants — one place to set, not per-game
+    # fiddling; per-game overrides are §M). Serving is gated on the
+    # EFFECTIVE plan (see games' GameStateSerializer.get_brand): a lapsed
+    # creator plan turns branding OFF without destroying the venue's upload.
+    # Writes are gated in ProfileView (free-plan write → plain 403); the
+    # staff Users tab may edit brand_name and clear the logo.
+    brand_name = models.CharField(max_length=60, blank=True)
+    brand_logo = models.ImageField(
+        upload_to="brands/", null=True, blank=True, validators=[validate_image]
+    )
+    # §H1: persisted size of `brand_logo` (post-resize), maintained by save()
+    # below exactly like Category.photo_bytes — the storage quota counts it
+    # (accounts/quotas.storage_bytes_used). Clearing the logo frees the bytes
+    # because this column goes to 0 with it.
+    brand_logo_bytes = models.PositiveBigIntegerField(default=0)
+
     objects = UserManager()
 
     USERNAME_FIELD = "email"
     REQUIRED_FIELDS = []
+
+    def save(self, *args, **kwargs):
+        # §H1: the models' save()-time media choke point, exactly like
+        # Category.save() — resize BEFORE storage, recount brand_logo_bytes
+        # from the post-resize file (or to 0 when the logo is cleared by a
+        # full save).
+        from trivia.images import prepare_media
+
+        prepare_media(
+            self,
+            image_fields=("brand_logo",),
+            file_fields=("brand_logo",),
+            byte_field="brand_logo_bytes",
+            update_fields=kwargs.get("update_fields"),
+        )
+        super().save(*args, **kwargs)
 
     @property
     def effective_plan(self) -> str:

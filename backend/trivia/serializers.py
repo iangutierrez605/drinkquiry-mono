@@ -52,21 +52,17 @@ class QuestionSerializer(serializers.ModelSerializer):
     # §F2 (Handoff #10): a question lives in one or more categories. Reads
     # and writes both use `categories` (list of ids). Deleted categories are
     # unassignable (§F5) — the queryset filter is the gate.
+    # §K1 (Handoff #11): the deprecated single-`category` write alias (#10's
+    # one-session back-compat) is GONE — a `category` key is now an unknown
+    # field, and a body with no `categories` gets the 400 naming it (pinned).
     categories = serializers.PrimaryKeyRelatedField(
         many=True, queryset=Category.objects.filter(deleted_at__isnull=True)
-    )
-    # DEPRECATED (kept for ONE session, §F2 back-compat): the pre-#10 single
-    # `category` id is still accepted on WRITE and mapped to `[id]` so
-    # in-flight tabs don't 400 mid-deploy. Write-only — responses carry
-    # `categories` only. Remove next session.
-    category = serializers.PrimaryKeyRelatedField(
-        queryset=Category.objects.filter(deleted_at__isnull=True), write_only=True, required=False
     )
 
     class Meta:
         model = Question
         fields = (
-            "id", "categories", "category", "question_text", "answer", "difficulty",
+            "id", "categories", "question_text", "answer", "difficulty",
             "media_type", "image", "audio", "video",
             "owner", "visibility", "moderation_status", "moderation_note", "created_at",
         )
@@ -86,11 +82,6 @@ class QuestionSerializer(serializers.ModelSerializer):
         expected = field_for_type.get(media_type)
         if expected and not (attrs.get(expected) or (self.instance and getattr(self.instance, expected))):
             raise serializers.ValidationError({expected: f"A {media_type} file is required for this media type."})
-        # Legacy single-id write maps onto the list (explicit `categories`
-        # wins if a client somehow sends both).
-        legacy = attrs.pop("category", None)
-        if legacy is not None and not attrs.get("categories"):
-            attrs["categories"] = [legacy]
         categories = attrs.get("categories")
         if categories is not None:
             # De-dup while preserving order (a repeated id is harmless input).

@@ -150,12 +150,32 @@ class Participant(models.Model):
     # never plays it. Players don't pick (punted). Display-only: no game
     # logic keys off this field.
     buzzer_sound = models.PositiveSmallIntegerField(default=1)
+    # §F (Handoff #11): soft removal — the host kicked this seat. Null =
+    # active; the ONLY liveness flag (same convention as Question/Category
+    # `deleted_at` — a participant is REMOVED from a live game, not deleted
+    # content, hence the name). The row is deliberately kept: Buzz and
+    # DrinkAssignment CASCADE off it, BoardCell.answered_by is SET_NULL, and
+    # Game.winners references it — a hard delete would erase buzz/drink
+    # history and blank exactly the attribution §G renders. "Active" surfaces
+    # (snapshot participants, join cap, token rejoin, WS connect + per-message
+    # checks, winners, drink targets, judge lookups, history counts) filter
+    # removed_at__isnull=True; history surfaces (the finished report, cell
+    # attribution via the snapshot's `former_players`) keep the row.
+    removed_at = models.DateTimeField(null=True, blank=True)
     connected = models.BooleanField(default=False)
     joined_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         constraints = [
-            models.UniqueConstraint(fields=["game", "name"], name="unique_participant_name_per_game"),
+            # §F (Handoff #11): PARTIAL unique (active seats only) — third use
+            # of the house pattern (unique_category_name_per_owner,
+            # unique_active_theme_name) — so a kicked troll's name, or a
+            # legitimately-rejoining team's, is immediately reusable.
+            models.UniqueConstraint(
+                fields=["game", "name"],
+                condition=models.Q(removed_at__isnull=True),
+                name="unique_participant_name_per_game",
+            ),
         ]
 
     def __str__(self):

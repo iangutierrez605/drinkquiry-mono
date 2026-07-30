@@ -33,7 +33,14 @@ from rest_framework.permissions import IsAdminUser
 from . import quotas
 from .models import Plan, User
 
-PATCHABLE_FIELDS = {"plan", "plan_expires_at", "limit_overrides"}
+# §H (Handoff #11): staff oversight for venue branding — an unvetted image
+# reaches a public TV, so the Users tab can see the brand fields and clear a
+# bad logo (brand_logo_clear) or blank a bad name (brand_name). The
+# whitelist EXTENDS by exactly these two keys; everything else still 400s
+# (that shape is pinned — extend it, don't loosen it). There is no logo
+# moderation queue (§M): the creator plan is manually granted to known
+# venues, which is the trust boundary (noted in CHANGES.md).
+PATCHABLE_FIELDS = {"plan", "plan_expires_at", "limit_overrides", "brand_name", "brand_logo_clear"}
 
 
 class AdminUserPagination(pagination.PageNumberPagination):
@@ -47,14 +54,26 @@ class AdminUserSerializer(serializers.ModelSerializer):
 
     effective_plan = serializers.CharField(read_only=True)
     usage = serializers.SerializerMethodField()
+    # §H: brand oversight — logo is read-only here (staff never UPLOAD a
+    # venue's logo, they only clear a bad one via the flag below).
+    brand_logo = serializers.FileField(read_only=True)
+    brand_logo_clear = serializers.BooleanField(write_only=True, required=False)
 
     class Meta:
         model = User
         fields = (
             "id", "email", "display_name", "plan", "effective_plan",
             "plan_expires_at", "is_staff", "date_joined", "limit_overrides", "usage",
+            "brand_name", "brand_logo", "brand_logo_clear",
         )
         read_only_fields = ("id", "email", "display_name", "is_staff", "date_joined")
+
+    def update(self, instance, validated_data):
+        # §H: the clear flag → no logo; the full save() recounts
+        # brand_logo_bytes to 0 (frees the venue's storage quota).
+        if validated_data.pop("brand_logo_clear", False):
+            validated_data["brand_logo"] = None
+        return super().update(instance, validated_data)
 
     def get_usage(self, obj):
         return quotas.usage(obj)

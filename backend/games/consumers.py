@@ -22,6 +22,10 @@ Client -> server actions (JSON {"action": ..., ...}):
     assign_drinks {to_participant_id}
                                — host fallback for give_drink (same
                                  once-per-cell marker; first assignment wins)
+    remove_player {participant_id}
+                               — §F (Handoff #11): soft-remove a player seat
+                                 (services.remove_player). Works in lobby and
+                                 active games; the host seat is unremovable
     close_cell                 — return to board (marks cell answered)
     finish_game
 
@@ -30,7 +34,17 @@ Server -> clients events:
   buzz           — incremental: someone buzzed {participant_id, name, order}
   answer_reveal  — {answer} (host action)
   error          — {detail} (+ {code} for documented structured errors, e.g.
-                   §G's {"detail", "code": "drinks_already_assigned"})
+                   §G's {"detail", "code": "drinks_already_assigned"} and
+                   §F(#11)'s {"detail", "code": "player_removed"})
+
+App close codes:
+  4001 — unknown/expired participant token at connect (accept-then-close;
+         Handoff #3 §E1). A REMOVED participant's token also lands here on
+         any reconnect attempt (_get_participant filters removed seats).
+  4003 — §F (Handoff #11): the sender's seat was removed mid-connection. An
+         already-connected socket can't be closed by a connect-time filter,
+         so every receive_json re-checks the seat is still active; a removed
+         sender gets the `player_removed` structured error, then this close.
 
 Design note: every mutation persists to the DB first, then a fresh snapshot is
 broadcast. Clients are dumb renderers of state, so reloads/reconnects are
@@ -55,6 +69,7 @@ from .services import (
     judge_buzz,
     open_cell,
     register_buzz,
+    remove_player,
     reset_buzzer,
     reveal_answer,
     set_buzzer,
@@ -90,6 +105,17 @@ class GameConsumer(AsyncJsonWebsocketConsumer):
             await self._broadcast_state()
 
     async def receive_json(self, content, **kwargs):
+        # §F (#11): a kicked player's live socket is already connected, so
+        # the connect-time filter can't help — re-check the seat on every
+        # message (one indexed query). Removed sender → structured error,
+        # then the documented 4003 close (see module docstring).
+        if not await self._participant_active():
+            await self.send_json(
+                {"type": "error", "detail": "The host removed this buzzer.", "code": "player_removed"}
+            )
+            await self.close(code=4003)
+            return
+
         action = content.get("action")
         is_host = self.participant.role == ParticipantRole.HOST
 
@@ -151,6 +177,10 @@ class GameConsumer(AsyncJsonWebsocketConsumer):
                 # §G: the host fallback — same mutation, same once-per-cell
                 # marker as the player path above.
                 await self._assign_drink(content.get("to_participant_id"))
+            elif action == "remove_player":
+                # §F (#11): body in services.remove_player — soft flag, buzz/
+                # cell cleanup for the open round, per the house rule.
+                await self._host_remove_player(content.get("participant_id"))
             elif action == "close_cell":
                 await self._host_close_cell()
             elif action == "finish_game":
@@ -191,7 +221,17 @@ class GameConsumer(AsyncJsonWebsocketConsumer):
     def _get_participant(self, token):
         if not token:
             return None
-        return Participant.objects.select_related("game").filter(game__code=self.code, token=token).first()
+        # §F (#11): a removed seat's token is dead — reconnects fall through
+        # to the 4001 path exactly like an unknown token.
+        return (
+            Participant.objects.select_related("game")
+            .filter(game__code=self.code, token=token, removed_at__isnull=True)
+            .first()
+        )
+
+    @database_sync_to_async
+    def _participant_active(self):
+        return Participant.objects.filter(pk=self.participant.pk, removed_at__isnull=True).exists()
 
     @database_sync_to_async
     def _set_connected(self, value):
@@ -201,7 +241,9 @@ class GameConsumer(AsyncJsonWebsocketConsumer):
     def _snapshot(self):
         game = (
             Game.objects.prefetch_related("columns__cells", "columns__category", "participants")
-            .select_related("current_cell__question", "judged_participant")
+            # "host" feeds §H's brand — selected here so no snapshot pays an
+            # extra query for it (the cells_remaining N+1 lesson).
+            .select_related("current_cell__question", "judged_participant", "host")
             .get(code=self.code)
         )
         data = GameStateSerializer(game).data
@@ -244,6 +286,10 @@ class GameConsumer(AsyncJsonWebsocketConsumer):
         # services.assign_drink is the single gate (winner-only for players,
         # once per cell for everyone).
         assign_drink(code=self.code, actor=self.participant, target_participant_id=target_participant_id)
+
+    @database_sync_to_async
+    def _host_remove_player(self, participant_id):
+        remove_player(code=self.code, participant_id=participant_id, actor=self.participant)
 
     @database_sync_to_async
     def _host_close_cell(self):

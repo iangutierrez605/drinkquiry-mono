@@ -379,6 +379,18 @@ async def ws_flow(code, host_tok, a_tok, a_id, b_tok, b_id, knox, fknox):
 
     async with websockets.connect(url(host_tok), origin=ORIGIN) as host:
         await recv_until(host, "state")
+        # --- §F (Handoff #11): host removes TEAM A over WS -----------------
+        await host.send(json.dumps({"action": "remove_player", "participant_id": a_id}))
+        s = (await latest_state(host))["game"]
+        assert all(p["id"] != a_id for p in s["participants"]), s["participants"]
+        ok("remove_player over WS → TEAM A gone from the snapshot's participants (§F)")
+        # The freed seat + the partial name constraint: the SAME name joins
+        # fresh (201) even though the table was at the 6-team cap.
+        r = requests.post(f"{BASE}/api/games/{code}/join/", json={"name": "TEAM A"})
+        assert r.status_code == 201, r.text
+        assert r.json()["participant"]["id"] != a_id, r.json()
+        ok("fresh join with the SAME name → 201 new seat (cap freed + partial constraint, §F)")
+        await drain(host)
         await host.send(json.dumps({"action": "finish_game"}))
         s = (await latest_state(host))["game"]
         assert s["status"] == "finished"; ok("finish_game → finished")
@@ -399,6 +411,13 @@ async def ws_flow(code, host_tok, a_tok, a_id, b_tok, b_id, knox, fknox):
     pmap = {p["name"]: p for p in rep["participants"]}
     assert pmap["TEAM B"]["drinks_given"] == 1
     assert next(p for p in rep["participants"] if p["role"] == "host")["drinks_taken"] == 1
+    # §F (#11): the report keeps the KICKED seat with its tallies, flagged —
+    # two TEAM A rows now exist (removed original + the fresh rejoin).
+    team_a_rows = [p for p in rep["participants"] if p["name"] == "TEAM A"]
+    assert {p["removed"] for p in team_a_rows} == {True, False}, team_a_rows
+    removed_a = next(p for p in team_a_rows if p["removed"])
+    assert removed_a["id"] == a_id and "drinks_taken" in removed_a, removed_a
+    ok("report keeps the removed TEAM A with tallies + removed:true; the fresh seat is removed:false (§F)")
     qs = [q for col in rep["columns"] for q in col["questions"]]
     assert qs and all(q.get("answer") for q in qs), "finished report must include every answer"
     assert any(q["answer"] == the_answer for q in qs)
@@ -430,7 +449,7 @@ def media_round_trip():
     img = Image.new("RGB", (2600, 1400), (30, 90, 200))
     buf = io.BytesIO(); img.save(buf, format="JPEG", quality=95); raw = buf.getvalue()
     r = requests.post(f"{BASE}/api/questions/", headers=h,
-                      data={"category": cat.json()["id"], "question_text": "Smoke media?", "answer": "Yes",
+                      data={"categories": [cat.json()["id"]], "question_text": "Smoke media?", "answer": "Yes",  # §K1: alias removed
                             "difficulty": 1, "visibility": "private", "media_type": "image"},
                       files={"image": ("photo.jpg", raw, "image/jpeg")})
     assert r.status_code == 201, r.text

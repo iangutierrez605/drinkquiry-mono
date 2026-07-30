@@ -1,6 +1,6 @@
 # Drinkquiry
 
-Jeopardy-style trivia platform where correct answers let you assign drinks (or points) to other teams. Django 6 + DRF + Channels backend, fully dockerized.
+Quiz-show-style trivia platform where correct answers let you assign drinks (or points) to other teams. Django 6 + DRF + Channels backend, fully dockerized.
 
 ## Quick start
 
@@ -11,7 +11,7 @@ docker compose exec api python manage.py seed_demo        # 5 official categorie
 docker compose exec api python manage.py createsuperuser  # for /admin moderation
 ```
 
-API at http://localhost:8000/api/, admin at http://localhost:8000/admin/, WebSockets at ws://localhost:8000/ws/game/CODE/.
+API at http://localhost:8000/api/, admin at http://localhost:8000/admin/, WebSockets at ws://localhost:8000/ws/game/CODE/. `GET /api/health/` is the deploy probe.
 
 ## Architecture
 
@@ -24,9 +24,9 @@ docker-compose
 
 Apps:
 
-- `accounts` — email-login user, knox tokens, `plan`/`plan_expires_at` paid tier (quotas in `settings.PLAN_LIMITS`; `is_creator` is now derived from the plan)
-- `trivia` — Category and Question with owner, visibility (private/public), moderation status (pending/approved/rejected), photo/image/audio/video with size + type validators, admin approve/reject actions
-- `games` — Game, board columns/cells, participants (no account needed to buzz), buzz log, drink assignments, WebSocket consumer
+- `accounts` — email-login user, knox tokens, `plan`/`plan_expires_at` paid tier (quotas in `settings.PLAN_LIMITS` + per-user `limit_overrides`), password forgot/reset/change with transactional email, per-IP throttles on the public auth endpoints, the staff user-management API, and venue branding (`brand_name`/`brand_logo`, creator plan)
+- `trivia` — Category and Question (a question can live in SEVERAL categories) with owner, visibility, a full staff moderation queue + searchable library, soft delete on both models, versioned revise, host flags, bulk CSV/zip upload with media, staff-curated themes for one-tap board building
+- `games` — Game, board columns/cells, participants (no account needed to buzz), buzz log, drink assignments, host kick (soft removal), game history + host-private reports, WebSocket consumer + REST polling snapshot
 
 ## The buzzer flow
 
@@ -61,7 +61,7 @@ Server events: `state` (full snapshot), `answer_reveal {answer}`, `error {detail
 
 ## Moderation (requirements 2, 3, 7)
 
-Content is born PRIVATE. Setting visibility to public flips it to PENDING; it only appears publicly once an admin approves it in /admin (bulk approve/reject actions). Any edit to public content re-enters the queue. Private content is always usable by its owner regardless of moderation. Media size caps: 5 MB images, 10 MB audio, 50 MB video (tune in settings). With `MEDIA_BACKEND=s3`, files go to S3/DigitalOcean Spaces as private objects served through signed URLs, so unvetted uploads are never publicly listable.
+Content is born PRIVATE. Setting visibility to public flips it to PENDING; it only appears publicly once an admin approves it in /admin (bulk approve/reject actions). Any edit to public content re-enters the queue. Private content is always usable by its owner regardless of moderation. Media size caps: 10 MB images (auto-resized past 1 MB / 1920 px), 8 MB audio, 25 MB video (tune in settings). With `MEDIA_BACKEND=s3`, files go to S3/DigitalOcean Spaces as private objects served through signed URLs, so unvetted uploads are never publicly listable.
 
 ## Monetisation: paid tiers (requirement 1)
 
@@ -82,14 +82,15 @@ hosting is unlimited for everyone (free `games_per_month: None`); flip it to a n
 When you add Stripe, a checkout webhook writes the same two fields and nothing else
 changes. Quota tests live in the full suite: `python manage.py test accounts trivia games`.
 
+The React + Vite frontend (in `frontend/`) covers the whole flow: /host (create with themes, lobby preview + swap, live panel, player kick), /board/CODE (TV — WebSocket with REST-polling fallback, venue branding), /game/buzzer/CODE (phones, no account), /profile (history, reports, branding, password), /moderate (six staff tabs).
+
 ## Roadmap / not in this prototype
 
-- Stripe checkout + webhook to set `plan`/`plan_expires_at` (and a cron to downgrade expired plans, though expiry is already enforced at read time)
-- Email verification / password reset
-- Rate limiting on join/buzz endpoints, CAPTCHA on registration
+- Stripe checkout + webhook to set `plan`/`plan_expires_at` (expiry is already enforced at read time) — includes billing the branding/venue tier
+- Email verification at registration (password reset/change already ship)
+- CAPTCHA on registration (per-IP auth throttles already ship; game join and the polling snapshot stay deliberately unthrottled)
 - Team rosters (currently one participant = one team buzzer, which matches your design)
-- Frontend (recommended: React + Vite, one WebSocket hook, three routes: /host, /board/CODE, /game/buzzer/CODE)
-- Production hardening: gunicorn/uvicorn workers behind nginx, collectstatic, HTTPS/WSS, `DJANGO_DEBUG=false`
+- Production hardening beyond DEPLOY.md's compose + Caddy setup
 
 ## Local dev without Docker
 

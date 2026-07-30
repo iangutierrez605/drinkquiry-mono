@@ -974,3 +974,392 @@ class CellsRemainingTests(GameTestBase):
         snap = self.snapshot(game)
         self.assertEqual(snap["cells_remaining"], 0)  # exactly after the LAST close
         self.assertIsNone(snap["current_cell"])
+
+
+# ---------------------------------------------------------------------------
+# §F (Handoff #11) — host removes players (soft flag + every active surface)
+# ---------------------------------------------------------------------------
+class RemovePlayerTests(GameTestBase):
+    """services.remove_player + the C6-audited `removed_at__isnull=True`
+    filters: snapshot participants/former_players, join cap, token rejoin,
+    winners, drink targets, judge lookups, history counts, and the report's
+    keep-everything-with-a-flag rule."""
+
+    def setUp(self):
+        from .services import remove_player  # noqa: F401 — import check
+
+    def snapshot(self, game):
+        from .serializers import GameStateSerializer
+
+        fresh = (
+            Game.objects.prefetch_related("columns__cells", "columns__category", "participants")
+            .select_related("current_cell__question", "judged_participant", "host")
+            .get(pk=game.pk)
+        )
+        return GameStateSerializer(fresh).data
+
+    def host_seat(self, game):
+        return Participant.objects.create(game=game, name="Host", role=ParticipantRole.HOST)
+
+    def test_host_only(self):
+        from .services import remove_player
+
+        game = make_game(self.host)
+        a, b = self.add_players(game, "TEAM A", "TEAM B")
+        with self.assertRaisesMessage(ActionError, "Only the host can remove players."):
+            remove_player(code=game.code, participant_id=b.id, actor=a)
+        b.refresh_from_db()
+        self.assertIsNone(b.removed_at)
+
+    def test_host_seat_unremovable(self):
+        from .services import remove_player
+
+        game = make_game(self.host)
+        seat = self.host_seat(game)
+        with self.assertRaisesMessage(ActionError, "The host seat can't be removed."):
+            remove_player(code=game.code, participant_id=seat.id, actor=seat)
+
+    def test_finished_game_refuses(self):
+        from .services import remove_player
+
+        game = make_game(self.host)
+        seat = self.host_seat(game)
+        (a,) = self.add_players(game, "TEAM A")
+        finalize_game(code=game.code)
+        with self.assertRaisesMessage(ActionError, "finished"):
+            remove_player(code=game.code, participant_id=a.id, actor=seat)
+
+    def test_unknown_participant(self):
+        from .services import remove_player
+
+        game = make_game(self.host)
+        seat = self.host_seat(game)
+        with self.assertRaisesMessage(ActionError, "Unknown participant."):
+            remove_player(code=game.code, participant_id=999999, actor=seat)
+
+    def test_double_remove_exact_structured_shape(self):
+        from .services import remove_player
+
+        game = make_game(self.host)
+        seat = self.host_seat(game)
+        (a,) = self.add_players(game, "TEAM A")
+        remove_player(code=game.code, participant_id=a.id, actor=seat)
+        with self.assertRaises(StructuredActionError) as ctx:
+            remove_player(code=game.code, participant_id=a.id, actor=seat)
+        self.assertEqual(set(ctx.exception.payload), {"detail", "code"})  # C4: no extra keys
+        self.assertEqual(ctx.exception.payload["code"], "player_removed")
+
+    def test_works_in_lobby_and_active(self):
+        from .services import remove_player
+
+        game = make_game(self.host)
+        seat = self.host_seat(game)
+        a, b = self.add_players(game, "TEAM A", "TEAM B")
+        remove_player(code=game.code, participant_id=a.id, actor=seat)  # lobby
+        Game.objects.filter(pk=game.pk).update(status=GameStatus.ACTIVE)
+        remove_player(code=game.code, participant_id=b.id, actor=seat)  # active
+        a.refresh_from_db(); b.refresh_from_db()
+        self.assertIsNotNone(a.removed_at)
+        self.assertIsNotNone(b.removed_at)
+
+    # ---- open-cell interactions ------------------------------------------
+
+    def _open_and_buzz(self, game, *players):
+        cell = self.cells(game)[0]
+        open_cell(code=game.code, cell_id=cell.id)
+        set_buzzer(code=game.code, is_open=True)
+        for p in players:
+            register_buzz(code=game.code, participant=p)
+        return cell
+
+    def test_open_cell_buzzes_deleted_historical_kept(self):
+        from .models import Buzz
+        from .services import remove_player
+
+        game = make_game(self.host, n=2)
+        seat = self.host_seat(game)
+        a, b = self.add_players(game, "TEAM A", "TEAM B")
+        Game.objects.filter(pk=game.pk).update(status=GameStatus.ACTIVE)
+        # Round 1: both buzz, B wins with drinks assigned, cell closes —
+        # A's buzz on this cell is history and must survive.
+        first = self._open_and_buzz(game, a, b)
+        judge_buzz(code=game.code, participant_id=b.id, correct=True)
+        close_cell(code=game.code)
+        # Round 2: both buzz on the fresh cell; A is then removed.
+        cells = self.cells(game)
+        second = next(c for c in cells if c.id != first.id)
+        open_cell(code=game.code, cell_id=second.id)
+        set_buzzer(code=game.code, is_open=True)
+        register_buzz(code=game.code, participant=a)
+        register_buzz(code=game.code, participant=b)
+        remove_player(code=game.code, participant_id=a.id, actor=seat)
+        self.assertFalse(Buzz.objects.filter(cell=second, participant=a).exists())  # live order evaporates
+        self.assertTrue(Buzz.objects.filter(cell=second, participant=b).exists())
+        self.assertTrue(Buzz.objects.filter(cell=first, participant=a).exists())  # closed-cell history stays
+
+    def test_unjudged_winner_cleared_and_buzzer_reopens(self):
+        from .services import remove_player
+
+        game = make_game(self.host, mode="drinks")
+        seat = self.host_seat(game)
+        a, b = self.add_players(game, "TEAM A", "TEAM B")
+        Game.objects.filter(pk=game.pk).update(status=GameStatus.ACTIVE)
+        cell = self._open_and_buzz(game, a)
+        judge_buzz(code=game.code, participant_id=a.id, correct=True)  # locks buzzer, sets marker
+        remove_player(code=game.code, participant_id=a.id, actor=seat)
+        cell.refresh_from_db()
+        game.refresh_from_db()
+        self.assertIsNone(cell.answered_by)
+        self.assertIsNone(cell.answered_correctly)
+        self.assertTrue(game.buzzer_open)  # the round restarts for everyone else
+        self.assertIsNone(game.judged_participant)
+        self.assertIsNone(game.judged_correct)
+
+    def test_drinks_already_assigned_leaves_the_cell_alone(self):
+        from .services import remove_player
+
+        game = make_game(self.host, mode="drinks")
+        seat = self.host_seat(game)
+        a, b = self.add_players(game, "TEAM A", "TEAM B")
+        Game.objects.filter(pk=game.pk).update(status=GameStatus.ACTIVE)
+        cell = self._open_and_buzz(game, a)
+        judge_buzz(code=game.code, participant_id=a.id, correct=True)
+        assign_drink(code=game.code, actor=a, target_participant_id=b.id)
+        remove_player(code=game.code, participant_id=a.id, actor=seat)
+        cell.refresh_from_db()
+        game.refresh_from_db()
+        self.assertEqual(cell.answered_by_id, a.id)  # the drink happened; history stays
+        self.assertTrue(cell.answered_correctly)
+        self.assertFalse(game.buzzer_open)
+        # The judgment marker still clears — the verdict banner would name
+        # someone who's gone.
+        self.assertIsNone(game.judged_participant)
+
+    def test_judged_wrong_marker_cleared_on_removal(self):
+        from .services import remove_player
+
+        game = make_game(self.host)
+        seat = self.host_seat(game)
+        a, b = self.add_players(game, "TEAM A", "TEAM B")
+        Game.objects.filter(pk=game.pk).update(status=GameStatus.ACTIVE)
+        self._open_and_buzz(game, a)
+        judge_buzz(code=game.code, participant_id=a.id, correct=False)
+        remove_player(code=game.code, participant_id=a.id, actor=seat)
+        game.refresh_from_db()
+        self.assertIsNone(game.judged_participant)
+        self.assertIsNone(game.judged_correct)
+
+    def test_removal_keeps_tallies_on_the_row(self):
+        from .services import remove_player
+
+        game = make_game(self.host, mode="drinks")
+        seat = self.host_seat(game)
+        a, b = self.add_players(game, "TEAM A", "TEAM B")
+        Game.objects.filter(pk=game.pk).update(status=GameStatus.ACTIVE)
+        self._open_and_buzz(game, a)
+        judge_buzz(code=game.code, participant_id=a.id, correct=True)
+        assign_drink(code=game.code, actor=a, target_participant_id=b.id)
+        remove_player(code=game.code, participant_id=a.id, actor=seat)
+        a.refresh_from_db()
+        self.assertEqual(a.drinks_given, 1)
+        self.assertEqual(a.score, 1)  # history is history
+
+    # ---- seat + name reuse -------------------------------------------------
+
+    def test_name_reusable_after_removal_partial_constraint(self):
+        from .services import remove_player
+
+        game = make_game(self.host)
+        seat = self.host_seat(game)
+        (a,) = self.add_players(game, "TEAM A")
+        remove_player(code=game.code, participant_id=a.id, actor=seat)
+        again = Participant.objects.create(game=game, name="TEAM A")  # no IntegrityError
+        self.assertNotEqual(again.pk, a.pk)
+        # And an ACTIVE duplicate still collides.
+        from django.db import IntegrityError, transaction
+
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Participant.objects.create(game=game, name="TEAM A")
+
+    def test_join_cap_frees_a_seat(self):
+        from django.conf import settings
+        from .services import remove_player
+
+        game = make_game(self.host)
+        seat = self.host_seat(game)
+        names = [f"TEAM {i}" for i in range(settings.MAX_PLAYERS_PER_GAME)]
+        players = self.add_players(game, *names)
+        url = f"/api/games/{game.code}/join/"
+        r = self.client.post(url, {"name": "TEAM LATE"}, format="json")
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["code"], "game_full")
+        remove_player(code=game.code, participant_id=players[0].id, actor=seat)
+        r = self.client.post(url, {"name": "TEAM LATE"}, format="json")
+        self.assertEqual(r.status_code, 201)
+
+    def test_removed_token_cannot_reclaim_falls_through_to_fresh_join(self):
+        from .services import remove_player
+
+        game = make_game(self.host)
+        seat = self.host_seat(game)
+        (a,) = self.add_players(game, "TEAM A")
+        remove_player(code=game.code, participant_id=a.id, actor=seat)
+        url = f"/api/games/{game.code}/join/"
+        r = self.client.post(url, {"name": "TEAM A", "participant_token": a.token}, format="json")
+        self.assertEqual(r.status_code, 201)  # a FRESH seat, not a reclaim
+        self.assertNotEqual(r.json()["participant"]["id"], a.id)
+        self.assertNotEqual(r.json()["participant_token"], a.token)
+
+    def test_active_token_still_reclaims(self):
+        game = make_game(self.host)
+        (a,) = self.add_players(game, "TEAM A")
+        url = f"/api/games/{game.code}/join/"
+        r = self.client.post(url, {"name": "TEAM A", "participant_token": a.token}, format="json")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["participant"]["id"], a.id)
+
+    # ---- snapshot ----------------------------------------------------------
+
+    def snapshot_helper(self, game):
+        return RemovePlayerTests.snapshot(self, game)
+
+    def test_snapshot_excludes_removed_and_former_players_carries_attributed_only(self):
+        from .services import remove_player
+
+        game = make_game(self.host, mode="drinks", n=2)
+        seat = self.host_seat(game)
+        a, b, c = self.add_players(game, "TEAM A", "TEAM B", "TEAM C")
+        Game.objects.filter(pk=game.pk).update(status=GameStatus.ACTIVE)
+        # A wins a cell WITH drinks assigned (attribution sticks), then gets
+        # kicked; C is kicked holding nothing.
+        cell = self._open_and_buzz(game, a)
+        judge_buzz(code=game.code, participant_id=a.id, correct=True)
+        assign_drink(code=game.code, actor=a, target_participant_id=b.id)
+        close_cell(code=game.code)
+        remove_player(code=game.code, participant_id=a.id, actor=seat)
+        remove_player(code=game.code, participant_id=c.id, actor=seat)
+        snap = self.snapshot(game)
+        names = {p["name"] for p in snap["participants"]}
+        self.assertNotIn("TEAM A", names)
+        self.assertNotIn("TEAM C", names)
+        self.assertIn("TEAM B", names)
+        self.assertEqual(snap["former_players"], [{"id": a.id, "name": "TEAM A"}])
+        # §G's resolution set: the answered cell's id resolves via former_players.
+        won = next(
+            cl for col in snap["columns"] for cl in col["cells"] if cl["id"] == cell.id
+        )
+        self.assertEqual(won["answered_by"], a.id)
+
+    def test_snapshot_over_rest_view_excludes_removed(self):
+        from .services import remove_player
+
+        game = make_game(self.host)
+        seat = self.host_seat(game)
+        a, b = self.add_players(game, "TEAM A", "TEAM B")
+        remove_player(code=game.code, participant_id=a.id, actor=seat)
+        r = self.client.get(f"/api/games/{game.code}/")
+        self.assertEqual(r.status_code, 200)
+        names = {p["name"] for p in r.json()["participants"] if p["role"] == "player"}
+        self.assertEqual(names, {"TEAM B"})
+        self.assertEqual(r.json()["former_players"], [])
+
+    # ---- finish / report / history ----------------------------------------
+
+    def test_finalize_excludes_removed_from_winners(self):
+        from .services import remove_player
+
+        game = make_game(self.host)
+        seat = self.host_seat(game)
+        a, b = self.add_players(game, "TEAM A", "TEAM B")
+        Participant.objects.filter(pk=a.pk).update(score=500)
+        Participant.objects.filter(pk=b.pk).update(score=100)
+        remove_player(code=game.code, participant_id=a.id, actor=seat)
+        finalize_game(code=game.code)
+        game.refresh_from_db()
+        self.assertEqual([w.name for w in game.winners.all()], ["TEAM B"])
+
+    def test_report_keeps_removed_with_flag(self):
+        from .services import remove_player
+
+        game = make_game(self.host)
+        seat = self.host_seat(game)
+        a, b = self.add_players(game, "TEAM A", "TEAM B")
+        remove_player(code=game.code, participant_id=a.id, actor=seat)
+        finalize_game(code=game.code)
+        self.as_host()
+        r = self.client.get(f"/api/games/{game.code}/report/")
+        self.assertEqual(r.status_code, 200)
+        rows = {p["name"]: p for p in r.json()["participants"] if p["role"] == "player"}
+        self.assertEqual(set(rows), {"TEAM A", "TEAM B"})  # ALL participants
+        self.assertTrue(rows["TEAM A"]["removed"])
+        self.assertFalse(rows["TEAM B"]["removed"])
+
+    def test_history_player_count_excludes_removed(self):
+        from .services import remove_player
+
+        game = make_game(self.host)
+        seat = self.host_seat(game)
+        a, b, c = self.add_players(game, "TEAM A", "TEAM B", "TEAM C")
+        remove_player(code=game.code, participant_id=a.id, actor=seat)
+        self.as_host()
+        r = self.client.get("/api/games/history/")
+        row = next(g for g in r.json()["results"] if g["code"] == game.code)
+        self.assertEqual(row["participant_count"], 2)
+
+    def test_removed_seat_not_a_drink_target(self):
+        from .services import remove_player
+
+        game = make_game(self.host, mode="drinks")
+        seat = self.host_seat(game)
+        a, b = self.add_players(game, "TEAM A", "TEAM B")
+        Game.objects.filter(pk=game.pk).update(status=GameStatus.ACTIVE)
+        self._open_and_buzz(game, a)
+        judge_buzz(code=game.code, participant_id=a.id, correct=True)
+        remove_player(code=game.code, participant_id=b.id, actor=seat)
+        with self.assertRaisesMessage(ActionError, "Pick who drinks."):
+            assign_drink(code=game.code, actor=a, target_participant_id=b.id)
+
+    def test_removed_seat_cannot_be_judged(self):
+        from .services import remove_player
+
+        game = make_game(self.host)
+        seat = self.host_seat(game)
+        a, b = self.add_players(game, "TEAM A", "TEAM B")
+        Game.objects.filter(pk=game.pk).update(status=GameStatus.ACTIVE)
+        self._open_and_buzz(game, a, b)
+        remove_player(code=game.code, participant_id=a.id, actor=seat)
+        with self.assertRaisesMessage(ActionError, "Unknown participant."):
+            judge_buzz(code=game.code, participant_id=a.id, correct=True)
+
+    def test_buzzer_sound_round_robin_counts_active_only(self):
+        from .services import remove_player
+
+        game = make_game(self.host)
+        seat = self.host_seat(game)
+        a, b = self.add_players(game, "TEAM A", "TEAM B")
+        remove_player(code=game.code, participant_id=a.id, actor=seat)
+        r = self.client.post(f"/api/games/{game.code}/join/", {"name": "TEAM C"}, format="json")
+        self.assertEqual(r.status_code, 201)
+        # 1 active player (TEAM B) before the join → sound (1 % 4) + 1 == 2.
+        self.assertEqual(r.json()["participant"]["buzzer_sound"], 2)
+
+
+class CellSerializerTripwireTests(GameTestBase):
+    """§G (Handoff #11): the answered-cell names are resolved CLIENT-side
+    from `answered_by` against participants + former_players — pinned here so
+    nobody 'helpfully' adds a name field to CellSerializer later."""
+
+    def test_cell_serializer_exposes_answered_by_and_no_name(self):
+        from .serializers import CellSerializer
+
+        game = make_game(self.host)
+        (a,) = self.add_players(game, "TEAM A")
+        cell = self.cells(game)[0]
+        cell.answered_by = a
+        cell.answered_correctly = True
+        cell.save(update_fields=["answered_by", "answered_correctly"])
+        data = CellSerializer(cell).data
+        self.assertEqual(
+            set(data), {"id", "row", "value", "state", "answered_by", "answered_correctly"}
+        )
+        self.assertEqual(data["answered_by"], a.id)

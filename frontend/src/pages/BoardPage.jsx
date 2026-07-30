@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import { QRCodeSVG } from "qrcode.react";
-import { api } from "../lib/api";
+import { api, mediaUrl } from "../lib/api";
 import { loadSeat } from "../lib/storage";
 import { useGameSocket } from "../lib/useGameSocket";
 import { ensureAudio, playBuzz } from "../lib/sounds";
@@ -23,7 +23,10 @@ export default function BoardPage() {
   const ws = useGameSocket(upper, seat?.token || null);
   const [polled, setPolled] = useState(null);
   const [pollError, setPollError] = useState(null);
-  const usePolling = !seat?.token || ws.authFailed;
+  // §F (#11): `removed` — a kicked PLAYER's seat token in this browser (they
+  // opened the board too) dies with code 4003; the board is read-only, so it
+  // just falls back to unauthenticated polling like any other bad token.
+  const usePolling = !seat?.token || ws.authFailed || ws.removed;
 
   useEffect(() => {
     if (!usePolling) return undefined;
@@ -117,6 +120,9 @@ export default function BoardPage() {
     );
 
   const cell = game.current_cell;
+  // §H (#11): venue branding, straight from the snapshot (C2 — polling
+  // boards get it free). Null unless the host's creator plan is live.
+  const brand = game.brand ?? null;
   const players = game.participants.filter((p) => p.role === "player");
   const hostSeat = game.participants.find((p) => p.role === "host");
   // §F: verdict straight from the snapshot (rule 1) — WS and polling boards
@@ -128,6 +134,11 @@ export default function BoardPage() {
     <div className={`tv ${flash ? "tv--flash" : ""}`}>
       <header className="tv__head">
         <span className="wordmark wordmark--small">DRINKQUIRY</span>
+        {/* §H (#11): the small persistent in-play logo — present but never
+            competing with the game (the lobby block below is the big one). */}
+        {brand?.logo && game.status !== "lobby" && (
+          <img src={mediaUrl(brand.logo)} alt={brand.name || "Venue logo"} className="brandlogo brandlogo--tvhead" />
+        )}
         <button
           type="button"
           className={`btn btn--ghost tv__soundtoggle ${soundOn ? "tv__soundtoggle--on" : ""}`}
@@ -148,6 +159,18 @@ export default function BoardPage() {
 
       {game.status === "lobby" && (
         <div className="tv__lobby">
+          {/* §H (#11): the paid surface — "tonight's trivia at THE KINGS
+              ARMS" right where the room is looking. */}
+          {brand && (
+            <div className="tv__brand">
+              {brand.logo && <img src={mediaUrl(brand.logo)} alt="" className="brandlogo brandlogo--tvlobby" />}
+              {brand.name && (
+                <p className="tv__brandline">
+                  tonight's trivia at <strong>{brand.name}</strong>
+                </p>
+              )}
+            </div>
+          )}
           <p className="tv__lede">Grab a phone per team and join with code</p>
           <div className="tv__bigcode">{game.code}</div>
           {/* §H4: QR straight to this game's buzzer page. Origin-derived —

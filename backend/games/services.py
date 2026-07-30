@@ -299,7 +299,9 @@ def judge_buzz(*, code: str, participant_id, correct: bool) -> Game:
     cell = game.current_cell
     if cell is None:
         raise ActionError("No question is open.")
-    participant = game.participants.filter(pk=participant_id).first()
+    # §F (#11): a removed participant can't be judged — the buzz row they
+    # rode in on was deleted at removal, so this only bites a stale click.
+    participant = game.participants.filter(pk=participant_id, removed_at__isnull=True).first()
     if participant is None:
         raise ActionError("Unknown participant.")
     if correct:
@@ -352,7 +354,8 @@ def assign_drink(*, code: str, actor, target_participant_id) -> Game:
         raise StructuredActionError(
             "Drinks were already assigned for this question.", "drinks_already_assigned"
         )
-    target = game.participants.filter(pk=target_participant_id).first()
+    # §F (#11): a removed seat is not a valid drink target.
+    target = game.participants.filter(pk=target_participant_id, removed_at__isnull=True).first()
     if target is None:
         raise ActionError("Pick who drinks.")
     # (Self-assignment allowed; see docstring for the one-line forbid spot.)
@@ -368,6 +371,71 @@ def assign_drink(*, code: str, actor, target_participant_id) -> Game:
     winner.save(update_fields=["drinks_given", "score"])
     cell.drinks_assigned = True
     cell.save(update_fields=["drinks_assigned"])
+    return game
+
+
+@transaction.atomic
+def remove_player(*, code: str, participant_id, actor) -> Game:
+    """§F (Handoff #11): host kicks a player — the wrong-code joiner, the
+    troll name, the table that left after round one.
+
+    SOFT removal (Participant.removed_at; see the model comment for why hard
+    deletes are off the table). Works in lobby AND active games; FINISHED
+    games refuse (history is sealed). Open-cell interactions:
+
+    - the removed player's Buzz rows for the CURRENTLY OPEN cell are deleted
+      (their place in the live buzz order evaporates); historical buzzes on
+      closed cells stay;
+    - if the open cell's answered_by is the removed player and drinks are NOT
+      yet assigned, the win is voided: answered_by/answered_correctly clear,
+      the judgment marker clears, and the buzzer reopens — the round restarts
+      for everyone else (the winner just vanished mid-celebration). If drinks
+      WERE already assigned, everything stays: the drink happened, and the
+      host closes the cell normally. (Deliberate: `answer_revealed` is left
+      untouched either way — un-revealing what the room already saw is
+      theater; the host can simply close the cell if the answer is up.)
+    - if the removed player is the judgment marker's subject, the marker
+      clears (the verdict banner would name someone who's gone).
+
+    Already-removed → the documented StructuredActionError
+    {"detail", "code": "player_removed"} — a NEW code (C4-safe) so the kicked
+    phone can distinguish "you were kicked" from generic errors.
+    """
+    if actor.role != ParticipantRole.HOST:
+        raise ActionError("Only the host can remove players.")
+    game = Game.objects.select_for_update().get(code=code)
+    if game.status == GameStatus.FINISHED:
+        raise ActionError("The game is finished — its history is sealed.")
+    participant = game.participants.filter(pk=participant_id).first()
+    if participant is None:
+        raise ActionError("Unknown participant.")
+    if participant.role == ParticipantRole.HOST:
+        raise ActionError("The host seat can't be removed.")
+    if participant.removed_at is not None:
+        raise StructuredActionError("That player was already removed.", "player_removed")
+
+    participant.removed_at = timezone.now()
+    participant.save(update_fields=["removed_at"])
+
+    game_fields: list[str] = []
+    if game.current_cell_id is not None:
+        # Their place in the live buzz order evaporates; closed cells keep
+        # their historical buzz rows.
+        Buzz.objects.filter(cell_id=game.current_cell_id, participant_id=participant.pk).delete()
+        # Fetch the cell separately (select_for_update + nullable-FK Postgres
+        # foot-gun — house rule).
+        cell = BoardCell.objects.get(pk=game.current_cell_id)
+        if cell.answered_by_id == participant.pk and not cell.drinks_assigned:
+            cell.answered_by = None
+            cell.answered_correctly = None
+            cell.save(update_fields=["answered_by", "answered_correctly"])
+            game.buzzer_open = True  # the round restarts for everyone else
+            game_fields.append("buzzer_open")
+            game_fields += _clear_judgment(game)
+    if game.judged_participant_id == participant.pk and "judged_participant" not in game_fields:
+        game_fields += _clear_judgment(game)
+    if game_fields:
+        game.save(update_fields=game_fields)
     return game
 
 
@@ -408,7 +476,9 @@ def finalize_game(*, code: str) -> Game:
     game.answer_revealed = False
     fields = _clear_judgment(game)
     game.save(update_fields=["status", "finished_at", "buzzer_open", "answer_revealed", *fields])
-    players = list(game.participants.filter(role=ParticipantRole.PLAYER))
+    # §F (#11): removed players can't tie for the crown — their tallies stay
+    # visible only in the host-private report (which keeps ALL participants).
+    players = list(game.participants.filter(role=ParticipantRole.PLAYER, removed_at__isnull=True))
     if players:
         top = max(p.score for p in players)
         game.winners.set([p for p in players if p.score == top])

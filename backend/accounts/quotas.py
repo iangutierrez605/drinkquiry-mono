@@ -114,7 +114,11 @@ def storage_bytes_used(user) -> int:
         .aggregate(total=Sum("photo_bytes"))["total"]
         or 0
     )
-    return q + c
+    # §H (Handoff #11): the brand logo counts too (quota counters are an
+    # "active" surface, C6). A cleared logo frees the bytes because the
+    # column goes to 0 with it (User.save recount); the old file stays on
+    # disk — the same deliberate mismatch noted for deleted questions.
+    return q + c + (user.brand_logo_bytes or 0)
 
 
 _COUNTERS = {

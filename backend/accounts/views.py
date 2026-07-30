@@ -44,12 +44,37 @@ class LoginView(KnoxLoginView):
         return UserSerializer
 
 
+BRAND_WRITE_FIELDS = {"brand_name", "brand_logo", "brand_logo_clear"}
+
+
 class ProfileView(generics.RetrieveUpdateAPIView):
+    """§H (Handoff #11): the profile PATCH now also carries venue branding
+    (brand_name, brand_logo multipart, brand_logo_clear). Branding isn't a
+    counted quota, so a free-plan WRITE gets a plain 403 (reads are fine and
+    the fields persist through a plan lapse — only SERVING is plan-gated,
+    over in the games snapshot). The storage quota DOES apply to the upload
+    (the standard structured quota_storage 403, same as category photos)."""
+
     serializer_class = UserSerializer
     permission_classes = (permissions.IsAuthenticated,)
 
     def get_object(self):
         return self.request.user
+
+    def update(self, request, *args, **kwargs):
+        if BRAND_WRITE_FIELDS & set(request.data.keys()):
+            if not request.user.is_creator:  # effective plan (expiry collapses to free)
+                return Response(
+                    {"detail": "Branding is part of the creator plan."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            logo = request.FILES.get("brand_logo")
+            if logo is not None:
+                from .quotas import storage_quota_denial
+
+                if denial := storage_quota_denial(request.user, logo.size):
+                    return Response(denial, status=status.HTTP_403_FORBIDDEN)
+        return super().update(request, *args, **kwargs)
 
 
 # --- §K1/§K2 (Handoff #9): password flows -----------------------------------

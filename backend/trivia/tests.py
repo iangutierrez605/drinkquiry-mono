@@ -7,6 +7,7 @@ shipping).
 """
 import io
 import os
+import pathlib
 import shutil
 import tempfile
 import zipfile
@@ -830,7 +831,7 @@ class MediaProcessingTests(BaseCase):
         return self.client.post(
             "/api/questions/",
             {
-                "category": self.cat.id,
+                "categories": [self.cat.id],  # §K1 (#11): alias removed
                 "question_text": f"{media_type} q?",
                 "answer": "A",
                 "difficulty": 1,
@@ -971,7 +972,7 @@ class StorageQuotaTests(BaseCase):
         self.auth(user)
         return self.client.post(
             "/api/questions/",
-            {"category": self.cat.id, "question_text": f"Q{Question.objects.count()}?",
+            {"categories": [self.cat.id], "question_text": f"Q{Question.objects.count()}?",  # §K1
              "answer": "A", "difficulty": 1, "visibility": "private",
              "media_type": "image", "image": upload},
             format="multipart",
@@ -1663,11 +1664,14 @@ class MultiCategoryApiTests(BaseCase):
         q = Question.objects.get(pk=res.data["id"])
         self.assertEqual(q.categories.count(), 2)
 
-    def test_legacy_single_category_write_still_works(self):
-        # §F2 back-compat for ONE session: in-flight tabs mustn't 400.
+    def test_legacy_single_category_write_is_a_clean_400(self):
+        # §K1 (Handoff #11): the deprecation is COMPLETE — #10's one-session
+        # write alias is gone. A `category`-only body is now just a body with
+        # no `categories`, and the 400 names the field the client should send.
         res = self.post_question(category=self.own.id)
-        self.assertEqual(res.status_code, 201, res.data)
-        self.assertEqual(res.data["categories"], [self.own.id])
+        self.assertEqual(res.status_code, 400, res.data)
+        self.assertIn("categories", res.data)
+        self.assertEqual(Question.objects.count(), 0)
 
     def test_at_least_one_category_is_required(self):
         res = self.post_question(categories=[])
@@ -2024,3 +2028,60 @@ class ThemeApiTests(BaseCase):
         call_command("seed_demo")
         self.assertEqual(Theme.objects.filter(deleted_at__isnull=True).count(), first)
         self.assertGreaterEqual(first, 2)  # §G1: 2–3 seeded themes
+
+
+# ---------------------------------------------------------------------------
+# §K2 (Handoff #11) — the COMMITTED media-template zip round-trips
+# ---------------------------------------------------------------------------
+@override_settings(MEDIA_ROOT=TMP_MEDIA)
+class MediaTemplateZipTests(BaseCase):
+    """/create links /question-media-template.zip; the file now exists in
+    frontend/public (built from the template directory) and must import
+    cleanly through the bulk upload — dry-run AND real — using the exact
+    committed bytes. It contains a pipe row (TV|80s), so this doubles as a
+    live multi-category check on the shipped template."""
+
+    ZIP_PATH = (
+        pathlib.Path(__file__).resolve().parent.parent.parent
+        / "frontend" / "public" / "question-media-template.zip"
+    )
+
+    def upload(self, **data):
+        self.auth(self.creator)
+        payload = SimpleUploadedFile(
+            "question-media-template.zip", self.ZIP_PATH.read_bytes(), content_type="application/zip"
+        )
+        return self.client.post(
+            "/api/questions/bulk/", {"file": payload, **data}, format="multipart"
+        )
+
+    def test_committed_zip_exists_with_expected_members(self):
+        self.assertTrue(self.ZIP_PATH.exists(), self.ZIP_PATH)
+        import zipfile
+
+        with zipfile.ZipFile(self.ZIP_PATH) as z:
+            self.assertEqual(sorted(z.namelist()), ["media/example.png", "questions.csv"])
+
+    def test_dry_run_then_real_import(self):
+        # create_categories mirrors the /create form's "create missing
+        # categories" checkbox — the template names (Movies, TV, 80s) don't
+        # pre-exist for a fresh creator, and auto-create is the shipped flow.
+        res = self.upload(dry_run="true", create_categories="true")
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertTrue(res.data.get("dry_run"))
+        self.assertEqual(res.data["created"], 3)
+        self.assertEqual(Question.objects.count(), 0)  # dry means dry
+
+        res = self.upload(create_categories="true")
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertEqual(res.data["created"], 3)
+        self.assertEqual(Question.objects.count(), 3)
+        # The pipe row landed in BOTH categories (auto-created).
+        piped = Question.objects.get(question_text="Who shot J.R.?")
+        self.assertEqual(
+            sorted(piped.categories.values_list("name", flat=True)), ["80s", "TV"]
+        )
+        # The media row carries its image, sized through the pipeline.
+        with_media = Question.objects.get(question_text="What film is this frame from?")
+        self.assertTrue(with_media.image)
+        self.assertGreater(with_media.media_bytes, 0)

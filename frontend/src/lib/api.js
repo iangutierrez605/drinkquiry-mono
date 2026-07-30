@@ -128,6 +128,13 @@ export const api = {
     request("/api/auth/login/", { method: "POST", body: { email, password } }),
   logout: (token) => request("/api/auth/logout/", { method: "POST", authToken: token }),
   profile: (token) => request("/api/auth/profile/", { authToken: token }),
+  // §H (Handoff #11): venue branding rides the profile PATCH — multipart
+  // when a logo file is attached, JSON otherwise (brand_name edits, the
+  // brand_logo_clear flag). Free-plan writes get a plain 403 server-side.
+  updateProfile: (token, changes) =>
+    changes instanceof FormData
+      ? request("/api/auth/profile/", { method: "PATCH", authToken: token, formData: changes })
+      : request("/api/auth/profile/", { method: "PATCH", authToken: token, body: changes }),
 
   // ---- Password flows (§K, Handoff #9) ----
   // forgot ALWAYS 200s with the same body (no user enumeration server-side).

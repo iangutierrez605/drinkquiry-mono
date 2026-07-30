@@ -69,7 +69,9 @@ class GameJoinView(APIView):
     permission_classes = (permissions.AllowAny,)
 
     def post(self, request, code):
-        game = get_object_or_404(Game, code=code.upper())
+        # select_related("host"): the join response serializes a snapshot,
+        # and §H's brand field reads game.host.
+        game = get_object_or_404(Game.objects.select_related("host"), code=code.upper())
         serializer = JoinGameSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         # §H1 (Handoff #8): team names are ALL CAPS, normalized server-side
@@ -85,7 +87,10 @@ class GameJoinView(APIView):
         # full table must still return 200 (the reload flow cannot break).
         token = request.data.get("participant_token")
         if token:
-            participant = Participant.objects.filter(game=game, token=token).first()
+            # §F (#11): a removed seat's token must NOT reclaim it — filter
+            # removed and fall through to a normal fresh-seat join attempt
+            # (their old name is reusable thanks to the partial constraint).
+            participant = Participant.objects.filter(game=game, token=token, removed_at__isnull=True).first()
             if participant:
                 return Response(
                     {
@@ -102,7 +107,11 @@ class GameJoinView(APIView):
             # The host's control seat is role=host and never counts.
             with transaction.atomic():
                 locked_game = Game.objects.select_for_update().get(pk=game.pk)
-                player_count = locked_game.participants.filter(role=ParticipantRole.PLAYER).count()
+                # §F (#11): removed seats don't count — kicking frees a seat.
+                # The buzzer_sound round-robin below rides the same count.
+                player_count = locked_game.participants.filter(
+                    role=ParticipantRole.PLAYER, removed_at__isnull=True
+                ).count()
                 if player_count >= settings.MAX_PLAYERS_PER_GAME:
                     # NEW structured contract (separate from the quota_* 403s;
                     # never routed through the quota helpers): exactly
@@ -150,7 +159,8 @@ class GameStateView(APIView):
     def get(self, request, code):
         game = get_object_or_404(
             Game.objects.prefetch_related("columns__cells", "participants", "columns__category")
-            .select_related("current_cell__question", "judged_participant"),
+            # "host" feeds §H's brand (no per-snapshot host query).
+            .select_related("current_cell__question", "judged_participant", "host"),
             code=code.upper(),
         )
         return Response(GameStateSerializer(game, context={"request": request}).data)
@@ -264,7 +274,13 @@ class GameHistoryView(generics.ListAPIView):
     def get_queryset(self):
         return (
             Game.objects.filter(host=self.request.user)
-            .annotate(player_count=Count("participants", filter=Q(participants__role=ParticipantRole.PLAYER)))
+            # §F (#11): active players only — a kicked seat is not a team.
+            .annotate(
+                player_count=Count(
+                    "participants",
+                    filter=Q(participants__role=ParticipantRole.PLAYER, participants__removed_at__isnull=True),
+                )
+            )
             .prefetch_related("winners")
             .order_by("-created_at", "-id")
         )

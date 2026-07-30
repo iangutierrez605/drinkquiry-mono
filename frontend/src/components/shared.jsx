@@ -102,11 +102,21 @@ export function ScoreStrip({ game, selfId }) {
 }
 
 /**
- * The Jeopardy grid. Pure renderer of `columns` from the snapshot.
+ * The game grid. Pure renderer of `columns` from the snapshot.
  * If `onOpenCell` is given (host), hidden cells are clickable.
+ *
+ * §G (Handoff #11): a won cell shows the winning TEAM's name (still in the
+ * gold --won treatment so it reads at TV distance); a played cell nobody got
+ * keeps —. Names resolve CLIENT-side (house style — see how HostPage finds
+ * `winner`) from `answered_by` against participants + §F's former_players;
+ * an id that resolves to nothing (pre-#11 games whose winner was hard-deleted
+ * by ancient tooling — answered_by is SET_NULL) falls back to ✓.
  */
 export function BoardGrid({ game, onOpenCell, compact = false }) {
   const cols = game.columns;
+  const nameById = new Map(
+    [...game.participants, ...(game.former_players ?? [])].map((p) => [p.id, p.name]),
+  );
   return (
     <div className={`board ${compact ? "board--compact" : ""}`} style={{ "--cols": cols.length }}>
       {cols.map((col) => (
@@ -117,6 +127,7 @@ export function BoardGrid({ game, onOpenCell, compact = false }) {
           </div>
           {col.cells.map((cell) => {
             const clickable = onOpenCell && cell.state === "hidden" && game.status === "active" && !game.current_cell;
+            const winnerName = cell.answered_correctly ? nameById.get(cell.answered_by) : null;
             return (
               <button
                 key={cell.id}
@@ -126,7 +137,11 @@ export function BoardGrid({ game, onOpenCell, compact = false }) {
                 onClick={clickable ? () => onOpenCell(cell.id) : undefined}
               >
                 {cell.state === "answered" ? (
-                  <span className="cell__done">{cell.answered_correctly ? "✓" : "—"}</span>
+                  winnerName ? (
+                    <span className="cell__done cell__done--name">{winnerName}</span>
+                  ) : (
+                    <span className="cell__done">{cell.answered_correctly ? "✓" : "—"}</span>
+                  )
                 ) : (
                   <span className="cell__value">
                     {game.mode === "drinks" ? `${cell.value} 🍺` : cell.value}

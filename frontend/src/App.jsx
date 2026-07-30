@@ -66,7 +66,7 @@ function Landing() {
           <div className="howstep">
             <span className="howstep__emoji">📺</span>
             <strong>Board on the TV</strong>
-            <span>The Jeopardy grid, the buzz order, the big reveals — cast it or plug it in.</span>
+            <span>The trivia grid, the buzz order, the big reveals — cast it or plug it in.</span>
           </div>
           <div className="howstep__arrow">→</div>
           <div className="howstep">
