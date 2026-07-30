@@ -102,11 +102,11 @@ class _ModerationViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, views
 
     def _act(self, request, *, approve: bool):
         obj = self.get_object()
-        # §I2: a soft-deleted question can't be reviewed (categories have no
-        # deleted_at; getattr keeps this shared body model-agnostic).
-        if getattr(obj, "deleted_at", None) is not None:
+        # §I2/§F5: a soft-deleted item can't be reviewed — questions since
+        # #9, categories since #10 (both models carry deleted_at now).
+        if obj.deleted_at is not None:
             return Response(
-                {"detail": "This question was deleted — nothing to review."},
+                {"detail": "This item was deleted — nothing to review."},
                 status=status.HTTP_409_CONFLICT,
             )
         if obj.moderation_status != ModerationStatus.PENDING:
@@ -145,7 +145,13 @@ class ModerationCategoryViewSet(_ModerationViewSet):
     def get_queryset(self):
         # §J1: usage = games that included the category (BoardColumn is unique
         # per (game, category), so counting columns counts games).
-        return super().get_queryset().annotate(usage_count=Count("boardcolumn", distinct=True))
+        qs = super().get_queryset().annotate(usage_count=Count("boardcolumn", distinct=True))
+        # §F5 (Handoff #10): deleted categories never appear in the pending
+        # queue list; detail/actions still see them so a review race gets the
+        # shared 409, not a 404.
+        if self.action == "list":
+            qs = qs.filter(deleted_at__isnull=True)
+        return qs
 
 
 class LibraryPagination(pagination.PageNumberPagination):
@@ -168,7 +174,8 @@ class ModerationQuestionViewSet(_ModerationViewSet):
     def get_queryset(self):
         qs = super().get_queryset()
         # §J1: usage = cells referencing the question, across all games.
-        qs = qs.select_related("category").annotate(usage_count=Count("boardcell", distinct=True))
+        # §F4: `categories` is an M2M — prefetched for category_names.
+        qs = qs.prefetch_related("categories").annotate(usage_count=Count("boardcell", distinct=True))
         if self.action != "list":
             return qs  # detail/actions see deleted rows too (revise/delete 409 cleanly)
 
@@ -191,7 +198,9 @@ class ModerationQuestionViewSet(_ModerationViewSet):
         if category := params.get("category", "").strip():
             if not category.isdigit():
                 raise ValidationError({"category": "Must be a category id."})
-            qs = qs.filter(category_id=category)
+            # §F4: through the M2M; .distinct() keeps the PAGINATED queryset
+            # duplicate-free (the join can otherwise repeat rows).
+            qs = qs.filter(categories__id=category).distinct()
         # ?owner= — email icontains; the special value "official" means
         # owner-less (site-provided) content.
         if owner := params.get("owner", "").strip():
@@ -299,7 +308,6 @@ class ModerationQuestionViewSet(_ModerationViewSet):
 
         with transaction.atomic():
             new = Question(
-                category=old.category,
                 owner=old.owner,
                 question_text=old.question_text,
                 answer=old.answer,
@@ -317,6 +325,10 @@ class ModerationQuestionViewSet(_ModerationViewSet):
             for field, value in edits.items():
                 setattr(new, field, value)
             new.save()
+            # §F2: the revision lives in the SAME categories as the original
+            # (recategorizing stays a normal owner/staff PATCH concern; the
+            # revise editable-field set did not grow this session).
+            new.categories.set(old.categories.all())
             old.deleted_at = timezone.now()
             old.replaced_by = new
             old.save(update_fields=["deleted_at", "replaced_by", "updated_at"])
@@ -341,7 +353,8 @@ class ModerationFlagsView(APIView):
             # (e.g. rows deleted by hand in /admin).
             Question.objects.filter(reports__status=ReportStatus.OPEN, deleted_at__isnull=True)
             .distinct()
-            .select_related("category", "owner")
+            .select_related("owner")
+            .prefetch_related("categories")  # §F4: M2M feeds category_names
             .annotate(usage_count=Count("boardcell", distinct=True))
             .prefetch_related(
                 Prefetch("reports", queryset=open_reports.select_related("reporter"), to_attr="open_reports")
@@ -403,7 +416,11 @@ class ModerationCountsView(APIView):
         pending = ModerationStatus.PENDING
         return Response(
             {
-                "categories": Category.objects.filter(moderation_status=pending).count(),
+                # §F5: the badge must match the (deleted-filtered) queue list —
+                # same rule questions got in #9.
+                "categories": Category.objects.filter(
+                    moderation_status=pending, deleted_at__isnull=True
+                ).count(),
                 # §I: the badge must match the (deleted-filtered) queue list.
                 "questions": Question.objects.filter(
                     moderation_status=pending, deleted_at__isnull=True

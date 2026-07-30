@@ -42,9 +42,10 @@ def make_category(owner, name, *, public_approved=False):
 
 
 def make_question(owner, category, text, *, status=ModerationStatus.NOT_SUBMITTED, visibility=Visibility.PRIVATE, note=""):
-    return Question.objects.create(
+    # §F (Handoff #10): categories are M2M — `category` may be one Category
+    # or a list of them; the helper's call sites stayed unchanged.
+    question = Question.objects.create(
         owner=owner,
-        category=category,
         question_text=text,
         answer="A",
         difficulty=1,
@@ -52,6 +53,8 @@ def make_question(owner, category, text, *, status=ModerationStatus.NOT_SUBMITTE
         moderation_status=status,
         moderation_note=note,
     )
+    question.categories.set(category if isinstance(category, (list, tuple)) else [category])
+    return question
 
 
 class BaseCase(APITestCase):
@@ -113,7 +116,7 @@ class ModerationApiTests(BaseCase):
         self.assertEqual([r["id"] for r in rows], [self.q_old.id, self.q_new.id])
         self.assertEqual(rows[0]["owner_email"], "creator@test.com")
         self.assertEqual(rows[1]["owner_email"], "other@test.com")
-        self.assertEqual(rows[0]["category_name"], "Movies")
+        self.assertEqual(rows[0]["category_names"], ["Movies"])  # §F4: sorted list now
         self.assertIn("answer", rows[0])  # reviewers need the answer
 
     def test_status_filter_and_invalid_status(self):
@@ -331,7 +334,7 @@ class BulkUploadTests(BaseCase):
         # Staff account is on the free plan — official uploads are quota-exempt.
         res = self.upload(self.staff, HEADER + "Science,Q1?,A,1,private\nScience,Q2?,A,2,public\n", official="true")
         self.assertEqual(res.status_code, 201, res.data)
-        rows = Question.objects.filter(category=self.official_cat)
+        rows = Question.objects.filter(categories=self.official_cat)
         self.assertEqual(rows.count(), 2)
         for q in rows:
             self.assertIsNone(q.owner)
@@ -1070,17 +1073,19 @@ class SimilarQuestionsTests(BaseCase):
         super().setUp()
         self.cat = make_category(None, "Movies", public_approved=True)
         self.dupe = Question.objects.create(
-            owner=None, category=self.cat,
+            owner=None,
             question_text="Which actor played the Joker in The Dark Knight?",
             answer="Heath Ledger", difficulty=2,
             visibility=Visibility.PUBLIC, moderation_status=ModerationStatus.APPROVED,
         )
+        self.dupe.categories.add(self.cat)
         self.unrelated = Question.objects.create(
-            owner=None, category=self.cat,
+            owner=None,
             question_text="What year did the first talkie premiere?",
             answer="1927", difficulty=3,
             visibility=Visibility.PUBLIC, moderation_status=ModerationStatus.APPROVED,
         )
+        self.unrelated.categories.add(self.cat)
         self.pending = make_question(
             self.creator, self.cat, "Who played the Joker in The Dark Knight?",
             status=ModerationStatus.PENDING, visibility=Visibility.PUBLIC,
@@ -1127,10 +1132,11 @@ class QuestionFlagTests(BaseCase):
         super().setUp()
         self.cat = make_category(None, "History", public_approved=True)
         self.question = Question.objects.create(
-            owner=self.other, category=self.cat,
+            owner=self.other,
             question_text="Approved but suspicious?", answer="Yes", difficulty=1,
             visibility=Visibility.PUBLIC, moderation_status=ModerationStatus.APPROVED,
         )
+        self.question.categories.add(self.cat)
 
     def flag(self, user, reason=""):
         self.client.force_authenticate(user)
@@ -1265,7 +1271,7 @@ class QuestionLifecycleBase(BaseCase):
 
     def play_in_game(self, question, host=None):
         game = Game.objects.create(host=host or self.creator, mode="points")
-        column = BoardColumn.objects.create(game=game, category=question.category, position=0)
+        column = BoardColumn.objects.create(game=game, category=question.categories.first(), position=0)
         cell = BoardCell.objects.create(game=game, column=column, question=question, row=0, value=100)
         return game, cell
 
@@ -1434,7 +1440,8 @@ class ReviseEndpointTests(QuestionLifecycleBase):
         self.assertEqual(new.difficulty, 3)
         self.assertEqual(new.answer, self.q1.answer)  # untouched field copied
         self.assertEqual(new.owner_id, self.creator.id)
-        self.assertEqual(new.category_id, self.cat.id)
+        # §F2 (Handoff #10): the revision copies the SAME category set.
+        self.assertEqual(list(new.categories.values_list("id", flat=True)), [self.cat.id])
         self.assertEqual(new.moderation_status, ModerationStatus.APPROVED)
         self.assertIsNone(new.deleted_at)
         self.assertFalse(self.q1.reports.filter(status=ReportStatus.OPEN).exists())
@@ -1486,10 +1493,11 @@ class LibraryApiTests(QuestionLifecycleBase):
         super().setUp()
         self.official_cat = make_category(None, "Official Cat", public_approved=True)
         self.official_q = Question.objects.create(
-            owner=None, category=self.official_cat, question_text="Official filler?",
+            owner=None, question_text="Official filler?",
             answer="Yes", difficulty=1, visibility=Visibility.PUBLIC,
             moderation_status=ModerationStatus.APPROVED,
         )
+        self.official_q.categories.add(self.official_cat)
         self.deleted_q = self.soft_delete(
             make_question(self.creator, self.cat, "Gone soon?", status=ModerationStatus.APPROVED,
                           visibility=Visibility.PUBLIC)
@@ -1624,3 +1632,395 @@ class ModerationEmailTests(BaseCase):
         self.assertEqual(res.status_code, 200, res.content)
         self.q.refresh_from_db()
         self.assertEqual(self.q.moderation_status, ModerationStatus.APPROVED)
+
+
+# ---------------------------------------------------------------------------
+# Handoff #10 §F — questions belong to multiple categories
+# ---------------------------------------------------------------------------
+
+class MultiCategoryApiTests(BaseCase):
+    """§F2: the write path — `categories` (list), the deprecated `category`
+    back-compat alias, and the per-category permission rule."""
+
+    def setUp(self):
+        super().setUp()
+        self.own = make_category(self.creator, "Mine")
+        self.official = make_category(None, "Official", public_approved=True)
+        self.foreign_private = make_category(self.other, "Theirs (private)")
+        self.auth(self.creator)
+
+    def post_question(self, **overrides):
+        body = {"question_text": "Multi?", "answer": "Yes", "difficulty": 2, "visibility": "private"}
+        body.update(overrides)
+        return self.client.post("/api/questions/", body)
+
+    def test_create_with_two_categories(self):
+        res = self.post_question(categories=[self.own.id, self.official.id])
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertEqual(sorted(res.data["categories"]), sorted([self.own.id, self.official.id]))
+        # The deprecated write alias never appears in responses.
+        self.assertNotIn("category", res.data)
+        q = Question.objects.get(pk=res.data["id"])
+        self.assertEqual(q.categories.count(), 2)
+
+    def test_legacy_single_category_write_still_works(self):
+        # §F2 back-compat for ONE session: in-flight tabs mustn't 400.
+        res = self.post_question(category=self.own.id)
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertEqual(res.data["categories"], [self.own.id])
+
+    def test_at_least_one_category_is_required(self):
+        res = self.post_question(categories=[])
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("categories", res.data)
+
+    def test_one_ineligible_category_fails_the_whole_create(self):
+        res = self.post_question(categories=[self.own.id, self.foreign_private.id])
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(Question.objects.count(), 0)
+
+    def test_patch_without_categories_keeps_the_set(self):
+        q = make_question(self.creator, [self.own, self.official], "Keep cats?")
+        res = self.client.patch(f"/api/questions/{q.id}/", {"answer": "New answer"})
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(q.categories.count(), 2)
+
+    def test_patch_with_categories_replaces_the_set(self):
+        q = make_question(self.creator, [self.own], "Move cats?")
+        res = self.client.patch(f"/api/questions/{q.id}/", {"categories": [self.official.id]})
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(list(q.categories.values_list("id", flat=True)), [self.official.id])
+
+    def test_duplicate_ids_in_the_list_collapse(self):
+        res = self.post_question(categories=[self.own.id, self.own.id])
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertEqual(res.data["categories"], [self.own.id])
+
+    def test_question_list_filter_through_m2m_is_duplicate_free(self):
+        q = make_question(self.creator, [self.own, self.official], "Once only?")
+        listed = self.client.get("/api/questions/").json()["results"]
+        self.assertEqual([row["id"] for row in listed].count(q.id), 1)
+        by_cat = self.client.get(f"/api/questions/?category={self.own.id}").json()["results"]
+        self.assertIn(q.id, [row["id"] for row in by_cat])
+
+
+class BulkPipeCategoryTests(BaseCase):
+    """§F2 CSV: pipe-separated category names + the new dedupe key."""
+
+    HEADER = "category,question_text,answer,difficulty,visibility\n"
+
+    def setUp(self):
+        super().setUp()
+        self.movies = make_category(None, "Movies", public_approved=True)
+        self.music = make_category(None, "Music", public_approved=True)
+
+    def upload(self, user, text, **data):
+        self.auth(user)
+        payload = {"file": csv_file(text)}
+        payload.update(data)
+        return self.client.post("/api/questions/bulk/", payload, format="multipart")
+
+    def test_pipe_row_creates_one_question_in_two_categories(self):
+        res = self.upload(self.creator, self.HEADER + "Movies|Music,Theme song?,Titanic,2,private\n")
+        self.assertEqual(res.status_code, 201, res.data)
+        q = Question.objects.get(question_text="Theme song?")
+        self.assertEqual(
+            sorted(q.categories.values_list("name", flat=True)), ["Movies", "Music"]
+        )
+
+    def test_pipe_with_auto_create_resolves_per_name(self):
+        res = self.upload(
+            self.creator, self.HEADER + "Movies|Brand New,Mixed?,A,1,private\n", create_categories="true"
+        )
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertEqual(res.data["category_names"], ["Brand New"])  # only the new one created
+        q = Question.objects.get(question_text="Mixed?")
+        self.assertEqual(sorted(q.categories.values_list("name", flat=True)), ["Brand New", "Movies"])
+
+    def test_one_bad_name_errors_the_whole_row(self):
+        res = self.upload(self.creator, self.HEADER + "Movies|No Such Cat,Broken?,A,1,private\n")
+        self.assertEqual(res.status_code, 400)
+        errors = res.data["errors"]
+        self.assertEqual(errors[0]["field"], "category")
+        self.assertIn("No Such Cat", errors[0]["message"])
+        self.assertEqual(Question.objects.count(), 0)
+
+    def test_dedupe_key_is_text_only_now(self):
+        # BEHAVIOR CHANGE (decided, §F2): same text in a DIFFERENT category
+        # is a duplicate — the M2M made "one question in both" the way to
+        # express that, so the upload skips it.
+        existing = make_question(self.creator, [self.movies], "Same text?")
+        res = self.upload(self.creator, self.HEADER + "Music,Same text?,A,1,private\n")
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertEqual(res.data["created"], 0)
+        self.assertEqual(res.data["skipped"], [2])
+        # The existing question was NOT silently recategorized either.
+        self.assertEqual(list(existing.categories.values_list("id", flat=True)), [self.movies.id])
+
+    def test_same_text_twice_in_one_file_dedupes_across_categories(self):
+        res = self.upload(
+            self.creator,
+            self.HEADER + "Movies,Twice?,A,1,private\nMusic,Twice?,A,1,private\n",
+        )
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertEqual(res.data["created"], 1)
+        self.assertEqual(res.data["skipped"], [3])
+
+    def test_repeated_name_within_one_row_collapses(self):
+        res = self.upload(self.creator, self.HEADER + "Movies|movies,Twins?,A,1,private\n")
+        self.assertEqual(res.status_code, 201, res.data)
+        q = Question.objects.get(question_text="Twins?")
+        self.assertEqual(list(q.categories.values_list("name", flat=True)), ["Movies"])
+
+
+class SimilaritySharesAnyCategoryTests(BaseCase):
+    """§F4: the primary similarity pool is 'shares ANY category'."""
+
+    def test_candidate_sharing_one_of_two_categories_is_in_the_pool(self):
+        movies = make_category(None, "Movies", public_approved=True)
+        music = make_category(None, "Music", public_approved=True)
+        target = make_question(
+            self.creator, [movies, music], "Which band scored the film Flash Gordon?",
+            status=ModerationStatus.PENDING, visibility=Visibility.PUBLIC,
+        )
+        candidate = make_question(
+            self.other, [music], "Which band scored the movie Flash Gordon soundtrack?",
+            status=ModerationStatus.APPROVED, visibility=Visibility.PUBLIC,
+        )
+        from unittest.mock import patch as _patch
+
+        from .similarity import similar_questions
+
+        with _patch("trivia.similarity.MIN_CATEGORY_POOL", 1):
+            matches = similar_questions(target)
+        self.assertEqual(matches[0]["id"], candidate.id)
+        # §F4: the per-match category context is a sorted NAME LIST now.
+        self.assertEqual(matches[0]["category_names"], ["Music"])
+
+
+# ---------------------------------------------------------------------------
+# Handoff #10 §F5 — category soft delete (the absence audit)
+# ---------------------------------------------------------------------------
+
+class CategorySoftDeleteTests(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.cat = make_category(self.creator, "Doomed")
+        self.q = make_question(self.creator, [self.cat], "Orphan soon?")
+        self.auth(self.creator)
+
+    def delete_cat(self, cat=None):
+        return self.client.delete(f"/api/categories/{(cat or self.cat).id}/")
+
+    def test_owner_delete_is_soft(self):
+        res = self.delete_cat()
+        self.assertEqual(res.status_code, 204)
+        self.cat.refresh_from_db()
+        self.assertIsNotNone(self.cat.deleted_at)  # row remains
+
+    def test_deleting_a_played_category_succeeds_and_history_survives(self):
+        # The latent ProtectedError-500: BoardColumn.category is PROTECT.
+        from games.services import create_game, finalize_game
+
+        for i in range(2):
+            make_question(self.creator, [self.cat], f"Filler {i}?")
+        game = create_game(host=self.creator, mode="points", category_ids=[self.cat.id], questions_per_category=2)
+        finalize_game(code=game.code)
+        self.assertEqual(self.delete_cat().status_code, 204)
+        # History/report intact: the column still names the category.
+        res = self.client.get(f"/api/games/{game.code}/report/")
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(res.json()["columns"][0]["category_name"], "Doomed")
+        # And the public snapshot still serializes it (deleted rows REMAIN in
+        # board columns — history is history).
+        snap = self.client.get(f"/api/games/{game.code}/").json()
+        self.assertEqual(snap["columns"][0]["category_name"], "Doomed")
+
+    def test_absent_from_listings_and_404_on_detail(self):
+        self.delete_cat()
+        listed = self.client.get("/api/categories/").json()["results"]
+        self.assertNotIn(self.cat.id, [c["id"] for c in listed])
+        self.assertEqual(self.client.get(f"/api/categories/{self.cat.id}/").status_code, 404)
+        self.assertEqual(self.client.patch(f"/api/categories/{self.cat.id}/", {"name": "Back"}).status_code, 404)
+
+    def test_name_reuse_after_delete(self):
+        self.delete_cat()
+        res = self.client.post("/api/categories/", {"name": "Doomed", "visibility": "private"})
+        self.assertEqual(res.status_code, 201, res.data)  # partial constraint permits it
+
+    def test_bulk_upload_cannot_resolve_a_deleted_category(self):
+        self.delete_cat()
+        res = self.client.post(
+            "/api/questions/bulk/",
+            {"file": csv_file("category,question_text,answer,difficulty,visibility\nDoomed,Q?,A,1,private\n")},
+            format="multipart",
+        )
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.data["errors"][0]["field"], "category")
+
+    def test_bulk_auto_create_makes_a_fresh_category_despite_the_deleted_name(self):
+        self.delete_cat()
+        res = self.client.post(
+            "/api/questions/bulk/",
+            {
+                "file": csv_file("category,question_text,answer,difficulty,visibility\nDoomed,Fresh?,A,1,private\n"),
+                "create_categories": "true",
+            },
+            format="multipart",
+        )
+        self.assertEqual(res.status_code, 201, res.data)
+        fresh = Question.objects.get(question_text="Fresh?").categories.get()
+        self.assertNotEqual(fresh.id, self.cat.id)  # NOT the deleted row
+        self.assertIsNone(fresh.deleted_at)
+
+    def test_question_creation_cannot_target_a_deleted_category(self):
+        self.delete_cat()
+        res = self.client.post(
+            "/api/questions/",
+            {"categories": [self.cat.id], "question_text": "Into the void?", "answer": "No", "difficulty": 1},
+        )
+        self.assertEqual(res.status_code, 400)
+
+    def test_moderation_queue_and_counts_exclude_deleted_categories(self):
+        self.cat.submit_for_review()
+        self.cat.save()
+        self.auth(self.staff)
+        before = self.client.get("/api/moderation/counts/").json()["categories"]
+        self.assertGreaterEqual(before, 1)
+        self.auth(self.creator)
+        self.delete_cat()
+        self.auth(self.staff)
+        counts = self.client.get("/api/moderation/counts/").json()
+        self.assertEqual(counts["categories"], before - 1)
+        queue = self.client.get("/api/moderation/categories/").json()["results"]
+        self.assertNotIn(self.cat.id, [c["id"] for c in queue])
+        # Reviewing the deleted row races cleanly: the shared 409, not a 404.
+        res = self.client.post(f"/api/moderation/categories/{self.cat.id}/approve/")
+        self.assertEqual(res.status_code, 409)
+
+    def test_quota_counters_exclude_deleted_categories(self):
+        from accounts.quotas import categories_used, storage_bytes_used
+
+        self.cat.photo_bytes = 1000
+        self.cat.save(update_fields=["photo_bytes"])
+        self.assertEqual(categories_used(self.creator), 1)
+        used_before = storage_bytes_used(self.creator)
+        self.delete_cat()
+        self.assertEqual(categories_used(self.creator), 0)
+        self.assertEqual(storage_bytes_used(self.creator), used_before - 1000)
+
+    def test_questions_are_not_cascaded_and_stay_in_the_owners_list(self):
+        self.delete_cat()
+        self.q.refresh_from_db()
+        self.assertIsNone(self.q.deleted_at)  # NOT deleted with the category
+        listed = self.client.get("/api/questions/").json()["results"]
+        self.assertIn(self.q.id, [row["id"] for row in listed])
+        # ...and it can be recategorized via a normal PATCH.
+        fresh = make_category(self.creator, "New Home")
+        res = self.client.patch(f"/api/questions/{self.q.id}/", {"categories": [fresh.id]})
+        self.assertEqual(res.status_code, 200, res.data)
+
+    def test_orphaned_question_is_invisible_to_game_builds(self):
+        from rest_framework.exceptions import ValidationError as DRFValidationError
+
+        from games.services import create_game
+
+        self.delete_cat()
+        # The deleted category id reads as unknown — a build can't reach the
+        # orphan through it (usable_questions goes through a live category).
+        with self.assertRaises(DRFValidationError) as ctx:
+            create_game(host=self.creator, mode="points", category_ids=[self.cat.id], questions_per_category=1)
+        self.assertIn("Unknown category ids", str(ctx.exception.detail["categories"]))
+
+
+# ---------------------------------------------------------------------------
+# Handoff #10 §G — themes
+# ---------------------------------------------------------------------------
+
+class ThemeApiTests(BaseCase):
+    def setUp(self):
+        super().setUp()
+        from .models import Theme
+
+        self.movies = make_category(None, "Movies", public_approved=True)
+        self.music = make_category(None, "Music", public_approved=True)
+        for i in range(2):
+            make_question(None, [self.movies], f"M{i}?", status=ModerationStatus.APPROVED,
+                          visibility=Visibility.PUBLIC)
+        self.private_cat = make_category(self.creator, "Creator Private")
+        make_question(self.creator, [self.private_cat], "Private Q?")
+        self.theme = Theme.objects.create(name="Screens", description="Film + sound")
+        self.theme.categories.set([self.movies, self.music, self.private_cat])
+
+    def test_list_shape_and_per_user_visibility_and_counts(self):
+        self.auth(self.creator)
+        themes = self.client.get("/api/themes/").json()
+        self.assertEqual(len(themes), 1)
+        theme = themes[0]
+        self.assertEqual(set(theme), {"id", "name", "description", "categories"})
+        by_name = {c["name"]: c for c in theme["categories"]}
+        # The creator sees their own private category, with THEIR count.
+        self.assertEqual(set(by_name), {"Movies", "Music", "Creator Private"})
+        self.assertEqual(by_name["Movies"]["usable_question_count"], 2)
+        self.assertEqual(by_name["Creator Private"]["usable_question_count"], 1)
+        # A different user does NOT see the creator's private category.
+        self.auth(self.other)
+        theme = self.client.get("/api/themes/").json()[0]
+        self.assertEqual({c["name"] for c in theme["categories"]}, {"Movies", "Music"})
+
+    def test_anon_gets_401_and_deleted_rows_are_excluded(self):
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.get("/api/themes/").status_code, 401)
+        from django.utils import timezone as _tz
+
+        self.movies.deleted_at = _tz.now()
+        self.movies.save(update_fields=["deleted_at"])
+        self.auth(self.creator)
+        theme = self.client.get("/api/themes/").json()[0]
+        self.assertNotIn("Movies", [c["name"] for c in theme["categories"]])  # §F5 reach
+        self.theme.deleted_at = _tz.now()
+        self.theme.save(update_fields=["deleted_at"])
+        self.assertEqual(self.client.get("/api/themes/").json(), [])
+
+    def test_staff_crud_round_trip(self):
+        self.auth(self.staff)
+        res = self.client.post(
+            "/api/moderation/themes/",
+            {"name": "Party", "description": "Bangers", "categories": [self.music.id]},
+        )
+        self.assertEqual(res.status_code, 201, res.data)
+        theme_id = res.data["id"]
+        self.assertEqual(res.data["category_names"], ["Music"])
+        res = self.client.patch(
+            f"/api/moderation/themes/{theme_id}/", {"categories": [self.music.id, self.movies.id]}
+        )
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(res.data["category_names"], ["Movies", "Music"])
+        # Duplicate ACTIVE name → 400.
+        res = self.client.post("/api/moderation/themes/", {"name": "Party"})
+        self.assertEqual(res.status_code, 400)
+        # Soft delete → 204; double delete → house 409; name is reusable.
+        self.assertEqual(self.client.delete(f"/api/moderation/themes/{theme_id}/").status_code, 204)
+        self.assertEqual(self.client.delete(f"/api/moderation/themes/{theme_id}/").status_code, 409)
+        listed = self.client.get("/api/moderation/themes/").json()
+        self.assertNotIn(theme_id, [t["id"] for t in listed])
+        res = self.client.post("/api/moderation/themes/", {"name": "Party"})
+        self.assertEqual(res.status_code, 201, res.data)
+
+    def test_staff_endpoints_reject_non_staff_and_anon(self):
+        self.auth(self.creator)
+        self.assertEqual(self.client.get("/api/moderation/themes/").status_code, 403)
+        self.assertEqual(self.client.post("/api/moderation/themes/", {"name": "Nope"}).status_code, 403)
+        self.client.force_authenticate(None)
+        self.assertEqual(self.client.get("/api/moderation/themes/").status_code, 401)
+
+    def test_seed_demo_is_idempotent_for_themes(self):
+        from django.core.management import call_command
+
+        from .models import Theme
+
+        call_command("seed_demo")
+        first = Theme.objects.filter(deleted_at__isnull=True).count()
+        call_command("seed_demo")
+        self.assertEqual(Theme.objects.filter(deleted_at__isnull=True).count(), first)
+        self.assertGreaterEqual(first, 2)  # §G1: 2–3 seeded themes

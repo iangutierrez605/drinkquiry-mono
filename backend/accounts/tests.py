@@ -25,8 +25,7 @@ def make_official_category(name="Movies", questions=3):
         owner=None, name=name, visibility=Visibility.PUBLIC, moderation_status=ModerationStatus.APPROVED
     )
     for i in range(questions):
-        Question.objects.create(
-            category=cat,
+        question = Question.objects.create(
             owner=None,
             question_text=f"Q{i}?",
             answer=f"A{i}",
@@ -34,6 +33,7 @@ def make_official_category(name="Movies", questions=3):
             visibility=Visibility.PUBLIC,
             moderation_status=ModerationStatus.APPROVED,
         )
+        question.categories.add(cat)  # §F (Handoff #10): categories are M2M
     return cat
 
 
@@ -454,3 +454,153 @@ class ChangePasswordTests(PasswordFlowTestBase):
                                    **self.bearer(token))
         self.assertEqual(res.status_code, 200, res.content)
         self.knox_login("free@test.com", "fresh-pass-456")
+
+
+# ---------------------------------------------------------------------------
+# Handoff #10 §I2 — auth-surface throttling
+# ---------------------------------------------------------------------------
+
+def tiny_rates(testcase):
+    """Pin every auth throttle to 2/min for one test. NOT override_settings
+    on REST_FRAMEWORK: SimpleRateThrottle captures THROTTLE_RATES as a CLASS
+    attribute at import time, so a settings override never reaches an
+    already-imported throttle — patching the classes' `rate` (which
+    short-circuits get_rate()) is the reliable seam."""
+    from unittest.mock import patch as _patch
+
+    from accounts.throttling import (
+        LoginRateThrottle,
+        PasswordForgotRateThrottle,
+        PasswordResetRateThrottle,
+        RegisterRateThrottle,
+    )
+
+    for cls in (LoginRateThrottle, RegisterRateThrottle, PasswordForgotRateThrottle, PasswordResetRateThrottle):
+        patcher = _patch.object(cls, "rate", "2/min", create=True)  # `rate` is normally set per-instance
+        patcher.start()
+        testcase.addCleanup(patcher.stop)
+
+
+class AuthThrottleTests(APITestCase):
+    def setUp(self):
+        cache.clear()  # throttle counters live in the cache
+        self.addCleanup(cache.clear)
+        tiny_rates(self)
+        User.objects.create_user("throttle@test.com", "sturdy-pass-123")
+
+    def login(self):
+        return self.client.post(
+            "/api/auth/login/", {"email": "throttle@test.com", "password": "wrong-on-purpose"}
+        )
+
+    def test_third_login_within_the_window_is_429(self):
+        self.assertEqual(self.login().status_code, 400)
+        self.assertEqual(self.login().status_code, 400)
+        res = self.login()
+        self.assertEqual(res.status_code, 429)
+        # DRF's default body — a NEW status, not a mutated shape (C4).
+        self.assertIn("detail", res.json())
+
+    def test_scopes_do_not_collide_across_endpoints(self):
+        self.login()
+        self.login()
+        self.assertEqual(self.login().status_code, 429)  # login exhausted...
+        res = self.client.post(
+            "/api/auth/register/",
+            {"email": "fresh@test.com", "password": "sturdy-pass-123", "display_name": "F"},
+        )
+        self.assertIn(res.status_code, (200, 201), res.content)  # ...register untouched
+        res = self.client.post("/api/auth/password/forgot/", {"email": "throttle@test.com"})
+        self.assertEqual(res.status_code, 200)  # ...and so is forgot
+
+    def test_snapshot_and_join_stay_unthrottled(self):
+        # The throttles are per-view, NOT a global default: hammering login
+        # must never 429 the public polling snapshot (a bar of phones behind
+        # one NAT IP is the normal case).
+        self.login()
+        self.login()
+        self.assertEqual(self.login().status_code, 429)
+        for _ in range(5):
+            res = self.client.get("/api/games/NOSUCH1/")
+            self.assertEqual(res.status_code, 404)  # not 429
+
+    def test_forgot_throttle_keeps_bodies_identical_before_the_limit(self):
+        # §L: cooldown/throttle independence — a throttled forgot is a
+        # DIFFERENT STATUS, but every 200 keeps the pinned enumeration-proof
+        # body (real vs unknown email identical).
+        real = self.client.post("/api/auth/password/forgot/", {"email": "throttle@test.com"})
+        fake = self.client.post("/api/auth/password/forgot/", {"email": "ghost@test.com"})
+        self.assertEqual(real.status_code, fake.status_code, 200)
+        self.assertEqual(real.json(), fake.json())
+        self.assertEqual(self.client.post("/api/auth/password/forgot/", {"email": "x@test.com"}).status_code, 429)
+
+
+class ThrottleIdentTests(APITestCase):
+    """§I2's proxy problem: getting the client ident wrong throttles the
+    whole site as one IP. Pinned under both settings."""
+
+    def make_request(self, **meta):
+        from rest_framework.test import APIRequestFactory
+
+        request = APIRequestFactory().post("/api/auth/login/")
+        request.META.update(meta)
+        return request
+
+    def ident(self, request):
+        from accounts.throttling import LoginRateThrottle
+
+        return LoginRateThrottle().get_ident(request)
+
+    @override_settings(DJANGO_BEHIND_PROXY=True)
+    def test_behind_proxy_reads_the_last_forwarded_hop(self):
+        request = self.make_request(
+            REMOTE_ADDR="10.0.0.2",  # the proxy
+            HTTP_X_FORWARDED_FOR="203.0.113.7, 198.51.100.9",
+        )
+        # NUM_PROXIES=1 semantics: ONE trusted hop appended the last entry.
+        self.assertEqual(self.ident(request), "198.51.100.9")
+
+    @override_settings(DJANGO_BEHIND_PROXY=True)
+    def test_behind_proxy_without_header_falls_back_to_remote_addr(self):
+        request = self.make_request(REMOTE_ADDR="10.0.0.2")
+        self.assertEqual(self.ident(request), "10.0.0.2")
+
+    @override_settings(DJANGO_BEHIND_PROXY=False)
+    def test_direct_mode_ignores_spoofable_forwarded_headers(self):
+        request = self.make_request(
+            REMOTE_ADDR="203.0.113.7",
+            HTTP_X_FORWARDED_FOR="1.2.3.4",  # client-supplied, untrusted here
+        )
+        self.assertEqual(self.ident(request), "203.0.113.7")
+
+
+# ---------------------------------------------------------------------------
+# Handoff #10 §I3 — health check
+# ---------------------------------------------------------------------------
+
+class HealthCheckTests(APITestCase):
+    def test_ok_shape_exactly(self):
+        res = self.client.get("/api/health/")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json(), {"status": "ok"})  # smoke pins this too
+
+    def test_no_auth_needed_and_stale_tokens_ignored(self):
+        res = self.client.get("/api/health/", HTTP_AUTHORIZATION="Token garbage")
+        self.assertEqual(res.status_code, 200)
+
+    @override_settings(REDIS_URL="redis://example.invalid:6379/0")
+    def test_cache_failure_degrades_to_503(self):
+        with patch("config.health.cache") as mocked:
+            mocked.set.side_effect = RuntimeError("redis down")
+            res = self.client.get("/api/health/")
+        self.assertEqual(res.status_code, 503)
+        body = res.json()
+        self.assertEqual(body["status"], "degraded")
+        self.assertIn("cache", body)
+
+    def test_database_failure_degrades_to_503(self):
+        with patch("config.health.connection") as mocked:
+            mocked.cursor.side_effect = RuntimeError("db gone")
+            res = self.client.get("/api/health/")
+        self.assertEqual(res.status_code, 503)
+        self.assertEqual(res.json()["status"], "degraded")

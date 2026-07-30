@@ -47,12 +47,30 @@ class CategoryViewSet(viewsets.ModelViewSet):
             return Response(denial, status=status.HTTP_403_FORBIDDEN)
         return super().update(request, *args, **kwargs)
 
+    def perform_destroy(self, instance):
+        """§F5 (Handoff #10): category delete is a SOFT delete — set
+        deleted_at, return the usual 204. Same uniform rule as questions
+        (§I2 #9): hard-deleting an ever-PLAYED category was a guaranteed
+        ProtectedError 500 (BoardColumn.category is PROTECT), and the M2M
+        removed the old questions-cascade anyway. The category's QUESTIONS
+        are NOT cascaded: a question whose categories are all deleted simply
+        becomes undrawable but stays in its owner's list, recategorizable
+        via PATCH. Board columns/snapshots/reports/history keep the row;
+        quota counters exclude it. Restore is punted (§M)."""
+        from django.utils import timezone
+
+        instance.deleted_at = timezone.now()
+        instance.save(update_fields=["deleted_at", "updated_at"])
+
     def get_queryset(self):
         user = self.request.user
         # order_by("id"): deterministic pagination (fixes the compose run's
         # UnorderedObjectListWarning) — applied here in the list queryset, not
         # as Meta.ordering, so no other Category caller changes behavior.
-        qs = Category.objects.all()
+        # §F5: deleted categories are invisible here for everyone —
+        # get_object routes through this too, so a deleted category 404s on
+        # retrieve/PATCH/DELETE.
+        qs = Category.objects.filter(deleted_at__isnull=True)
         if user.is_authenticated:
             return qs.filter(PUBLIC_APPROVED | Q(owner=user) | Q(owner__isnull=True)).distinct().order_by("id")
         return qs.filter(PUBLIC_APPROVED | Q(owner__isnull=True)).order_by("id")
@@ -238,9 +256,12 @@ class QuestionViewSet(viewsets.ModelViewSet):
         # get_object routes through this too, so a deleted question 404s on
         # retrieve/PATCH/DELETE/report. The one surface that can see deleted
         # rows is the staff moderation library (?deleted=, trivia/moderation).
-        qs = Question.objects.select_related("category").filter(deleted_at__isnull=True)
+        # §F4: category is an M2M now — prefetch it, filter through it, and
+        # keep the paginated queryset duplicate-free (.distinct(); the M2M
+        # join can otherwise repeat rows).
+        qs = Question.objects.prefetch_related("categories").filter(deleted_at__isnull=True)
         if category_id := self.request.query_params.get("category"):
-            qs = qs.filter(category_id=category_id)
+            qs = qs.filter(categories__id=category_id)
         if user.is_authenticated:
             return qs.filter(PUBLIC_APPROVED | Q(owner=user) | Q(owner__isnull=True)).distinct().order_by("id")
-        return qs.filter(PUBLIC_APPROVED | Q(owner__isnull=True)).order_by("id")
+        return qs.filter(PUBLIC_APPROVED | Q(owner__isnull=True)).distinct().order_by("id")

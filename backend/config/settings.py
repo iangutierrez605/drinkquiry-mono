@@ -101,6 +101,24 @@ else:
     # Local dev without Redis (single process only)
     CHANNEL_LAYERS = {"default": {"BACKEND": "channels.layers.InMemoryChannelLayer"}}
 
+# --- Cache (§I1, Handoff #10) -----------------------------------------------
+# Django 6 ships a native RedisCache — NO new dependency. When REDIS_URL is
+# set (compose/prod), the default cache shares the channel layer's Redis
+# instance with a "cache" key prefix to stay out of its way; otherwise LocMem
+# (dev + the SQLite-fallback suite, unchanged). This quietly FIXES a latent
+# #9 issue: the forgot-password cooldown was LocMem = per-process; on Redis
+# it (and §I2's throttle counters) is global across daphne processes.
+if REDIS_URL:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": REDIS_URL,
+            "KEY_PREFIX": "cache",
+        }
+    }
+else:
+    CACHES = {"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}}
+
 AUTH_USER_MODEL = "accounts.User"
 
 AUTH_PASSWORD_VALIDATORS = [
@@ -115,6 +133,17 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": ("rest_framework.permissions.IsAuthenticated",),
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": 50,
+    # §I2 (Handoff #10): per-IP rates for the public auth surface, applied
+    # PER-VIEW via accounts/throttling.py — deliberately NOT a global default
+    # (game join and the polling snapshot must stay unthrottled; a bar full
+    # of phones behind one NAT IP is the normal case, not an attack).
+    # Settings constants, not env — env-overridable would be overkill.
+    "DEFAULT_THROTTLE_RATES": {
+        "login": "10/min",
+        "register": "5/min",
+        "password_forgot": "5/min",
+        "password_reset": "5/min",
+    },
 }
 
 # In dev every origin is allowed (CORS_ALLOW_ALL_ORIGINS below), so the
@@ -199,8 +228,25 @@ DATA_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024
 # admin's redirects/CSRF checks) see https when Caddy terminates TLS (§H).
 # Opt-in via env: enabling it while NOT behind a trusted proxy would let
 # clients spoof the header, so the dev default stays off.
-if env_bool("DJANGO_BEHIND_PROXY", False):
+# §I2 (Handoff #10): now ALSO a named settings constant — the auth throttles
+# read it at call time (so tests can override_settings it) to decide whether
+# X-Forwarded-For identifies the client. Getting this wrong throttles the
+# whole site as one IP, so it shares the exact env flag that already gates
+# SECURE_PROXY_SSL_HEADER: behind Caddy, both are true together.
+DJANGO_BEHIND_PROXY = env_bool("DJANGO_BEHIND_PROXY", False)
+if DJANGO_BEHIND_PROXY:
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+    # §I4: `check --deploy` wins that are safe exactly when TLS terminates in
+    # front of us — session/CSRF cookies only ever travel over https then.
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+
+# §I4: HSTS is a ONE-WAY DOOR (browsers pin https for the whole max-age), so
+# it stays the OWNER's flag to flip: env-driven, default 0 (off). Suggested
+# prod value once confident: 31536000 (see DEPLOY.md).
+SECURE_HSTS_SECONDS = int(os.environ.get("SECURE_HSTS_SECONDS", "0"))
+if SECURE_HSTS_SECONDS:
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool("SECURE_HSTS_INCLUDE_SUBDOMAINS", False)
 
 # --- Paid tiers (see accounts/quotas.py) -----------------------------------
 # Per-plan quotas. None = unlimited. Editing this dict changes pricing without
@@ -248,3 +294,25 @@ DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "Drinkquiry <hello@dri
 FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "http://localhost:5173").rstrip("/")
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+# --- Logging (§I5, Handoff #10) ----------------------------------------------
+# A modest console setup: everything reaches stdout so `docker compose logs
+# api` sees it — including accounts.emails' send-failure warnings (verified
+# with a forced failure locally). Django's own request-error logging keeps
+# working: the `django` logger propagates to root by default and
+# disable_existing_loggers stays False. INFO root in prod, DEBUG-friendly in
+# dev. Sentry/aggregation is §M.
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "console": {"format": "{levelname} {asctime} {name} {message}", "style": "{"},
+    },
+    "handlers": {
+        "console": {"class": "logging.StreamHandler", "formatter": "console"},
+    },
+    # INFO root in dev too: a DEBUG root drowns the console in third-party
+    # chatter (asyncio's selector line on every command, SQL echo). Raise a
+    # specific logger when actually debugging.
+    "root": {"handlers": ["console"], "level": "INFO"},
+}

@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from .models import BoardCell, BoardColumn, Buzz, Game, Participant
+from .models import BoardCell, BoardColumn, Buzz, CellState, Game, Participant
 
 
 class ParticipantSerializer(serializers.ModelSerializer):
@@ -119,12 +119,31 @@ class GameStateSerializer(serializers.ModelSerializer):
     # §G: the player cap, surfaced in the snapshot so lobby copy ("N/6 teams")
     # stays a dumb render of server state (rule 1) instead of a hardcoded 6.
     max_players = serializers.SerializerMethodField()
+    # §H1 (Handoff #10): cells not yet ANSWERED — derived here, never stored,
+    # so the snapshot stays the source of truth and BOTH transports (WS and
+    # the polling board) get it for free (C2). An OPEN cell still counts as
+    # remaining, so the count hits 0 only after the LAST close_cell — exactly
+    # when the host is back at the fully played grid and the finish prompt
+    # should appear. questions_per_category × columns at lobby; decrements
+    # per close; a reveal/judgment alone never changes it.
+    cells_remaining = serializers.SerializerMethodField()
 
     class Meta:
         model = Game
         fields = (
-            "code", "mode", "status", "questions_per_category", "max_players",
+            "code", "mode", "status", "questions_per_category", "max_players", "cells_remaining",
             "buzzer_open", "current_cell", "revealed_answer", "columns", "participants", "created_at",
+        )
+
+    def get_cells_remaining(self, game):
+        # Counted from the SAME prefetched columns/cells `columns` serializes
+        # in this pass (every snapshot caller prefetches columns__cells) —
+        # no fresh query per snapshot, no N+1.
+        return sum(
+            1
+            for column in game.columns.all()
+            for cell in column.cells.all()
+            if cell.state != CellState.ANSWERED
         )
 
     def get_max_players(self, game):

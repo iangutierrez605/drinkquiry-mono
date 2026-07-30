@@ -1,3 +1,4 @@
 category,question_text,answer,difficulty,visibility,media_type,media_file
 Movies,What film is this frame from?,Your answer here,2,private,image,media/example.png
 Movies,"Name the film from this quote: ""Here's looking at you, kid.""",Casablanca,1,private,,
+TV|80s,Who shot J.R.?,Kristin Shepard,3,private,,

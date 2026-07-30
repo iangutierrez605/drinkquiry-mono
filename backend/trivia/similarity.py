@@ -10,6 +10,12 @@ Ranking: normalize (casefold, strip punctuation), drop stopwords, then
 Jaccard similarity on the remaining significant words. Smarter similarity
 (trigram / embeddings) is a punted §M candidate — this is deliberately dumb,
 fast, and explainable at the queue's scale.
+
+§F4 (Handoff #10): categories are an M2M now, so "same category first"
+became "shares ANY category" — the primary pool is every approved question
+sharing at least one category with the one under review; the global fallback
+for thin pools is unchanged. Each match carries `category_names` (sorted
+list) instead of the old single name.
 """
 import re
 import string
@@ -54,9 +60,11 @@ def similar_questions(question: Question, *, top_n: int = TOP_N) -> list[dict]:
         Question.objects.filter(approved, deleted_at__isnull=True)
         .exclude(pk=question.pk)
         .annotate(usage_count=Count("boardcell", distinct=True))
-        .select_related("category")
+        .prefetch_related("categories")
     )
-    pool = list(base.filter(category_id=question.category_id))
+    # §F4: shares ANY category. .distinct(): the M2M join repeats a candidate
+    # once per shared category otherwise.
+    pool = list(base.filter(categories__in=question.categories.all()).distinct())
     if len(pool) < MIN_CATEGORY_POOL:
         pool = list(base)
     target = significant_words(question.question_text)
@@ -71,8 +79,8 @@ def similar_questions(question: Question, *, top_n: int = TOP_N) -> list[dict]:
             "id": c.id,
             "question_text": c.question_text,
             "answer": c.answer,
-            "category_id": c.category_id,
-            "category_name": c.category.name,
+            # §F4: the list replaces the old category_id/category_name pair.
+            "category_names": sorted(cat.name for cat in c.categories.all()),
             "score": round(score, 3),
             "usage_count": c.usage_count,
         }

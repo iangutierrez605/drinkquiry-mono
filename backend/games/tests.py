@@ -45,13 +45,13 @@ def seed_category(name: str, n_questions: int = 5) -> Category:
     distinctive strings we can grep entire payloads for."""
     cat = Category.objects.create(owner=None, name=name)
     for i in range(n_questions):
-        Question.objects.create(
-            category=cat,
+        question = Question.objects.create(
             owner=None,
             question_text=f"{name} question {i}?",
             answer=f"SECRET-{name}-{i}",
             difficulty=min(i + 1, 5),
         )
+        question.categories.add(cat)  # §F (Handoff #10): categories are M2M
     return cat
 
 
@@ -705,14 +705,16 @@ class ResumeTests(GameTestBase):
 class DrawPreferenceTests(GameTestBase):
     def uniform_category(self, name, n, difficulty=1):
         cat = Category.objects.create(owner=None, name=name)
-        return cat, [
-            Question.objects.create(
-                category=cat, owner=None,
+        questions = []
+        for i in range(n):
+            q = Question.objects.create(
+                owner=None,
                 question_text=f"{name} question {i}?", answer=f"SECRET-{name}-{i}",
                 difficulty=difficulty,
             )
-            for i in range(n)
-        ]
+            q.categories.add(cat)
+            questions.append(q)
+        return cat, questions
 
     def question_ids(self, game):
         return set(game.cells.values_list("question_id", flat=True))
@@ -754,8 +756,10 @@ class DrawPreferenceTests(GameTestBase):
     def test_difficulty_slotting_still_wins_over_preference(self):
         # A used easy question still beats an unused hard one for the top row.
         cat = Category.objects.create(owner=None, name="Slots")
-        easy = Question.objects.create(category=cat, owner=None, question_text="easy?", answer="A", difficulty=1)
-        hard = Question.objects.create(category=cat, owner=None, question_text="hard?", answer="B", difficulty=5)
+        easy = Question.objects.create(owner=None, question_text="easy?", answer="A", difficulty=1)
+        easy.categories.add(cat)
+        hard = Question.objects.create(owner=None, question_text="hard?", answer="B", difficulty=5)
+        hard.categories.add(cat)
         prior = Game.objects.create(host=self.host, mode="drinks")
         column = BoardColumn.objects.create(game=prior, category=cat, position=0)
         BoardCell.objects.create(game=prior, column=column, question=easy, row=0, value=1)
@@ -794,11 +798,13 @@ class BoardDetailAndReplaceTests(GameTestBase):
         cat = self.game.columns.first().category
         # Two spares: one at the outgoing question's difficulty, one far away.
         near = Question.objects.create(
-            category=cat, owner=None, question_text="near spare?", answer="SECRET-near", difficulty=1
+            owner=None, question_text="near spare?", answer="SECRET-near", difficulty=1
         )
-        Question.objects.create(
-            category=cat, owner=None, question_text="far spare?", answer="SECRET-far", difficulty=5
+        near.categories.add(cat)
+        far = Question.objects.create(
+            owner=None, question_text="far spare?", answer="SECRET-far", difficulty=5
         )
+        far.categories.add(cat)
         target = self.cells(self.game)[0]  # row 0 = difficulty 1 in seed_category
         self.assertEqual(target.question.difficulty, 1)
         on_board_before = set(self.game.cells.values_list("question_id", flat=True))
@@ -820,10 +826,10 @@ class BoardDetailAndReplaceTests(GameTestBase):
         self.assertIn("detail", res.json())
 
     def test_replace_409_after_start(self):
-        Question.objects.create(
-            category=self.game.columns.first().category, owner=None,
-            question_text="spare?", answer="SECRET-spare", difficulty=1,
+        spare = Question.objects.create(
+            owner=None, question_text="spare?", answer="SECRET-spare", difficulty=1,
         )
+        spare.categories.add(self.game.columns.first().category)
         Game.objects.filter(pk=self.game.pk).update(status=GameStatus.ACTIVE)
         target = self.cells(self.game)[0]
         self.as_host()
@@ -841,3 +847,130 @@ class BoardDetailAndReplaceTests(GameTestBase):
         self.assertEqual(
             self.client.post(f"/api/games/{self.game.code}/cells/{target.id}/replace/").status_code, 401
         )
+
+
+# ---------------------------------------------------------------------------
+# Handoff #10 §F3 — multi-category boards: no duplicates, honest shortages
+# ---------------------------------------------------------------------------
+
+class MultiCategoryBoardTests(GameTestBase):
+    def overlapping_categories(self, shared, a_extra, b_extra):
+        """Two categories sharing `shared` questions, plus per-category extras.
+        Uniform difficulty so the draw window never hides pool size."""
+        cat_a = Category.objects.create(owner=None, name="Movies A")
+        cat_b = Category.objects.create(owner=None, name="Eighties B")
+
+        def make(text, cats):
+            q = Question.objects.create(owner=None, question_text=text, answer="A", difficulty=1)
+            q.categories.set(cats)
+            return q
+
+        for i in range(shared):
+            make(f"shared {i}?", [cat_a, cat_b])
+        for i in range(a_extra):
+            make(f"a-only {i}?", [cat_a])
+        for i in range(b_extra):
+            make(f"b-only {i}?", [cat_b])
+        return cat_a, cat_b
+
+    def test_shared_question_appears_at_most_once_on_the_board(self):
+        # A: 3 shared + 2 own = 5; B: 3 shared + 5 own = 8. A 5-per-category
+        # build over both needs 10 DISTINCT questions and has exactly 10.
+        cat_a, cat_b = self.overlapping_categories(shared=3, a_extra=2, b_extra=5)
+        game = create_game(
+            host=self.host, mode="points", category_ids=[cat_a.id, cat_b.id], questions_per_category=5
+        )
+        ids = list(game.cells.values_list("question_id", flat=True))
+        self.assertEqual(len(ids), 10)
+        self.assertEqual(len(set(ids)), 10, "a question landed on the board twice")
+
+    def test_overlap_shortage_refuses_instead_of_duplicating(self):
+        # A: 5 usable, B: 5 usable — but 3 are the SAME questions, so two
+        # 5-question columns can't be filled. The EXCLUDED pool decides; the
+        # LATER column reports short (order-dependent attribution, accepted).
+        cat_a, cat_b = self.overlapping_categories(shared=3, a_extra=2, b_extra=2)
+        with self.assertRaises(DRFValidationError) as ctx:
+            create_game(
+                host=self.host, mode="points", category_ids=[cat_a.id, cat_b.id], questions_per_category=5
+            )
+        detail = str(ctx.exception.detail["categories"])
+        self.assertIn("'Eighties B' only has 2 usable question(s); 5 required.", detail)
+        self.assertNotIn("Movies A", detail)  # the first column filled fine
+        self.assertEqual(Game.objects.count(), 0)  # nothing half-built
+
+    def test_shortage_attribution_follows_column_order(self):
+        cat_a, cat_b = self.overlapping_categories(shared=3, a_extra=2, b_extra=2)
+        with self.assertRaises(DRFValidationError) as ctx:
+            create_game(
+                host=self.host, mode="points", category_ids=[cat_b.id, cat_a.id], questions_per_category=5
+            )
+        # Same data, reversed order: now A is the later column and reports.
+        self.assertIn("Movies A", str(ctx.exception.detail["categories"]))
+
+    def test_deleted_category_reads_as_unknown(self):
+        from django.utils import timezone
+
+        cat = seed_category("Soon Gone", n_questions=2)
+        cat.deleted_at = timezone.now()
+        cat.save(update_fields=["deleted_at"])
+        with self.assertRaises(DRFValidationError) as ctx:
+            create_game(host=self.host, mode="points", category_ids=[cat.id], questions_per_category=2)
+        self.assertIn("Unknown category ids", str(ctx.exception.detail["categories"]))
+
+    def test_replace_still_excludes_the_whole_board(self):
+        # Regression guard for §F3's "the replace pool needs no change".
+        cat_a, cat_b = self.overlapping_categories(shared=2, a_extra=1, b_extra=6)
+        game = create_game(
+            host=self.host, mode="points", category_ids=[cat_a.id, cat_b.id], questions_per_category=3
+        )
+        on_board = set(game.cells.values_list("question_id", flat=True))
+        target = game.cells.filter(column__category=cat_b).first()
+        from .services import replace_cell_question
+
+        cell = replace_cell_question(code=game.code, cell_id=target.id, host=self.host)
+        self.assertNotIn(cell.question_id, on_board)
+
+
+# ---------------------------------------------------------------------------
+# Handoff #10 §H — cells_remaining in the snapshot
+# ---------------------------------------------------------------------------
+
+class CellsRemainingTests(GameTestBase):
+    """§H1 semantics, pinned: an OPEN cell still counts as remaining; the
+    count hits 0 only after the LAST close_cell; reveal/judgment alone never
+    move it. Exercised at the services level over a whole tiny 1×2 board —
+    exactly what the socket runs."""
+
+    def snapshot(self, game):
+        from .serializers import GameStateSerializer
+
+        fresh = (
+            Game.objects.prefetch_related("columns__cells", "columns__category", "participants")
+            .select_related("current_cell__question", "judged_participant")
+            .get(pk=game.pk)
+        )
+        return GameStateSerializer(fresh).data
+
+    def test_counts_down_only_on_close(self):
+        game = make_game(self.host, n=2)
+        player = Participant.objects.create(game=game, name="TEAM A")
+        Game.objects.filter(pk=game.pk).update(status=GameStatus.ACTIVE)
+        self.assertEqual(self.snapshot(game)["cells_remaining"], 2)  # lobby total = per_cat × columns
+
+        cells = list(game.cells.order_by("row"))
+        open_cell(code=game.code, cell_id=cells[0].id)
+        self.assertEqual(self.snapshot(game)["cells_remaining"], 2)  # OPEN is not answered
+
+        set_buzzer(code=game.code, is_open=True)
+        register_buzz(code=game.code, participant=player)
+        judge_buzz(code=game.code, participant_id=player.id, correct=True)  # judge + reveal
+        self.assertEqual(self.snapshot(game)["cells_remaining"], 2)  # unchanged by reveal/judgment
+
+        close_cell(code=game.code)
+        self.assertEqual(self.snapshot(game)["cells_remaining"], 1)
+
+        open_cell(code=game.code, cell_id=cells[1].id)
+        close_cell(code=game.code)
+        snap = self.snapshot(game)
+        self.assertEqual(snap["cells_remaining"], 0)  # exactly after the LAST close
+        self.assertIsNone(snap["current_cell"])

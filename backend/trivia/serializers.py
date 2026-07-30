@@ -49,15 +49,36 @@ class CategorySerializer(serializers.ModelSerializer):
 
 class QuestionSerializer(serializers.ModelSerializer):
     owner = serializers.PrimaryKeyRelatedField(read_only=True)
+    # §F2 (Handoff #10): a question lives in one or more categories. Reads
+    # and writes both use `categories` (list of ids). Deleted categories are
+    # unassignable (§F5) — the queryset filter is the gate.
+    categories = serializers.PrimaryKeyRelatedField(
+        many=True, queryset=Category.objects.filter(deleted_at__isnull=True)
+    )
+    # DEPRECATED (kept for ONE session, §F2 back-compat): the pre-#10 single
+    # `category` id is still accepted on WRITE and mapped to `[id]` so
+    # in-flight tabs don't 400 mid-deploy. Write-only — responses carry
+    # `categories` only. Remove next session.
+    category = serializers.PrimaryKeyRelatedField(
+        queryset=Category.objects.filter(deleted_at__isnull=True), write_only=True, required=False
+    )
 
     class Meta:
         model = Question
         fields = (
-            "id", "category", "question_text", "answer", "difficulty",
+            "id", "categories", "category", "question_text", "answer", "difficulty",
             "media_type", "image", "audio", "video",
             "owner", "visibility", "moderation_status", "moderation_note", "created_at",
         )
         read_only_fields = ("moderation_status", "moderation_note")
+
+    def get_fields(self):
+        # `categories` is required on create but optional on PATCH (an update
+        # that doesn't mention categories keeps the existing set).
+        fields = super().get_fields()
+        if self.instance is not None:
+            fields["categories"].required = False
+        return fields
 
     def validate(self, attrs):
         media_type = attrs.get("media_type", getattr(self.instance, "media_type", MediaType.NONE))
@@ -65,27 +86,56 @@ class QuestionSerializer(serializers.ModelSerializer):
         expected = field_for_type.get(media_type)
         if expected and not (attrs.get(expected) or (self.instance and getattr(self.instance, expected))):
             raise serializers.ValidationError({expected: f"A {media_type} file is required for this media type."})
-        category = attrs.get("category") or (self.instance and self.instance.category)
+        # Legacy single-id write maps onto the list (explicit `categories`
+        # wins if a client somehow sends both).
+        legacy = attrs.pop("category", None)
+        if legacy is not None and not attrs.get("categories"):
+            attrs["categories"] = [legacy]
+        categories = attrs.get("categories")
+        if categories is not None:
+            # De-dup while preserving order (a repeated id is harmless input).
+            seen, unique = set(), []
+            for cat in categories:
+                if cat.pk not in seen:
+                    seen.add(cat.pk)
+                    unique.append(cat)
+            attrs["categories"] = unique
+            categories = unique
+        elif self.instance is not None:
+            categories = list(self.instance.categories.all())
+        if not categories:
+            raise serializers.ValidationError({"categories": "Pick at least one category."})
+        # The permission rule is unchanged (official | own | publicly
+        # visible) — now applied PER category: ONE ineligible category fails
+        # the whole create/update.
         user = self.context["request"].user
-        if category and not category.accepts_questions_from(user):
-            raise serializers.ValidationError({"category": "You cannot add questions to this category."})
+        for category in categories:
+            if not category.accepts_questions_from(user):
+                raise serializers.ValidationError(
+                    {"categories": f'You cannot add questions to "{category.name}".'}
+                )
         return attrs
 
     def create(self, validated_data):
+        categories = validated_data.pop("categories")
         wants_public = validated_data.get("visibility") == Visibility.PUBLIC
         question = Question(owner=self.context["request"].user, **validated_data)
         if wants_public:
             question.moderation_status = ModerationStatus.PENDING
         question.save()
+        question.categories.set(categories)
         return question
 
     def update(self, instance, validated_data):
+        categories = validated_data.pop("categories", None)
         wants_public = validated_data.get("visibility", instance.visibility) == Visibility.PUBLIC
         for key, value in validated_data.items():
             setattr(instance, key, value)
         # Any edit to public content re-enters the review queue.
         instance.moderation_status = ModerationStatus.PENDING if wants_public else ModerationStatus.NOT_SUBMITTED
         instance.save()
+        if categories is not None:
+            instance.categories.set(categories)
         return instance
 
 
@@ -132,7 +182,9 @@ class ModerationCategorySerializer(_UsageCountMixin, _OwnerContextMixin, Categor
 class ModerationQuestionSerializer(_UsageCountMixin, _OwnerContextMixin, QuestionSerializer):
     # `answer` is already in QuestionSerializer — required for review. It never
     # leaks into game snapshots (OpenCellSerializer excludes it).
-    category_name = serializers.CharField(source="category.name", read_only=True)
+    # §F4 (Handoff #10): `category_name` became `category_names` (sorted list)
+    # with the M2M — our serializer, our frontend, so REPLACED, not aliased.
+    category_names = serializers.SerializerMethodField()
     # §I4: lifecycle context for the library — deleted_at (null = active) and
     # the id of the revision that superseded this row, if any. Read-only,
     # staff-only surface; the public QuestionSerializer never carries these.
@@ -140,9 +192,13 @@ class ModerationQuestionSerializer(_UsageCountMixin, _OwnerContextMixin, Questio
 
     class Meta(QuestionSerializer.Meta):
         fields = QuestionSerializer.Meta.fields + (
-            "owner_email", "owner_display_name", "category_name", "usage_count",
+            "owner_email", "owner_display_name", "category_names", "usage_count",
             "deleted_at", "replaced_by",
         )
+
+    def get_category_names(self, obj):
+        # Reads the prefetch (viewsets prefetch `categories`) — no N+1.
+        return sorted(c.name for c in obj.categories.all())
 
 
 class FlaggedQuestionSerializer(ModerationQuestionSerializer):

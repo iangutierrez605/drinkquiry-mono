@@ -8,6 +8,7 @@ from .moderation import (
     ModerationFlagsView,
     ModerationQuestionViewSet,
 )
+from .themes import ModerationThemeViewSet, ThemeListView
 from .views import CategoryViewSet, QuestionViewSet
 
 router = DefaultRouter()
@@ -15,8 +16,13 @@ router.register("categories", CategoryViewSet, basename="category")
 router.register("questions", QuestionViewSet, basename="question")
 router.register("moderation/categories", ModerationCategoryViewSet, basename="moderation-category")
 router.register("moderation/questions", ModerationQuestionViewSet, basename="moderation-question")
+# §G: staff theme CRUD, in the moderation namespace with its siblings.
+router.register("moderation/themes", ModerationThemeViewSet, basename="moderation-theme")
 
 urlpatterns = [
+    # §G: the host-facing theme list — a static path, registered before the
+    # router per the house rule.
+    path("themes/", ThemeListView.as_view(), name="theme-list"),
     path("moderation/counts/", ModerationCountsView.as_view(), name="moderation-counts"),
     # Handoff #8 §K2: the host-flag inflow's staff side. Static paths before
     # the router so nothing gets swallowed by viewset lookups.

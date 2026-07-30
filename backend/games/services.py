@@ -71,6 +71,19 @@ def _preference_ordered(qs, host):
 
 @transaction.atomic
 def create_game(*, host, mode: str, category_ids: list[int], questions_per_category: int) -> Game:
+    """Build a game board from `category_ids`, in the order given.
+
+    §G (Handoff #10), deliberate: this API is THEME-UNAWARE. Themes are a
+    discovery/selection layer on the host create screen — they filter and
+    pre-select categories client-side, and the request still arrives as
+    `category_ids`. Do not "improve" this into a theme_id parameter without
+    an actual reason; the server-side theme-aware build is punted (§M).
+
+    §F3: with categories M2M, overlapping columns share questions — the
+    per-column draw excludes everything already picked (see below), so a
+    question appears at most once per board and shortage is judged against
+    the post-exclusion pool.
+    """
     if not (1 <= questions_per_category <= 10):
         raise ValidationError({"questions_per_category": "Must be between 1 and 10."})
     if not (1 <= len(category_ids) <= 8):
@@ -78,25 +91,41 @@ def create_game(*, host, mode: str, category_ids: list[int], questions_per_categ
     if len(set(category_ids)) != len(category_ids):
         raise ValidationError({"categories": "Duplicate categories are not allowed."})
 
-    categories = list(Category.objects.filter(id__in=category_ids))
+    # §F5: a deleted category id reads as "Unknown category ids" — deleted
+    # categories are invisible to new game builds, full stop.
+    categories = list(Category.objects.filter(id__in=category_ids, deleted_at__isnull=True))
     found = {c.id for c in categories}
     if missing := set(category_ids) - found:
         raise ValidationError({"categories": f"Unknown category ids: {sorted(missing)}."})
 
     # Requirement 4: refuse to create the game if any chosen category is short
     # on questions the host may use.
+    #
+    # §F3 (Handoff #10): categories are M2M now, so a question can sit in TWO
+    # selected categories — it must appear AT MOST ONCE on the board. Columns
+    # are processed IN THE ORDER GIVEN, each excluding every question already
+    # picked by an earlier column (`used_question_ids` — the same idea
+    # replace_cell_question uses with `on_board`). The shortage check runs
+    # against the EXCLUDED pool, so "Movies (5) + 80s Movies (5) sharing 3"
+    # correctly refuses a 5-per-category build instead of silently
+    # duplicating. Shortage ATTRIBUTION is therefore order-dependent — the
+    # LATER of two overlapping columns reports short (acceptable; the error
+    # shape and message format are unchanged).
+    by_id = {c.id: c for c in categories}
     shortages = {}
     picked: dict[int, list[Question]] = {}
-    for category in categories:
+    used_question_ids: set[int] = set()
+    for category_id in category_ids:
+        category = by_id[category_id]
         # §J2: difficulty stays the primary key (same difficulty-slot behavior
         # as before), and WITHIN a difficulty the host's unused questions come
         # first, then least-used, then random. The 3x fetch window and the
         # stable easiest->hardest sort below are unchanged, so the shortage
         # contract and row/value placement behave exactly as they did.
         qs = list(
-            _preference_ordered(usable_questions(category, host), host).order_by(
-                "difficulty", "host_uses", "global_uses", "?"
-            )[: questions_per_category * 3]
+            _preference_ordered(usable_questions(category, host), host)
+            .exclude(id__in=used_question_ids)  # §F3: never twice on one board
+            .order_by("difficulty", "host_uses", "global_uses", "?")[: questions_per_category * 3]
         )
         if len(qs) < questions_per_category:
             shortages[category.name] = len(qs)
@@ -106,6 +135,7 @@ def create_game(*, host, mode: str, category_ids: list[int], questions_per_categ
             # difficulty survives the re-sort.
             chosen = sorted(qs, key=lambda q: q.difficulty)[:questions_per_category]
             picked[category.id] = chosen
+            used_question_ids.update(q.id for q in chosen)
     if shortages:
         raise ValidationError(
             {

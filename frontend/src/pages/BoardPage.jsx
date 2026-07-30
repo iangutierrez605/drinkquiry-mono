@@ -182,7 +182,18 @@ export default function BoardPage() {
         </div>
       )}
 
-      {game.status === "active" && !cell && <BoardGrid game={game} />}
+      {game.status === "active" && !cell && (
+        <>
+          <BoardGrid game={game} />
+          {/* §H3 (Handoff #10): every cell played — a QUIET line, no
+              takeover, no animation (the winner moment owns big moments).
+              cells_remaining is a snapshot field, so polling boards get it
+              too (C2). */}
+          {game.cells_remaining === 0 && (
+            <p className="tv__allplayed">All questions played — waiting for the host to wrap up.</p>
+          )}
+        </>
+      )}
 
       {/* §G1 (Handoff #9): a CORRECT verdict hands the whole screen to the
           moment — full overlay with the winner's name as the star, the

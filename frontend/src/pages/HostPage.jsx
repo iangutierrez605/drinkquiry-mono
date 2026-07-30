@@ -93,6 +93,12 @@ export default function HostPage() {
 
 function CreateScreen({ auth, onCreated, onResumed }) {
   const [categories, setCategories] = useState(null);
+  // §G3 (Handoff #10): themes filter the category grid and offer a one-tap
+  // "Pick for me". Pure discovery/selection sugar — `selected` stays the one
+  // selection state, the create request still sends category_ids, and the
+  // server's shortage refusal (§F3) remains the real gate (rule 4).
+  const [themes, setThemes] = useState(null);
+  const [activeTheme, setActiveTheme] = useState(null); // null = "All categories"
   // §I: unfinished games this host can jump back into. Discoverability lives
   // here (the "no active game" screen) AND on /profile; both share
   // resumeHostGame above.
@@ -115,6 +121,10 @@ function CreateScreen({ auth, onCreated, onResumed }) {
       .then(setCategories)
       .catch((err) => setError(errorText(err)));
     api
+      .themes(auth.token)
+      .then(setThemes)
+      .catch(() => setThemes([])); // the strip is optional sugar
+    api
       .profile(auth.token)
       .then(setProfile)
       .catch(() => {}); // meter/link are optional; creation errors surface on their own
@@ -136,6 +146,26 @@ function CreateScreen({ auth, onCreated, onResumed }) {
 
   const toggle = (id) =>
     setSelected((sel) => (sel.includes(id) ? sel.filter((x) => x !== id) : sel.length < 8 ? [...sel, id] : sel));
+
+  // §G3 "Pick for me": up to 5 of the theme's categories that can actually
+  // fill a column (usable count >= perCategory), highest counts first. 5
+  // because the owner said "up to 5"; the manual grid still allows up to 8.
+  // REPLACES the current selection — it's the one-tap "give me a board".
+  const pickForMe = (theme) => {
+    const picks = theme.categories
+      .filter((c) => (c.usable_question_count ?? 0) >= perCategory)
+      .sort((a, b) => (b.usable_question_count ?? 0) - (a.usable_question_count ?? 0))
+      .slice(0, 5)
+      .map((c) => c.id);
+    setSelected(picks);
+  };
+
+  // Filtering is a VIEW, not a reset: switching themes never touches
+  // `selected` — categories chosen under another filter stay chosen.
+  const themeCategoryIds = activeTheme ? new Set(activeTheme.categories.map((c) => c.id)) : null;
+  const visibleCategories = themeCategoryIds
+    ? (categories ?? []).filter((c) => themeCategoryIds.has(c.id))
+    : categories;
 
   const create = async () => {
     setBusy(true);
@@ -227,9 +257,47 @@ function CreateScreen({ auth, onCreated, onResumed }) {
         <h2 className="h2">
           Categories <span className="field__hint">(pick 1–8)</span>
         </h2>
+        {themes && themes.length > 0 && (
+          <div className="themestrip">
+            <button
+              type="button"
+              className={`themechip ${activeTheme == null ? "themechip--on" : ""}`}
+              onClick={() => setActiveTheme(null)}
+            >
+              All categories
+            </button>
+            {themes.map((t) => {
+              // A theme is "thin" when NO visible category in it can fill a
+              // column at the current per-category setting.
+              const thin = !t.categories.some((c) => (c.usable_question_count ?? 0) >= perCategory);
+              const on = activeTheme?.id === t.id;
+              return (
+                <button
+                  key={t.id}
+                  type="button"
+                  className={`themechip ${on ? "themechip--on" : ""}`}
+                  disabled={thin}
+                  title={thin ? "Not enough questions yet" : t.description || ""}
+                  onClick={() => setActiveTheme(on ? null : t)}
+                >
+                  {t.name}
+                  {thin && <span className="themechip__hint"> — not enough questions yet</span>}
+                </button>
+              );
+            })}
+            {activeTheme && (
+              <span className="themestrip__actions">
+                <button type="button" className="btn btn--gold btn--sm" onClick={() => pickForMe(activeTheme)}>
+                  ✨ Pick for me
+                </button>
+                <span className="themestrip__count">{selected.length} selected</span>
+              </span>
+            )}
+          </div>
+        )}
         {!categories && !error && <p>Loading…</p>}
         <div className="catgrid">
-          {categories?.map((cat) => {
+          {visibleCategories?.map((cat) => {
             const short = (cat.usable_question_count ?? 0) < perCategory;
             const on = selected.includes(cat.id);
             return (
@@ -432,7 +500,40 @@ function HostGame({ code, token, auth, onLeave }) {
           <ScoreStrip game={game} />
           {!openCell && (
             <>
-              <p className="hostprompt">Click a cell to open its question.</p>
+              {/* §H2 (Handoff #10): the board is fully played — say so and
+                  bring the finish action to where the host is looking. The
+                  condition derives entirely from the snapshot (rule 1):
+                  cells_remaining hits 0 only after the LAST close_cell. The
+                  confirm state is the SAME confirmFinish the header uses —
+                  reused, not forked; the header's Finish button stays too. */}
+              {game.cells_remaining === 0 ? (
+                <div className="boarddone" role="status">
+                  <p className="boarddone__title">That's the whole board 🎉</p>
+                  <p className="boarddone__sub">Finish the game to crown the winner.</p>
+                  {confirmFinish ? (
+                    <span className="confirmrow">
+                      <button
+                        className="btn btn--danger"
+                        onClick={() => {
+                          send("finish_game");
+                          setConfirmFinish(false);
+                        }}
+                      >
+                        Confirm finish
+                      </button>
+                      <button className="btn btn--ghost" onClick={() => setConfirmFinish(false)}>
+                        Cancel
+                      </button>
+                    </span>
+                  ) : (
+                    <button className="btn btn--gold btn--big" onClick={() => setConfirmFinish(true)}>
+                      🏁 Finish game
+                    </button>
+                  )}
+                </div>
+              ) : (
+                <p className="hostprompt">Click a cell to open its question.</p>
+              )}
               <BoardGrid game={game} onOpenCell={openCellAction} />
             </>
           )}

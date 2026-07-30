@@ -15,15 +15,23 @@ from rest_framework.views import APIView
 from .emails import send_password_changed_email, send_password_reset_email
 from .models import User
 from .serializers import AuthSerializer, UserSerializer
+from .throttling import (
+    LoginRateThrottle,
+    PasswordForgotRateThrottle,
+    PasswordResetRateThrottle,
+    RegisterRateThrottle,
+)
 
 
 class RegisterView(generics.CreateAPIView):
     serializer_class = UserSerializer
     permission_classes = (permissions.AllowAny,)
+    throttle_classes = (RegisterRateThrottle,)  # §I2: 5/min per IP
 
 
 class LoginView(KnoxLoginView):
     permission_classes = (permissions.AllowAny,)
+    throttle_classes = (LoginRateThrottle,)  # §I2: 10/min per IP
 
     def post(self, request, format=None):
         serializer = AuthSerializer(data=request.data, context={"request": request})
@@ -58,10 +66,13 @@ class PasswordForgotView(APIView):
     {FRONTEND_BASE_URL}/reset-password?uid=<b64 pk>&token=<Django reset token>.
     Rate limiting is a per-email 60s cache cooldown; hitting it silently
     skips the SEND and never changes the response body (enumeration again).
-    Proper per-IP rate limiting is punted (§M).
+    §I2 (Handoff #10) layered a per-IP throttle ON TOP (no longer §M): the
+    cooldown and the throttle are independent — a 429 is a different STATUS,
+    which is fine (C4); every 200 keeps the identical pinned body.
     """
 
     permission_classes = (permissions.AllowAny,)
+    throttle_classes = (PasswordForgotRateThrottle,)  # §I2: 5/min per IP
 
     def post(self, request):
         email = str(request.data.get("email") or "").strip()
@@ -98,6 +109,7 @@ class PasswordResetView(APIView):
     """
 
     permission_classes = (permissions.AllowAny,)
+    throttle_classes = (PasswordResetRateThrottle,)  # §I2: 5/min per IP
 
     def post(self, request):
         uid = str(request.data.get("uid") or "")

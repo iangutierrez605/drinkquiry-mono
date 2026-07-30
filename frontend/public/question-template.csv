@@ -2,3 +2,4 @@ category,question_text,answer,difficulty,visibility
 Movies,Who directed Alien?,Ridley Scott,3,private
 Movies,"Which 1999 film asks ""What is the Matrix?""",The Matrix,2,public
 Science,What is H2O commonly called?,Water,1,
+Movies|Music,Which film's theme song is 'My Heart Will Go On'?,Titanic,2,private

@@ -42,14 +42,25 @@ DEMO = {
 }
 
 
+# §G (Handoff #10): 2–3 official themes over the seeded categories. Themes
+# ADD rows and never touch questions, so the smoke suite's standing
+# assumption (5 official categories × 5 usable questions) is untouched.
+THEMES = {
+    "Screens & Sounds": ("Movies and music — everything with a soundtrack.", ["Movies", "Music"]),
+    "Brain Food": ("Science and the wider world.", ["Science", "Geography"]),
+    "Night Out": ("The pub-quiz classics.", ["Music", "Food & Drink"]),
+}
+
+
 class Command(BaseCommand):
-    help = "Seed official demo categories and questions"
+    help = "Seed official demo categories, questions and themes"
 
     def handle(self, *args, **options):
         for name, questions in DEMO.items():
             category, _ = Category.objects.get_or_create(
                 owner=None,
                 name=name,
+                deleted_at=None,
                 defaults={
                     "visibility": Visibility.PUBLIC,
                     "moderation_status": ModerationStatus.APPROVED,
@@ -57,15 +68,28 @@ class Command(BaseCommand):
                 },
             )
             for difficulty, (text, answer) in enumerate(questions, start=1):
-                Question.objects.get_or_create(
-                    category=category,
+                # §F (Handoff #10): the dedupe identity is (owner,
+                # question_text) — category is M2M and attached after.
+                question, _ = Question.objects.get_or_create(
+                    owner=None,
                     question_text=text,
                     defaults={
                         "answer": answer,
                         "difficulty": difficulty,
-                        "owner": None,
                         "visibility": Visibility.PUBLIC,
                         "moderation_status": ModerationStatus.APPROVED,
                     },
                 )
-        self.stdout.write(self.style.SUCCESS("Seeded demo categories and questions."))
+                question.categories.add(category)  # idempotent
+        # §G: themes match on name like categories do, so a re-run never
+        # duplicates them; .set() keeps the category grouping idempotent too.
+        from trivia.models import Theme
+
+        for theme_name, (description, category_names) in THEMES.items():
+            theme, _ = Theme.objects.get_or_create(
+                name=theme_name, deleted_at=None, defaults={"description": description}
+            )
+            theme.categories.set(
+                Category.objects.filter(owner=None, name__in=category_names, deleted_at__isnull=True)
+            )
+        self.stdout.write(self.style.SUCCESS("Seeded demo categories, questions and themes."))

@@ -54,6 +54,18 @@ class ModeratedContentMixin(models.Model):
 class Category(ModeratedContentMixin):
     name = models.CharField(max_length=100)
     description = models.TextField(blank=True)
+    # §F5 (Handoff #10): soft delete — same convention as Question (§I1 #9):
+    # `deleted_at` is the ONLY liveness flag (null = active; no boolean twin).
+    # Needed anyway once questions↔categories went M2M (deleting a category
+    # no longer CASCADEs questions — M2M rows just vanish), and it kills the
+    # same latent bug §I(#9) killed for questions: BoardColumn.category is
+    # PROTECT, so hard-deleting an ever-PLAYED category was a guaranteed
+    # ProtectedError 500. Deleted categories deliberately REMAIN in board
+    # columns, snapshots, reports and history; every "active" surface
+    # (listings, bulk resolution, game builds, moderation queue + counts,
+    # quota counters, theme listings) filters deleted_at__isnull=True.
+    # Restore/staff-delete-endpoint/revise are punted (§M).
+    deleted_at = models.DateTimeField(null=True, blank=True)
     photo = models.ImageField(upload_to="categories/", null=True, blank=True, validators=[validate_image])
     # §F3: persisted size of `photo` (post-resize), maintained by save() below
     # so the storage quota is counted from columns, never by listing a bucket.
@@ -77,7 +89,15 @@ class Category(ModeratedContentMixin):
     class Meta:
         verbose_name_plural = "categories"
         constraints = [
-            models.UniqueConstraint(fields=["owner", "name"], name="unique_category_name_per_owner"),
+            # §F5: PARTIAL unique (active rows only) so a deleted category's
+            # name can be reused. SQLite and Postgres both support this via
+            # Django's condition= (verified in both — the suite runs SQLite,
+            # the owner-run compose pass runs Postgres).
+            models.UniqueConstraint(
+                fields=["owner", "name"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="unique_category_name_per_owner",
+            ),
         ]
 
     def __str__(self):
@@ -109,7 +129,22 @@ class MediaType(models.TextChoices):
 
 
 class Question(ModeratedContentMixin):
-    category = models.ForeignKey(Category, on_delete=models.CASCADE, related_name="questions")
+    # §F1 (Handoff #10): a question can live in MORE THAN ONE category
+    # ("Who shot J.R.?" is both TV and 80s) — the old `category` FK became
+    # this M2M. Keeping related_name="questions" is deliberate: every
+    # `category.questions` reverse lookup (usable_questions,
+    # usable_question_count, similarity) keeps working with only its FILTER
+    # semantics reviewed, not its spelling. Consequences stated plainly:
+    #   - deleting a Category no longer CASCADEs questions (M2M rows just
+    #     vanish) — §F5's category soft delete owns deletion semantics now,
+    #     and NOTHING may rely on the old cascade;
+    #   - a question whose categories are ALL deleted becomes undrawable
+    #     (draws go through a live category) but stays in its owner's list,
+    #     editable/recategorizable via PATCH;
+    #   - the bulk-upload dedupe key is (owner, question_text) — category
+    #     dropped out of it (same text in two categories is ONE question in
+    #     both; that's the whole point of §F).
+    categories = models.ManyToManyField(Category, related_name="questions")
     # §I1 (Handoff #9): soft delete. `deleted_at` is the ONLY liveness flag
     # (null = active; no boolean twin). Every "active questions" surface
     # filters deleted_at__isnull=True; deleted rows deliberately REMAIN in
@@ -155,6 +190,43 @@ class Question(ModeratedContentMixin):
 
     def __str__(self):
         return self.question_text[:80]
+
+
+class Theme(models.Model):
+    """§G (Handoff #10): a staff-curated tag grouping categories, so a host
+    can find "all music categories" in one tap on the create screen.
+
+    THIS is the tag table the owner suspected: a category can carry many
+    themes; a theme groups many categories. Staff-managed, official-only for
+    v1 — no owner column; creator-authored themes and theme moderation are
+    §M. Themes are a discovery/selection layer only: game creation still
+    takes `category_ids` and knows nothing about themes (deliberate — see
+    games/services.create_game's docstring).
+
+    Soft delete from day one (`deleted_at`, null = active — the house
+    convention; three lines now vs. a migration later). The partial unique
+    constraint lets a deleted theme's name be reused, exactly like §F5's
+    category constraint.
+    """
+
+    name = models.CharField(max_length=100)
+    description = models.TextField(blank=True)
+    categories = models.ManyToManyField(Category, related_name="themes", blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    deleted_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ("name", "id")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["name"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="unique_active_theme_name",
+            ),
+        ]
+
+    def __str__(self):
+        return self.name
 
 
 class ReportStatus(models.TextChoices):

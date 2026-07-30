@@ -78,7 +78,13 @@ def send_moderation_outcome_email(item, *, approved: bool, actor) -> None:
     label = item.question_text if kind == "question" else item.name
     if len(label) > 80:
         label = label[:77] + "…"
-    where = f" in {item.category.name}" if kind == "question" else ""
+    # §F (Handoff #10): questions live in one or MORE categories now — a
+    # C6-grep find this handoff's known list missed (noted in CHANGES.md).
+    if kind == "question":
+        names = sorted(c.name for c in item.categories.all())
+        where = f" in {', '.join(names)}" if names else ""
+    else:
+        where = ""
     if approved:
         subject = f"Your {kind} was approved"
         body = (

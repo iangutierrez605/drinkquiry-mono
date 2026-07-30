@@ -4,7 +4,7 @@ import { api, errorText, ApiError } from "../lib/api";
 import { clearSeat, loadSeat, saveSeat } from "../lib/storage";
 import { useGameSocket } from "../lib/useGameSocket";
 import { ensureAudio, playBuzz } from "../lib/sounds";
-import { ScoreStrip, Toast } from "../components/shared";
+import { FinalStandings, ScoreStrip, Toast } from "../components/shared";
 
 export default function BuzzerPage() {
   const { code = "" } = useParams();
@@ -193,13 +193,49 @@ function BuzzerLive({ code, seat, onBadSeat }) {
       </div>
     );
 
+  // §H4 (Handoff #10): once the game is FINISHED the dead buzz circle is
+  // the wrong screen — render a proper finale instead (below). The socket
+  // stays open (late snapshots still render); no new WS events.
+  const finished = game.status === "finished";
+  // Winner check, derived LOCALLY from the live snapshot exactly the way
+  // FinalStandings ranks (points → score, drinks → drinks_given): the
+  // snapshot has no winners field (that lives on history/report serializers)
+  // and doesn't need one.
+  const rankStat = (p) => (game.mode === "points" ? p.score : p.drinks_given);
+  const playersAll = game.participants.filter((p) => p.role === "player");
+  const topStat = playersAll.length ? Math.max(...playersAll.map(rankStat)) : 0;
+  const iAmWinner = finished && self != null && playersAll.length > 0 && rankStat(self) === topStat;
+
+  if (finished)
+    return (
+      <div className="page page--buzzer buzzover">
+        <header className="buzzhead">
+          <span className="buzzhead__team">{self?.name ?? seat.name}</span>
+          <span className={`conn ${connected ? "conn--on" : "conn--off"}`}>
+            <span className="conn__dot" />
+            {connected ? code : "reconnecting"}
+          </span>
+        </header>
+        {iAmWinner && <div className="buzzover__trophy">🏆</div>}
+        <div className="buzzover__title">GAME OVER 🍻</div>
+        {iAmWinner && <p className="buzzover__winner">Champions — that's you!</p>}
+        <FinalStandings game={game} />
+        {self && (
+          <p className="buzzfinal">
+            {game.mode === "points"
+              ? `Final score: ${self.score} pts`
+              : `You gave ${self.drinks_given} 🍺 and took ${self.drinks_taken} 🍻`}
+          </p>
+        )}
+        <p className="footnote buzzover__foot">Thanks for playing — hand the phone back. 🍻</p>
+        <Toast message={lastError} onDone={clearError} />
+      </div>
+    );
+
   let stateLabel;
   let stateClass;
   if (game.status === "lobby") {
     stateLabel = "Waiting for the host to start";
-    stateClass = "idle";
-  } else if (game.status === "finished") {
-    stateLabel = "Game over";
     stateClass = "idle";
   } else if (!cell) {
     stateLabel = "Watch the board…";
@@ -288,14 +324,6 @@ function BuzzerLive({ code, seat, onBadSeat }) {
             </li>
           ))}
         </ol>
-      )}
-
-      {game.status === "finished" && self && (
-        <p className="buzzfinal">
-          {game.mode === "points"
-            ? `Final score: ${self.score} pts`
-            : `You gave ${self.drinks_given} 🍺 and took ${self.drinks_taken} 🍻`}
-        </p>
       )}
 
       <footer className="buzzfoot">

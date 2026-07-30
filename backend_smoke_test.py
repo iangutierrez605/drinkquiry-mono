@@ -18,6 +18,11 @@ ORIGIN = os.environ.get("SMOKE_ORIGIN", "http://localhost:5173")
 ok = lambda m: print(f"  ✓ {m}")
 
 def rest():
+    # §I3 (Handoff #10): the probe endpoint — exact body pinned.
+    r = requests.get(f"{BASE}/api/health/")
+    assert r.status_code == 200 and r.json() == {"status": "ok"}, (r.status_code, r.text)
+    ok('/api/health/ → 200 {"status": "ok"} exactly (§I3)')
+
     r = requests.post(f"{BASE}/api/auth/register/", json={
         "email": "host@test.com", "password": "sturdy-pass-123", "display_name": "Quizmaster"})
     assert r.status_code in (200, 201) or "already exists" in r.text, r.text
@@ -113,6 +118,18 @@ def rest():
     cats = [c for c in r.json()["results"] if c["owner"] is None]
     assert all(c["usable_question_count"] == 5 for c in cats)
     ok(f"categories: {[c['name'] for c in cats]} (paginated, unwrapped like api.js)")
+
+    # §G (Handoff #10): the host-facing theme list — seed_demo ships themes.
+    r = requests.get(f"{BASE}/api/themes/", headers={"Authorization": f"Token {knox}"})
+    assert r.status_code == 200, r.text
+    themes = r.json()
+    assert len(themes) >= 1, themes
+    for t in themes:
+        assert set(t) == {"id", "name", "description", "categories"}, t
+        for c in t["categories"]:
+            assert set(c) == {"id", "name", "usable_question_count"}, c
+            assert isinstance(c["usable_question_count"], int)
+    ok(f"themes: {[t['name'] for t in themes]} — categories carry per-user usable counts (§G)")
 
     # shortage 400 path the host UI must surface
     r = requests.post(f"{BASE}/api/games/", headers={"Authorization": f"Token {knox}"},
@@ -214,7 +231,10 @@ async def ws_flow(code, host_tok, a_tok, a_id, b_tok, b_id, knox, fknox):
         s = (await latest_state(host))["game"]
         assert {p["name"] for p in s["participants"]} >= {"TEAM A", "TEAM B"}
         assert all(c["cells"][0]["value"] == 1 for c in s["columns"])
-        ok("snapshot on connect; drinks-mode values = row drinks")
+        # §H1 (Handoff #10): total = questions_per_category × columns at lobby.
+        total_cells = sum(len(c["cells"]) for c in s["columns"])
+        assert s["cells_remaining"] == total_cells == 15, (s.get("cells_remaining"), total_cells)
+        ok(f"snapshot on connect; drinks-mode values = row drinks; cells_remaining == {total_cells} (§H1)")
 
         async def act(ws, action, **payload):
             await ws.send(json.dumps({"action": action, **payload}))
@@ -342,6 +362,9 @@ async def ws_flow(code, host_tok, a_tok, a_id, b_tok, b_id, knox, fknox):
         assert s["current_cell"] is None
         cell = next(c for col in s["columns"] for c in col["cells"] if c["id"] == cell_id)
         assert cell["state"] == "answered"; ok("close_cell → back to board, cell answered")
+        # §H1: exactly one decrement per close (the flow plays ONE cell).
+        assert s["cells_remaining"] == total_cells - 1, s.get("cells_remaining")
+        ok(f"cells_remaining decremented to {total_cells - 1} after close_cell (§H1)")
         polled = requests.get(f"{BASE}/api/games/{code}/").json()
         assert polled["revealed_answer"] is None and the_answer not in json.dumps(polled)
         ok("revealed_answer gone from polled snapshot after close_cell (§F2)")

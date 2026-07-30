@@ -266,7 +266,9 @@ function CategoryForm({ auth, onSaved, onToast }) {
 /* ---------------- Question form ---------------- */
 
 function QuestionForm({ auth, categories, onSaved, onToast }) {
-  const [category, setCategory] = useState("");
+  // §F6 (Handoff #10): a question can live in SEVERAL categories — the old
+  // single select became a chalkboard-native checkbox list (no new deps).
+  const [selectedCats, setSelectedCats] = useState([]);
   const [questionText, setQuestionText] = useState("");
   const [answer, setAnswer] = useState("");
   const [difficulty, setDifficulty] = useState(3);
@@ -292,7 +294,10 @@ function QuestionForm({ auth, categories, onSaved, onToast }) {
     setError(null);
     try {
       const fd = new FormData();
-      fd.append("category", category);
+      // §F2: repeated `categories` entries — the API reads the list; the
+      // legacy single `category` write stays server-side for one session
+      // but this frontend is already on the new field.
+      selectedCats.forEach((id) => fd.append("categories", id));
       fd.append("question_text", questionText.trim());
       fd.append("answer", answer.trim());
       fd.append("difficulty", String(difficulty));
@@ -304,6 +309,7 @@ function QuestionForm({ auth, categories, onSaved, onToast }) {
       setQuestionText("");
       setAnswer("");
       setFile(null);
+      setSelectedCats([]);
       onSaved();
     } catch (err) {
       setError(quotaMessage(err) ?? (err instanceof ApiError && err.status === 403 ? UPSELL_403 : errorText(err)));
@@ -316,20 +322,31 @@ function QuestionForm({ auth, categories, onSaved, onToast }) {
     <section className="panel">
       <h2 className="h2">New question</h2>
       <form onSubmit={submit}>
-        <label className="field">
-          Category
-          <select value={category} onChange={(e) => setCategory(e.target.value)} required>
-            <option value="" disabled>
-              Pick a category…
-            </option>
-            {categories.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.name}
-                {c.owner === null ? " (official)" : ""}
-              </option>
-            ))}
-          </select>
-        </label>
+        <fieldset className="field catpick">
+          <legend>
+            Categories <span className="field__hint">(pick one or more — a question can live in several)</span>
+          </legend>
+          <div className="catpick__list">
+            {categories.map((c) => {
+              const on = selectedCats.includes(String(c.id));
+              return (
+                <label key={c.id} className={`catpick__item ${on ? "catpick__item--on" : ""}`}>
+                  <input
+                    type="checkbox"
+                    checked={on}
+                    onChange={() =>
+                      setSelectedCats((sel) =>
+                        on ? sel.filter((x) => x !== String(c.id)) : [...sel, String(c.id)],
+                      )
+                    }
+                  />
+                  {c.name}
+                  {c.owner === null ? " (official)" : ""}
+                </label>
+              );
+            })}
+          </div>
+        </fieldset>
         <label className="field">
           Question
           <textarea value={questionText} onChange={(e) => setQuestionText(e.target.value)} required rows={3} maxLength={500} />
@@ -368,7 +385,10 @@ function QuestionForm({ auth, categories, onSaved, onToast }) {
         )}
         <VisibilityPick value={visibility} onChange={setVisibility} />
         {error && <p className="formerror">{error}</p>}
-        <button className="btn btn--primary" disabled={busy || !category || !questionText.trim() || !answer.trim()}>
+        <button
+          className="btn btn--primary"
+          disabled={busy || selectedCats.length === 0 || !questionText.trim() || !answer.trim()}
+        >
           {busy ? "Saving…" : "Add question"}
         </button>
       </form>
@@ -474,7 +494,8 @@ function BulkUpload({ auth, isStaff, onImported, onToast }) {
       <h2 className="h2">Bulk upload</h2>
       <p className="footnote">
         One file instead of one form per question — up to 500 rows. Columns:{" "}
-        <code>category,question_text,answer,difficulty,visibility</code>. For media questions, upload a{" "}
+        <code>category,question_text,answer,difficulty,visibility</code>. A question can go in several
+        categories at once — separate the names with a pipe: <code>TV|80s</code>. For media questions, upload a{" "}
         <strong>.zip</strong> with the CSV at its root plus the files, adding <code>media_type</code> and{" "}
         <code>media_file</code> (path inside the zip) columns.{" "}
         <a className="bulklink" href="/question-template.csv" download>
@@ -653,9 +674,11 @@ function MyContent({ auth, mine, allCategories, onChanged, onToast }) {
               Make private
             </button>
           )}
+          {/* §F5: deleting a category no longer touches its questions —
+              they stay in your list and can be recategorized. */}
           <DeleteButton
-            label="category and its questions"
-            onDelete={() => act(() => api.deleteCategory(auth.token, c.id), `Deleted “${c.name}”.`)}
+            label="category (its questions stay in your list)"
+            onDelete={() => act(() => api.deleteCategory(auth.token, c.id), `Deleted “${c.name}” — its questions are still yours.`)}
           />
         </div>
       ))}
@@ -665,7 +688,10 @@ function MyContent({ auth, mine, allCategories, onChanged, onToast }) {
           <div className="ownrow__main">
             <span className="ownrow__q">{q.question_text}</span>
             <span className="ownrow__meta">
-              {catName(q.category)} · difficulty {q.difficulty} · {q.media_type === "none" ? "text" : q.media_type}
+              {/* §F6: all of the question's categories (ids from the API,
+                  resolved against the visible category list). */}
+              {(q.categories ?? []).map(catName).join(" · ") || "no live categories"} · difficulty {q.difficulty} ·{" "}
+              {q.media_type === "none" ? "text" : q.media_type}
             </span>
           </div>
           <ModerationBadge item={q} />

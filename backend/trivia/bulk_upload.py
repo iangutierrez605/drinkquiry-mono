@@ -90,9 +90,12 @@ def eligible_categories(user, official: bool):
 
     Same rule as Category.accepts_questions_from (official | own | publicly
     visible), expressed as a queryset; official uploads match official
-    categories only.
+    categories only. §F5: deleted categories are never eligible — a row whose
+    name only matches a deleted category reads as "no such category", so
+    with create_categories on, a FRESH one is created (the partial unique
+    constraint permits the name reuse).
     """
-    qs = Category.objects.all()
+    qs = Category.objects.filter(deleted_at__isnull=True)
     if official:
         return qs.filter(owner__isnull=True)
     return qs.filter(
@@ -225,15 +228,18 @@ def _parse_csv_text(text, user, *, official: bool, skip_duplicates: bool,
         exact.setdefault(c.name.strip(), []).append(c)
         folded.setdefault(c.name.strip().casefold(), []).append(c)
 
-    # Existing (category_id, question_text) pairs for duplicate detection.
+    # §F2 (Handoff #10) — BEHAVIOR CHANGE, decided: the dedupe key is now
+    # (owner, question_text); category dropped out of it. Same text in two
+    # categories is ONE question in both — that's the whole point of §F.
+    # (Owner is the queryset filter below, so the in-memory key is the text.)
     owner_filter = {"owner__isnull": True} if official else {"owner": user}
     # §I (Handoff #9): a soft-deleted question is not a duplicate — deleting
     # one and re-uploading the same text must work.
     existing = set(
         Question.objects.filter(deleted_at__isnull=True, **owner_filter)
-        .values_list("category_id", "question_text")
+        .values_list("question_text", flat=True)
     )
-    seen_in_file: set[tuple, ] = set()
+    seen_in_file: set[str] = set()
 
     data_rows = list(reader)
     if len(data_rows) > MAX_ROWS:
@@ -249,12 +255,24 @@ def _parse_csv_text(text, user, *, official: bool, skip_duplicates: bool,
         if all(not get(col) for col in all_columns):
             continue  # silently ignore fully blank lines (trailing newlines etc.)
 
-        name = get("category")
-        category = None
-        new_cat_key = None
-        if not name:
+        # §F2 (Handoff #10): the category column accepts MULTIPLE names
+        # separated by a pipe — `TV|80s` (pipe, not comma: it's a CSV). Each
+        # name resolves or auto-creates exactly as one did; the row errors if
+        # ANY of its names is ambiguous/ineligible (same row-error shape).
+        raw_names = get("category")
+        # cat_tokens: resolved Category objects and ("new", key) markers for
+        # names scheduled for auto-creation, in row order, de-duped.
+        cat_tokens: list = []
+        cat_error = False
+        names = []
+        for part in raw_names.split("|"):
+            part = part.strip()
+            if part and part.casefold() not in {n.casefold() for n in names}:
+                names.append(part)
+        if not names:
             err(row_num, "category", "Category name is required.")
-        else:
+            cat_error = True
+        for name in names:
             candidates = exact.get(name) or folded.get(name.casefold()) or []
             if not candidates:
                 if create_categories:
@@ -262,12 +280,17 @@ def _parse_csv_text(text, user, *, official: bool, skip_duplicates: bool,
                     # insensitive on the trimmed name; first casing wins).
                     new_cat_key = name.casefold()
                     result.new_categories.setdefault(new_cat_key, name)
+                    cat_tokens.append(("new", new_cat_key))
                 else:
                     err(row_num, "category", f'No category named "{name}" that you can add questions to.')
+                    cat_error = True
             else:
                 category, problem = _pick_category(name, candidates, user)
                 if problem:
                     err(row_num, "category", problem)
+                    cat_error = True
+                else:
+                    cat_tokens.append(category)
 
         question_text = get("question_text")
         if not question_text:
@@ -331,17 +354,17 @@ def _parse_csv_text(text, user, *, official: bool, skip_duplicates: bool,
                 else:
                     media_path = norm
 
-        if (category is None and new_cat_key is None) or not question_text:
-            continue  # can't duplicate-check without both
+        if cat_error or not cat_tokens or not question_text:
+            continue  # can't duplicate-check / create without valid categories + text
 
-        cat_key = category.id if category is not None else ("new", new_cat_key)
-        key = (cat_key, question_text)
-        if key in existing or key in seen_in_file:
+        # §F2: the dedupe key is the text alone (owner is the queryset scope
+        # above) — same text in a second category is a duplicate NOW.
+        if question_text in existing or question_text in seen_in_file:
             if skip_duplicates:
                 result.skipped.append(row_num)
                 continue
             # skip_duplicates=false: duplicates are created, not errored (§G2).
-        seen_in_file.add(key)
+        seen_in_file.add(question_text)
 
         if media_type != MediaType.NONE:
             result.media_files += 1
@@ -349,8 +372,7 @@ def _parse_csv_text(text, user, *, official: bool, skip_duplicates: bool,
                 result.media_bytes_total += info.file_size  # §F3 batch storage check input
         result.rows.append(
             {
-                "category": category,
-                "new_category": new_cat_key,
+                "categories": cat_tokens,  # Category objects + ("new", key) markers
                 "question_text": question_text,
                 "answer": answer,
                 "difficulty": difficulty,
@@ -393,7 +415,12 @@ def create_rows(rows: list[dict], user, *, official: bool,
     """
     category_map = category_map or {}
     for row in rows:
-        category = row["category"] if row["category"] is not None else category_map[row["new_category"]]
+        # §F2: resolve the row's category tokens — real Category objects pass
+        # through; ("new", key) markers resolve via the just-created map.
+        categories = [
+            token if not isinstance(token, tuple) else category_map[token[1]]
+            for token in row["categories"]
+        ]
         if official:
             owner, visibility, mod_status = None, Visibility.PUBLIC, ModerationStatus.APPROVED
         else:
@@ -408,8 +435,7 @@ def create_rows(rows: list[dict], user, *, official: bool,
             data = archive.read(row["media_file"])
             filename = posixpath.basename(row["media_file"]) or "media"
             media_kwargs[field_name] = ContentFile(data, name=filename)
-        Question.objects.create(
-            category=category,
+        question = Question.objects.create(
             owner=owner,
             question_text=row["question_text"],
             answer=row["answer"],
@@ -419,4 +445,5 @@ def create_rows(rows: list[dict], user, *, official: bool,
             media_type=row["media_type"],
             **media_kwargs,
         )
+        question.categories.set(categories)
     return len(rows)

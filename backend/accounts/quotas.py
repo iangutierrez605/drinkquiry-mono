@@ -75,8 +75,11 @@ def games_used_this_month(user) -> int:
 
 
 def categories_used(user) -> int:
+    # §F5 (Handoff #10): soft-deleted categories free their quota slot —
+    # same convention questions adopted in #9 (and the same C6-audit lesson:
+    # quota counters are an "active" surface).
     Category = apps.get_model("trivia", "Category")
-    return Category.objects.filter(owner=user).count()
+    return Category.objects.filter(owner=user, deleted_at__isnull=True).count()
 
 
 def questions_used(user) -> int:
@@ -103,7 +106,14 @@ def storage_bytes_used(user) -> int:
         .aggregate(total=Sum("media_bytes"))["total"]
         or 0
     )
-    c = Category.objects.filter(owner=user).aggregate(total=Sum("photo_bytes"))["total"] or 0
+    # §F5: deleted categories don't count against storage either (their
+    # files stay on disk for history — the same deliberate mismatch noted
+    # for questions in #9).
+    c = (
+        Category.objects.filter(owner=user, deleted_at__isnull=True)
+        .aggregate(total=Sum("photo_bytes"))["total"]
+        or 0
+    )
     return q + c
 
 

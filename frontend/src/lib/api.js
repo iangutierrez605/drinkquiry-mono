@@ -232,6 +232,21 @@ export const api = {
       body: reason ? { reason } : {},
     }),
 
+  // ---- §G (Handoff #10): themes ----
+  // Host-facing discovery list (active themes, per-user visible categories
+  // with per-user usable counts). Unpaginated, staff-curated scale.
+  themes: (token) => request("/api/themes/", { authToken: token }),
+  // Staff CRUD (IsAdminUser server-side; the tab's is_staff gate is
+  // cosmetic). Unpaginated list — plain array.
+  moderationThemes: (token) => request("/api/moderation/themes/", { authToken: token }),
+  createTheme: (token, body) =>
+    request("/api/moderation/themes/", { method: "POST", authToken: token, body }),
+  updateTheme: (token, id, changes) =>
+    request(`/api/moderation/themes/${id}/`, { method: "PATCH", authToken: token, body: changes }),
+  // Soft delete; 409 = someone else already deleted it.
+  deleteTheme: (token, id) =>
+    request(`/api/moderation/themes/${id}/`, { method: "DELETE", authToken: token }),
+
   // ---- Games ----
   createGame: (token, { mode, categories, questions_per_category }) =>
     request("/api/games/", { method: "POST", authToken: token, body: { mode, categories, questions_per_category } }),

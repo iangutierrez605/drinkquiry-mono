@@ -100,7 +100,7 @@ function Shell({ user, children }) {
 /* ---------------- Queue ---------------- */
 
 function ReviewQueue({ auth, profile }) {
-  const [tab, setTab] = useState("questions"); // questions | categories | flagged | library | users
+  const [tab, setTab] = useState("questions"); // questions | categories | flagged | library | users | themes
   const [items, setItems] = useState(null); // pending items for the active QUEUE tab
   const [counts, setCounts] = useState(null);
   const [loadError, setLoadError] = useState(null);
@@ -164,10 +164,14 @@ function ReviewQueue({ auth, profile }) {
         <button className={`tab ${tab === "users" ? "tab--on" : ""}`} onClick={() => setTab("users")}>
           Users
         </button>
+        <button className={`tab ${tab === "themes" ? "tab--on" : ""}`} onClick={() => setTab("themes")}>
+          Themes
+        </button>
       </div>
 
       {tab === "library" && <LibraryTab auth={auth} onToast={setToast} />}
       {tab === "users" && <UsersTab auth={auth} onToast={setToast} />}
+      {tab === "themes" && <ThemesTab auth={auth} onToast={setToast} />}
 
       {queueTab && (
         <>
@@ -269,7 +273,8 @@ function QuestionCard({ auth, item, onActed, onConflict, onToast }) {
   return (
     <section className="panel modcard">
       <div className="modcard__meta">
-        <span className="modcard__cat">{item.category_name}</span>
+        {/* §F4: a question can live in several categories now. */}
+        <span className="modcard__cat">{(item.category_names ?? []).join(" · ")}</span>
         <span>difficulty {item.difficulty}</span>
         <span>{item.visibility}</span>
         {item.usage_count != null && <UsageBadge count={item.usage_count} />}
@@ -358,7 +363,7 @@ function SimilarMatches({ auth, questionId }) {
               {m.question_text} <em className="similar__answer">→ {m.answer}</em>
             </span>
             <span className="similar__usage">
-              {m.category_name} · played {m.usage_count}×
+              {(m.category_names ?? []).join(" · ")} · played {m.usage_count}×
             </span>
           </li>
         ))}
@@ -394,7 +399,7 @@ function FlaggedCard({ auth, item, onActed, onConflict, onToast }) {
   return (
     <section className="panel modcard modcard--flagged">
       <div className="modcard__meta">
-        <span className="modcard__cat">{item.category_name}</span>
+        <span className="modcard__cat">{(item.category_names ?? []).join(" · ")}</span>
         <span className="flagcount">🚩 {item.report_count} open flag{item.report_count === 1 ? "" : "s"}</span>
         <span className={`modbadge modbadge--${item.moderation_status}`}>{item.moderation_status}</span>
         {item.usage_count != null && <UsageBadge count={item.usage_count} />}
@@ -630,7 +635,7 @@ function LibraryRow({ auth, row, onToast, onRevised, onDeleted }) {
     <section className={`panel librow ${isDeleted ? "librow--deleted" : ""}`}>
       <div className="librow__main">
         <div className="librow__meta">
-          <span className="modcard__cat">{row.category_name}</span>
+          <span className="modcard__cat">{(row.category_names ?? []).join(" · ")}</span>
           <span className={`modbadge modbadge--${row.moderation_status}`}>{row.moderation_status}</span>
           {isDeleted && <span className="modbadge modbadge--deleted">deleted</span>}
           {isDeleted && row.replaced_by && <span className="librow__superseded">superseded by #{row.replaced_by}</span>}
@@ -990,5 +995,231 @@ function UserRow({ auth, user, onToast, onSaved }) {
         </div>
       )}
     </section>
+  );
+}
+
+/* ---------------- §G4 (Handoff #10): the Themes tab ---------------- */
+
+/**
+ * Staff-curated tag table: a theme groups categories so hosts can find "all
+ * music categories" in one tap on /host. List + inline create/edit (name,
+ * description, category multi-select fed by api.categories) + soft delete
+ * with confirm — the Library tab's row/form patterns, reused. Unpaginated
+ * (staff-curated scale). Everything is IsAdminUser server-side.
+ */
+function ThemesTab({ auth, onToast }) {
+  const [themes, setThemes] = useState(null);
+  const [categories, setCategories] = useState(null);
+  const [error, setError] = useState(null);
+  const [creating, setCreating] = useState(false);
+
+  const refresh = useCallback(() => {
+    api
+      .moderationThemes(auth.token)
+      .then((list) => {
+        setThemes(list);
+        setError(null);
+      })
+      .catch((err) => setError(errorText(err)));
+  }, [auth.token]);
+
+  useEffect(() => {
+    refresh();
+    api.categories(auth.token).then(setCategories).catch(() => setCategories([]));
+  }, [auth.token, refresh]);
+
+  return (
+    <>
+      <p className="footnote">
+        Themes are the host screen's one-tap category groups ("all music categories"). Official-only
+        for now — creators can't author themes yet. Game creation itself never sees themes; they only
+        filter and pre-select the category grid.
+      </p>
+      {error && <p className="formerror formerror--block">{error}</p>}
+      {!themes && !error && <p>Loading themes…</p>}
+
+      {creating ? (
+        <section className="panel">
+          <h2 className="h2">New theme</h2>
+          <ThemeForm
+            auth={auth}
+            categories={categories ?? []}
+            onCancel={() => setCreating(false)}
+            onDone={() => {
+              setCreating(false);
+              onToast("Theme created.");
+              refresh();
+            }}
+          />
+        </section>
+      ) : (
+        <button className="btn btn--primary btn--sm" onClick={() => setCreating(true)}>
+          + New theme
+        </button>
+      )}
+
+      {themes?.length === 0 && (
+        <section className="panel panel--center">
+          <p className="footnote">No themes yet — group some categories to give hosts a head start.</p>
+        </section>
+      )}
+      {themes?.map((theme) => (
+        <ThemeRow
+          key={theme.id}
+          auth={auth}
+          theme={theme}
+          categories={categories ?? []}
+          onToast={onToast}
+          onChanged={refresh}
+        />
+      ))}
+    </>
+  );
+}
+
+function ThemeRow({ auth, theme, categories, onToast, onChanged }) {
+  const [editing, setEditing] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const del = async () => {
+    setBusy(true);
+    try {
+      await api.deleteTheme(auth.token, theme.id);
+      onToast(`Deleted “${theme.name}” — hosts no longer see it. Its categories are untouched.`);
+      onChanged();
+    } catch (err) {
+      // 409: someone else beat us to it — refreshing drops the row anyway.
+      onToast(err?.status === 409 ? "Already deleted by someone else." : errorText(err));
+      if (err?.status === 409) onChanged();
+    } finally {
+      setBusy(false);
+      setConfirmDelete(false);
+    }
+  };
+
+  return (
+    <section className="panel librow">
+      <div className="librow__main">
+        <div className="librow__meta">
+          <span className="modcard__cat">theme</span>
+          <span>
+            {theme.category_names.length} categor{theme.category_names.length === 1 ? "y" : "ies"}
+          </span>
+          <span className="modcard__when">{new Date(theme.created_at).toLocaleDateString()}</span>
+        </div>
+        <p className="librow__q">{theme.name}</p>
+        {theme.description && <p className="footnote">{theme.description}</p>}
+        <p className="librow__a">{theme.category_names.join(" · ") || "no categories yet"}</p>
+      </div>
+      {!editing && (
+        <div className="librow__actions">
+          <button className="btn btn--ghost btn--sm" onClick={() => setEditing(true)}>
+            ✏️ Edit
+          </button>
+          {confirmDelete ? (
+            <span className="confirmrow">
+              <button className="btn btn--danger btn--sm" disabled={busy} onClick={del}>
+                {busy ? "Deleting…" : "Confirm delete"}
+              </button>
+              <button className="btn btn--ghost btn--sm" disabled={busy} onClick={() => setConfirmDelete(false)}>
+                Cancel
+              </button>
+            </span>
+          ) : (
+            <button className="btn btn--ghost btn--sm" onClick={() => setConfirmDelete(true)}>
+              🗑 Delete
+            </button>
+          )}
+        </div>
+      )}
+      {editing && (
+        <ThemeForm
+          auth={auth}
+          theme={theme}
+          categories={categories}
+          onCancel={() => setEditing(false)}
+          onDone={() => {
+            setEditing(false);
+            onToast("Theme saved.");
+            onChanged();
+          }}
+        />
+      )}
+    </section>
+  );
+}
+
+/** Shared create/edit form. `theme` present = edit (PATCH), absent = create. */
+function ThemeForm({ auth, theme, categories, onCancel, onDone }) {
+  const [name, setName] = useState(theme?.name ?? "");
+  const [description, setDescription] = useState(theme?.description ?? "");
+  const [selected, setSelected] = useState(() => (theme?.categories ?? []).map(String));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    const body = {
+      name: name.trim(),
+      description: description.trim(),
+      categories: selected.map(Number),
+    };
+    try {
+      if (theme) await api.updateTheme(auth.token, theme.id, body);
+      else await api.createTheme(auth.token, body);
+      onDone();
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form className="reviseform" onSubmit={submit}>
+      <label className="field">
+        Name
+        <input value={name} onChange={(e) => setName(e.target.value)} required maxLength={100} />
+      </label>
+      <label className="field">
+        Description <span className="field__hint">(optional)</span>
+        <input value={description} onChange={(e) => setDescription(e.target.value)} maxLength={300} />
+      </label>
+      <fieldset className="field catpick">
+        <legend>Categories in this theme</legend>
+        <div className="catpick__list">
+          {categories.map((c) => {
+            const on = selected.includes(String(c.id));
+            return (
+              <label key={c.id} className={`catpick__item ${on ? "catpick__item--on" : ""}`}>
+                <input
+                  type="checkbox"
+                  checked={on}
+                  onChange={() =>
+                    setSelected((sel) =>
+                      on ? sel.filter((x) => x !== String(c.id)) : [...sel, String(c.id)],
+                    )
+                  }
+                />
+                {c.name}
+                {c.owner === null ? " (official)" : ""}
+              </label>
+            );
+          })}
+        </div>
+      </fieldset>
+      {error && <p className="formerror">{error}</p>}
+      <div className="modcard__actions">
+        <button className="btn btn--primary btn--sm" disabled={busy || !name.trim()}>
+          {busy ? "Saving…" : theme ? "Save theme" : "Create theme"}
+        </button>
+        <button type="button" className="btn btn--ghost btn--sm" disabled={busy} onClick={onCancel}>
+          Cancel
+        </button>
+      </div>
+    </form>
   );
 }

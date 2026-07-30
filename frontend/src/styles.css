@@ -896,3 +896,60 @@ code { font-family: var(--font-mono); color: var(--teal); font-size: 0.9em; }
 /* ---------- §K password panels ---------- */
 .pwform { display: flex; flex-direction: column; gap: 10px; max-width: 380px; }
 .pwform__btns { display: flex; gap: 10px; }
+
+/* ---------------- Handoff #10 ---------------- */
+
+/* §F6: multi-category checkbox picker (question form + theme form) */
+.catpick { border: 1px dashed var(--line); border-radius: 8px; padding: 10px 12px; }
+.catpick legend { color: var(--dim); font-size: 0.85rem; padding: 0 6px; }
+.catpick__list { display: flex; flex-wrap: wrap; gap: 8px; }
+.catpick__item {
+  display: inline-flex; align-items: center; gap: 6px;
+  border: 1px solid var(--line); border-radius: 999px;
+  padding: 4px 12px; cursor: pointer; color: var(--dim);
+  font-size: 0.9rem; user-select: none;
+}
+.catpick__item input { accent-color: var(--teal); }
+.catpick__item--on { color: var(--paper); border-color: var(--teal); background: rgba(147, 213, 169, 0.08); }
+
+/* §G3: theme strip above the host category grid */
+.themestrip { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 14px; }
+.themechip {
+  font-family: var(--font-body); font-size: 0.9rem;
+  border: 1px solid var(--line); border-radius: 999px;
+  background: transparent; color: var(--dim);
+  padding: 6px 14px; cursor: pointer;
+}
+.themechip:hover:not(:disabled) { color: var(--paper); border-color: var(--paper); }
+.themechip--on { color: var(--ink); background: var(--teal); border-color: var(--teal); font-weight: 600; }
+.themechip:disabled { opacity: 0.45; cursor: not-allowed; }
+.themechip__hint { font-size: 0.78rem; font-style: italic; }
+.themestrip__actions { display: inline-flex; align-items: center; gap: 10px; margin-left: auto; }
+.themestrip__count {
+  color: var(--gold); font-size: 0.85rem; border: 1px dashed var(--gold);
+  border-radius: 999px; padding: 3px 10px;
+}
+
+/* §H2: host board-complete banner */
+.boarddone {
+  border: 2px solid var(--gold); border-radius: 12px;
+  background: rgba(237, 166, 63, 0.08);
+  text-align: center; padding: 18px 16px; margin: 0 0 14px;
+}
+.boarddone__title { font-family: var(--font-display); font-size: 1.9rem; letter-spacing: 0.04em; margin: 0; color: var(--gold); }
+.boarddone__sub { color: var(--dim); margin: 4px 0 12px; }
+
+/* §H3: TV quiet all-played line */
+.tv__allplayed { text-align: center; color: var(--dim); font-family: var(--font-hand); font-size: 1.5rem; margin: 14px 0 0; }
+
+/* §H4: buzzer game-over finale */
+.buzzover { align-items: center; text-align: center; }
+.buzzover__trophy { font-size: 4rem; line-height: 1; margin-top: 18px; animation: trophyPop 0.6s ease-out; }
+@keyframes trophyPop { from { transform: scale(0.3); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+.buzzover__title {
+  font-family: var(--font-display); font-size: clamp(3rem, 14vw, 4.5rem);
+  color: var(--gold); letter-spacing: 0.06em; margin: 10px 0 4px;
+}
+.buzzover__winner { color: var(--teal); font-family: var(--font-hand); font-size: 1.6rem; margin: 0 0 8px; }
+.buzzover .final { width: 100%; max-width: 420px; }
+.buzzover__foot { margin-top: 14px; }
