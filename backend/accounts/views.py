@@ -21,12 +21,40 @@ from .throttling import (
     PasswordResetRateThrottle,
     RegisterRateThrottle,
 )
+from .turnstile import turnstile_enabled, verify_turnstile
 
 
 class RegisterView(generics.CreateAPIView):
     serializer_class = UserSerializer
     permission_classes = (permissions.AllowAny,)
     throttle_classes = (RegisterRateThrottle,)  # §I2: 5/min per IP
+
+    def create(self, request, *args, **kwargs):
+        """§F (Handoff #12): layered bot gates, BEFORE the serializer runs.
+        A view override, not middleware — the gates belong to the one view
+        they protect. Both 400 bodies are NEW documented shapes (C4: added,
+        nothing mutated); both are deliberately vague (never name the field,
+        never hint the mechanism).
+        """
+        # F1 — honeypot, always on: the register form renders a decoy
+        # `website` input that humans never see. A NON-EMPTY value is a bot;
+        # an empty or absent key proceeds normally, so every existing client
+        # (and the smoke, C12) is untouched.
+        if str(request.data.get("website") or "").strip():
+            return Response({"detail": "Registration failed."}, status=status.HTTP_400_BAD_REQUEST)
+        # F2 — Cloudflare Turnstile, opt-in via env (ON iff the secret is
+        # set; entirely absent otherwise — a stray turnstile_token is
+        # ignored when OFF). Verification fails CLOSED (see turnstile.py).
+        print('check turnstile')
+        if turnstile_enabled():
+            print('turnstile is enabled', turnstile_enabled)
+            token = str(request.data.get("turnstile_token") or "")
+            if not verify_turnstile(token, remoteip=request.META.get("REMOTE_ADDR")):
+                return Response(
+                    {"detail": "Verification failed — please try again."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        return super().create(request, *args, **kwargs)
 
 
 class LoginView(KnoxLoginView):

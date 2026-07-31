@@ -19,6 +19,13 @@ function defaultApiBase() {
 }
 
 export const API_BASE = (import.meta.env.VITE_API_BASE ?? defaultApiBase()).replace(/\/$/, "");
+
+// §H (Handoff #12): the ONE place the support address lives (C1). Rendered
+// as mailto: links in the site footer, the auth screen, the buzzer's
+// no-such-game branch and the 404 page. NOTE (owner-run): Resend is
+// send-only — the mailbox itself must exist as a forward/alias at the
+// domain's mail hosting, or mail to it bounces.
+export const SUPPORT_EMAIL = "support@drinkquiry.com";
 export const WS_BASE = API_BASE
   ? API_BASE.replace(/^http/, "ws")
   : typeof window === "undefined"
@@ -153,6 +160,9 @@ export const api = {
     }),
 
   // ---- Content ----
+  // §G (Handoff #12): the anonymous shop window — no token, deliberately
+  // unthrottled server-side. {id, name, description, photo, question_count}.
+  publicCategories: () => allPages("/api/categories/public/"),
   categories: (token) => allPages("/api/categories/", token),
   questions: (categoryId, token) =>
     allPages(categoryId ? `/api/questions/?category=${categoryId}` : "/api/questions/", token),

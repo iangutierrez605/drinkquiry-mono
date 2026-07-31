@@ -66,6 +66,10 @@ export default function SiteNav() {
         DRINKQUIRY
       </Link>
       <div className="sitenav__links">
+        {/* §G2 (Handoff #12): useful discovery logged-out AND logged-in. */}
+        <NavLink to="/categories" className={navClass}>
+          Categories
+        </NavLink>
         <NavLink to="/host" className={navClass}>
           Host
         </NavLink>
@@ -85,7 +89,10 @@ export default function SiteNav() {
         {auth ? (
           <>
             <span className="sitenav__user" title={auth.user?.email}>
-              {auth.user?.display_name || auth.user?.email}
+              {/* §I (Handoff #12): NEVER the full email — a blank display
+                  name falls back to the email's local-part ("sam", not
+                  "sam@gmail.com"). The full address stays in the tooltip. */}
+              {auth.user?.display_name || (auth.user?.email || "").split("@")[0]}
             </span>
             <button type="button" className="btn btn--ghost btn--sm" onClick={logout}>
               Log out

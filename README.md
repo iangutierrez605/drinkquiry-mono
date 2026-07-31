@@ -2,6 +2,8 @@
 
 Quiz-show-style trivia platform where correct answers let you assign drinks (or points) to other teams. Django 6 + DRF + Channels backend, fully dockerized.
 
+Support: **support@drinkquiry.com** (the address in the site footer — the mailbox itself is a forward/alias at the domain's mail hosting; Resend only sends).
+
 ## Quick start
 
 ```bash

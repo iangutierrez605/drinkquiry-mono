@@ -1,6 +1,13 @@
-import { useState } from "react";
-import { api, errorText } from "../lib/api";
+import { useEffect, useRef, useState } from "react";
+import { api, errorText, SUPPORT_EMAIL } from "../lib/api";
 import { saveAuth } from "../lib/storage";
+
+// §F2 (Handoff #12): the Turnstile SITE key reaches the SPA at build time
+// (the VITE_API_BASE pattern). Absent → no script, no widget, no token sent —
+// the site runs exactly as before. The backend independently requires/skips
+// the token on its own TURNSTILE_SECRET_KEY (rule 4: the server is the gate).
+const TURNSTILE_SITE_KEY = import.meta.env.VITE_TURNSTILE_SITE_KEY || "";
+const TURNSTILE_SRC = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
 
 /**
  * §F1 (Handoff #9): the shared login/register screen, extracted from
@@ -22,6 +29,56 @@ export default function AuthScreen({ onAuthed }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [forgotSent, setForgotSent] = useState(false);
+  // §F1: the decoy field. Humans never see it (off-screen, aria-hidden,
+  // tabIndex -1); form-filling bots love a field named "website". Sent as-is
+  // — the SERVER rejects a non-empty value (this render is cosmetic, rule 4).
+  const [website, setWebsite] = useState("");
+  // §F2: the solved-challenge token (empty when the widget is absent/unsolved).
+  const [turnstileToken, setTurnstileToken] = useState("");
+  const turnstileRef = useRef(null);
+
+  // §F2: load + render the Turnstile widget for REGISTER only, and only when
+  // a site key was baked in. Login stays widget-free (its throttle is its
+  // defense — no friction for returning users). Hooks before the forgot-mode
+  // early return below (C11).
+  useEffect(() => {
+    if (!TURNSTILE_SITE_KEY || mode !== "register") return undefined;
+    let widgetId = null;
+    let alive = true;
+    const render = () => {
+      if (!alive || !window.turnstile || !turnstileRef.current) return;
+      widgetId = window.turnstile.render(turnstileRef.current, {
+        sitekey: TURNSTILE_SITE_KEY,
+        callback: (t) => setTurnstileToken(t),
+        "expired-callback": () => setTurnstileToken(""),
+        "error-callback": () => setTurnstileToken(""),
+      });
+    };
+    const existing = document.querySelector("script[data-dq-turnstile]");
+    if (window.turnstile) render();
+    else if (existing) existing.addEventListener("load", render);
+    else {
+      const s = document.createElement("script");
+      s.src = TURNSTILE_SRC;
+      s.async = true;
+      s.defer = true;
+      s.setAttribute("data-dq-turnstile", "1");
+      s.addEventListener("load", render);
+      document.head.appendChild(s);
+    }
+    return () => {
+      alive = false;
+      if (existing) existing.removeEventListener("load", render);
+      if (widgetId != null && window.turnstile) {
+        try {
+          window.turnstile.remove(widgetId);
+        } catch {
+          /* widget already gone */
+        }
+      }
+      setTurnstileToken("");
+    };
+  }, [mode]);
 
   const submit = async (e) => {
     e.preventDefault();
@@ -39,6 +96,11 @@ export default function AuthScreen({ onAuthed }) {
           password,
           display_name: displayName,
           ...(dob ? { date_of_birth: dob } : {}),
+          // §F1: usually "" (which the server waves through); a bot-filled
+          // value earns the vague 400 server-side.
+          website,
+          // §F2: only sent when the widget rendered and was solved.
+          ...(turnstileToken ? { turnstile_token: turnstileToken } : {}),
         });
       }
       const res = await api.login(email, password); // Knox basic-auth login
@@ -135,6 +197,29 @@ export default function AuthScreen({ onAuthed }) {
             <input type="date" value={dob} onChange={(e) => setDob(e.target.value)} />
           </label>
         )}
+        {mode === "register" && (
+          /* §F1: the honeypot. Off-screen absolute positioning (NOT
+             display:none alone — some form-fillers skip hidden inputs),
+             aria-hidden, out of the tab order, autocomplete off. Humans
+             never touch it; the server rejects a filled value. */
+          <div className="hp-field" aria-hidden="true">
+            <label htmlFor="dq-website">Website</label>
+            <input
+              id="dq-website"
+              name="website"
+              type="text"
+              tabIndex={-1}
+              autoComplete="off"
+              value={website}
+              onChange={(e) => setWebsite(e.target.value)}
+            />
+          </div>
+        )}
+        {mode === "register" && TURNSTILE_SITE_KEY && (
+          /* §F2: the challenge renders here only when a site key is baked
+             into the build. */
+          <div ref={turnstileRef} className="turnstile-slot" />
+        )}
         {error && <p className="formerror">{error}</p>}
         <button className="btn btn--primary" disabled={busy}>
           {busy ? "…" : mode === "login" ? "Log in" : "Create account & log in"}
@@ -147,6 +232,10 @@ export default function AuthScreen({ onAuthed }) {
       </form>
       <p className="footnote">
         Players don't need accounts — only the host logs in. Buzzers join at <code>/game/buzzer/CODE</code>.
+      </p>
+      {/* §H2 (Handoff #12): login trouble is THE support moment. */}
+      <p className="footnote">
+        Stuck? <a className="supportlink" href={`mailto:${SUPPORT_EMAIL}`}>{SUPPORT_EMAIL}</a>
       </p>
     </div>
   );

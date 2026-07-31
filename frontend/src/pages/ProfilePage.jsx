@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api, errorText, mediaUrl } from "../lib/api";
-import { loadAuth, onAuthChange } from "../lib/storage";
+import { loadAuth, onAuthChange, saveAuth } from "../lib/storage";
 import { Toast, UsageMeterLine } from "../components/shared";
 import AuthScreen from "../components/AuthScreen";
 
@@ -21,13 +21,13 @@ export default function ProfilePage() {
   const [auth, setAuth] = useState(loadAuth());
   // §F: nav logout / dead-token cleanup flips this page to the login screen.
   useEffect(() => onAuthChange(() => setAuth(loadAuth())), []);
+  // §I (Handoff #12): stable identity — saving a display name announces an
+  // auth change (saveAuth), which re-renders this page; an inline arrow here
+  // would hand ProfileBody a fresh onAuthGone and re-trigger its load effect
+  // on every save.
+  const authGone = useCallback(() => setAuth(null), []); // Knox token died mid-visit → login form
   if (!auth) return <AuthScreen onAuthed={setAuth} />;
-  return (
-    <ProfileBody
-      auth={auth}
-      onAuthGone={() => setAuth(null)} // Knox token died mid-visit → login form
-    />
-  );
+  return <ProfileBody auth={auth} onAuthGone={authGone} />;
 }
 
 function ProfileBody({ auth, onAuthGone }) {
@@ -35,6 +35,19 @@ function ProfileBody({ auth, onAuthGone }) {
   const [games, setGames] = useState(null);
   const [loadError, setLoadError] = useState(null);
   const [toast, setToast] = useState(null);
+
+  // §I (Handoff #12): kill navbar staleness. Every successful profile PATCH
+  // (display-name save, branding save/clear) returns the USER object
+  // directly (profile serializer) — merge it into the stored auth, keeping
+  // the token (login returned {token, user}; updateProfile does NOT). The
+  // existing AUTH_EVENT plumbing makes the SiteNav flip instantly.
+  const applyFreshProfile = useCallback(
+    (fresh) => {
+      setProfile(fresh);
+      saveAuth({ token: auth.token, user: fresh });
+    },
+    [auth.token],
+  );
 
   useEffect(() => {
     let alive = true;
@@ -66,12 +79,22 @@ function ProfileBody({ auth, onAuthGone }) {
         <section className="panel">
           <h2 className="h2">Account</h2>
           <div className="idblock">
-            <div className="idblock__name">{profile.display_name || profile.email}</div>
+            {/* §I: same rule as the navbar — never render the full email as
+                a name; a blank display name reads as the local-part. */}
+            <div className="idblock__name">
+              {profile.display_name || (profile.email || "").split("@")[0]}
+            </div>
             <div className="idblock__mail">{profile.email}</div>
             <span className={`planchip ${profile.plan !== "free" ? "planchip--paid" : ""}`}>
               {profile.plan} plan
             </span>
           </div>
+          <DisplayNameEdit
+            token={auth.token}
+            profile={profile}
+            onSaved={applyFreshProfile}
+            onToast={setToast}
+          />
           <UsageMeterLine
             entries={[
               { used: profile.usage?.games_this_month?.used, block: profile.usage?.games_this_month, noun: "games this month" },
@@ -96,7 +119,7 @@ function ProfileBody({ auth, onAuthGone }) {
         <BrandingPanel
           token={auth.token}
           profile={profile}
-          onSaved={setProfile}
+          onSaved={applyFreshProfile} /* §I: branding saves refresh the cached nav user too */
           onToast={setToast}
         />
       )}
@@ -132,6 +155,46 @@ function ProfileBody({ auth, onAuthGone }) {
  * the server is the real gate on writes (rule 4). Logo uploads ride the
  * same media pipeline + storage quota as category photos.
  */
+/* ---------------- §I (Handoff #12): display-name edit ---------------- */
+
+function DisplayNameEdit({ token, profile, onSaved, onToast }) {
+  const [name, setName] = useState(profile.display_name ?? "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  const save = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      // No backend change needed — display_name is already writable on the
+      // existing profile PATCH. onSaved is applyFreshProfile: the fresh user
+      // lands in the stored auth and the SiteNav flips instantly (§I).
+      const fresh = await api.updateProfile(token, { display_name: name.trim() });
+      onSaved(fresh);
+      onToast("Name saved ✔");
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const dirty = name.trim() !== (profile.display_name ?? "");
+  return (
+    <div className="nameedit">
+      <label className="field">
+        Display name{" "}
+        <span className="field__hint">(what the navbar shows — blank falls back to your email's name part)</span>
+        <input value={name} maxLength={50} onChange={(e) => setName(e.target.value)} />
+      </label>
+      {error && <p className="formerror">{error}</p>}
+      <button className="btn btn--primary btn--sm" disabled={busy || !dirty} onClick={save}>
+        {busy ? "Saving…" : "Save name"}
+      </button>
+    </div>
+  );
+}
+
 function BrandingPanel({ token, profile, onSaved, onToast }) {
   const [name, setName] = useState(profile.brand_name ?? "");
   const [file, setFile] = useState(null);

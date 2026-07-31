@@ -9,7 +9,7 @@ from .moderation import (
     ModerationQuestionViewSet,
 )
 from .themes import ModerationThemeViewSet, ThemeListView
-from .views import CategoryViewSet, QuestionViewSet
+from .views import CategoryViewSet, PublicCategoryListView, QuestionViewSet
 
 router = DefaultRouter()
 router.register("categories", CategoryViewSet, basename="category")
@@ -20,6 +20,11 @@ router.register("moderation/questions", ModerationQuestionViewSet, basename="mod
 router.register("moderation/themes", ModerationThemeViewSet, basename="moderation-theme")
 
 urlpatterns = [
+    # §G1 (Handoff #12): the anonymous browse surface — a static path BEFORE
+    # the router (house rule), or CategoryViewSet's detail route would
+    # swallow /categories/public/ as pk="public" (precedence pinned by test,
+    # the history pattern).
+    path("categories/public/", PublicCategoryListView.as_view(), name="category-public-list"),
     # §G: the host-facing theme list — a static path, registered before the
     # router per the house rule.
     path("themes/", ThemeListView.as_view(), name="theme-list"),

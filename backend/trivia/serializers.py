@@ -3,6 +3,25 @@ from rest_framework import serializers
 from .models import Category, MediaType, ModerationStatus, Question, Visibility
 
 
+class PublicCategorySerializer(serializers.ModelSerializer):
+    """§G1 (Handoff #12): the anonymous shop window — purpose-built, NOT a
+    reuse of CategorySerializer (which leaks owner identity and moderation
+    internals). Exactly five keys, now public API (pinned by test):
+    {id, name, description, photo, question_count}. `question_count` is an
+    annotation supplied by the view (one query, no N+1); NO question text,
+    answers or ids ride this payload — counts only (rule 5 stays airtight).
+    Photos are fine anonymously: official/approved content is moderated,
+    and S3 mode signs URLs server-side regardless.
+    """
+
+    question_count = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = Category
+        fields = ("id", "name", "description", "photo", "question_count")
+        read_only_fields = fields
+
+
 class CategorySerializer(serializers.ModelSerializer):
     owner = serializers.PrimaryKeyRelatedField(read_only=True)
     usable_question_count = serializers.SerializerMethodField()

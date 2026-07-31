@@ -2085,3 +2085,124 @@ class MediaTemplateZipTests(BaseCase):
         with_media = Question.objects.get(question_text="What film is this frame from?")
         self.assertTrue(with_media.image)
         self.assertGreater(with_media.media_bytes, 0)
+
+
+# ---------------------------------------------------------------------------
+# §G (Handoff #12) — the anonymous public category browse endpoint
+# ---------------------------------------------------------------------------
+class PublicCategoryBrowseTests(BaseCase):
+    """GET /api/categories/public/ — AllowAny, counts only, exactly five
+    keys, never any question content (rule 5), never any non-browsable
+    category, and never swallowed by CategoryViewSet's detail route."""
+
+    URL = "/api/categories/public/"
+
+    def setUp(self):
+        super().setUp()
+        # Official category with a mix of questions: 2 official + 1 public-
+        # approved creator question count; 1 soft-deleted and 1 private don't.
+        self.official = Category.objects.create(
+            owner=None, name="Movies",
+            description="From the silents to last summer.",
+            visibility=Visibility.PUBLIC, moderation_status=ModerationStatus.APPROVED,
+        )
+        for i in range(2):
+            q = Question.objects.create(
+                owner=None, question_text=f"Official {i}?", answer="SECRET-OFFICIAL-ANSWER",
+                difficulty=1, visibility=Visibility.PUBLIC,
+                moderation_status=ModerationStatus.APPROVED,
+            )
+            q.categories.add(self.official)
+        approved = make_question(
+            self.creator, self.official, "Approved creator Q?",
+            status=ModerationStatus.APPROVED, visibility=Visibility.PUBLIC,
+        )
+        approved.answer = "SECRET-CREATOR-ANSWER"
+        approved.save()
+        deleted = make_question(
+            self.creator, self.official, "Deleted Q?",
+            status=ModerationStatus.APPROVED, visibility=Visibility.PUBLIC,
+        )
+        from django.utils import timezone as _tz
+
+        deleted.deleted_at = _tz.now()
+        deleted.save()
+        make_question(self.creator, self.official, "Private Q?")  # never counts
+
+        # A creator category that IS browsable (public + approved)…
+        self.approved_cat = make_category(self.creator, "Beer", public_approved=True)
+        # …and the full set that must be ABSENT:
+        self.private_cat = make_category(self.creator, "My Private")
+        self.pending_cat = Category.objects.create(
+            owner=self.creator, name="Pending", visibility=Visibility.PUBLIC,
+            moderation_status=ModerationStatus.PENDING,
+        )
+        self.rejected_cat = Category.objects.create(
+            owner=self.creator, name="Rejected", visibility=Visibility.PUBLIC,
+            moderation_status=ModerationStatus.REJECTED,
+        )
+        self.deleted_cat = Category.objects.create(
+            owner=None, name="Gone", visibility=Visibility.PUBLIC,
+            moderation_status=ModerationStatus.APPROVED, deleted_at=_tz.now(),
+        )
+
+    def names(self, res):
+        return [c["name"] for c in res.json()["results"]]
+
+    def test_anonymous_200_with_only_browsable_categories(self):
+        res = self.client.get(self.URL)
+        self.assertEqual(res.status_code, 200, res.content)
+        names = self.names(res)
+        self.assertIn("Movies", names)
+        self.assertIn("Beer", names)
+        for absent in ("My Private", "Pending", "Rejected", "Gone"):
+            self.assertNotIn(absent, names)
+
+    def test_authenticated_200_too(self):
+        # No perverse 403 for logged-in users browsing the shop window.
+        self.auth(self.free)
+        res = self.client.get(self.URL)
+        self.assertEqual(res.status_code, 200, res.content)
+        self.assertIn("Movies", self.names(res))
+
+    def test_payload_is_exactly_the_five_public_keys(self):
+        # This shape is now public API — pin it.
+        res = self.client.get(self.URL)
+        for row in res.json()["results"]:
+            self.assertEqual(
+                set(row), {"id", "name", "description", "photo", "question_count"}, row
+            )
+
+    def test_no_question_content_anywhere_in_the_payload(self):
+        # Rule 5 stays airtight: counts only. Grep the raw payload for the
+        # seeded answer strings AND question text (the SnapshotReveal pattern).
+        raw = self.client.get(self.URL).content.decode()
+        for leak in ("SECRET-OFFICIAL-ANSWER", "SECRET-CREATOR-ANSWER", "Official 0?", "Approved creator Q?"):
+            self.assertNotIn(leak, raw)
+
+    def test_question_count_is_browsable_actives_only(self):
+        res = self.client.get(self.URL)
+        by_name = {c["name"]: c for c in res.json()["results"]}
+        # 2 official + 1 public-approved; the soft-deleted and the private
+        # questions don't count.
+        self.assertEqual(by_name["Movies"]["question_count"], 3)
+        self.assertEqual(by_name["Beer"]["question_count"], 0)
+
+    def test_ordering_is_name_a_to_z(self):
+        res = self.client.get(self.URL)
+        names = self.names(res)
+        self.assertEqual(names, sorted(names))
+
+    def test_route_not_swallowed_by_category_detail(self):
+        # If the router's categories/<pk>/ matched first, anonymous would be
+        # a 401 (IsAuthenticated viewset) — it must instead be this view's
+        # public 200 (the history-precedence pattern).
+        res = self.client.get(self.URL)
+        self.assertEqual(res.status_code, 200)
+        self.assertIn("results", res.json())
+
+    def test_stale_or_garbage_auth_header_still_200(self):
+        # An anonymous marketing surface must never 401 on a dead Knox token
+        # left in a browser (authentication_classes is empty on purpose).
+        res = self.client.get(self.URL, HTTP_AUTHORIZATION="Token deadbeef")
+        self.assertEqual(res.status_code, 200, res.content)

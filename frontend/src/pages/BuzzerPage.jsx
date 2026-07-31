@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
-import { api, errorText, ApiError } from "../lib/api";
+import { api, errorText, ApiError, SUPPORT_EMAIL } from "../lib/api";
 import { clearSeat, loadSeat, saveSeat } from "../lib/storage";
 import { useGameSocket } from "../lib/useGameSocket";
 import { ensureAudio, playBuzz } from "../lib/sounds";
@@ -72,7 +72,8 @@ function JoinForm({ code, existing, onJoined, onDropSeat }) {
         setNameTaken(true);
         setError(err.data.name.join(" "));
       } else if (err instanceof ApiError && err.status === 404) {
-        setError(`No game with code ${code}. Double-check with the host.`);
+        // §H3 (Handoff #12): confused guests are the other support moment.
+        setError(`No game with code ${code}. Double-check with the host — or email ${SUPPORT_EMAIL}.`);
       } else {
         setError(errorText(err));
       }

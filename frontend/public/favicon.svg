@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- §J1 (Handoff #12): a chalk "D" on the chalkboard green (#232b26). -->
+  <rect width="64" height="64" rx="12" fill="#232b26"/>
+  <text x="32" y="47" text-anchor="middle" font-family="'Bebas Neue', 'Arial Narrow', sans-serif" font-size="44" fill="#f4f1e6" letter-spacing="1">D</text>
+</svg>

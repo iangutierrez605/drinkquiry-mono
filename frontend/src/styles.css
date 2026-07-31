@@ -1012,3 +1012,40 @@ code { font-family: var(--font-mono); color: var(--teal); font-size: 0.9em; }
 .brandpanel__logo { display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap; margin: 6px 0; }
 .userrow__brand { display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap; margin: 4px 0 10px; }
 .userrow__brandlogo { display: inline-flex; align-items: center; gap: 10px; }
+
+/* ---------- Handoff #12 ---------- */
+
+/* §F1: the honeypot — off-screen absolute (NOT display:none alone; some
+   form-fillers skip hidden inputs). Kept out of layout, tab order and AT. */
+.hp-field { position: absolute; left: -9999px; top: auto; width: 1px; height: 1px; overflow: hidden; }
+
+/* §F2: the Turnstile widget slot (only renders when a site key is baked in). */
+.turnstile-slot { display: flex; justify-content: center; min-height: 0; }
+.turnstile-slot:not(:empty) { margin: 4px 0; }
+
+/* §H: the chrome footer + support links. */
+.sitefoot { padding: 26px 16px 20px; text-align: center; color: var(--dim); font-size: 13px; }
+.supportlink { color: var(--teal); text-decoration: underline; text-underline-offset: 2px; }
+.supportlink:hover { color: var(--gold); }
+
+/* §G2: the public browse grid — the catcard look, worn as a shop window. */
+.browseintro { max-width: 560px; }
+.browsegrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; margin: 14px 0; }
+.catcard--browse { cursor: default; }
+.catcard__photo { width: 100%; max-height: 110px; object-fit: cover; border-radius: 3px 8px 4px 7px; border: 1px solid var(--line); margin-bottom: 4px; }
+.catcard__desc { color: var(--dim); font-size: 13px; }
+.ctabanner { margin: 14px 0 18px; gap: 6px; }
+.ctabanner p { margin: 0 0 8px; color: var(--dim); }
+
+/* §G2: the landing teaser strip. */
+.teaser { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 8px 16px 26px; }
+.teaser__strip { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; max-width: 860px; }
+.catcard--teaser { min-width: 150px; }
+.teaser__more { color: var(--teal); text-decoration: underline; text-underline-offset: 2px; font-size: 15px; }
+.teaser__more:hover { color: var(--gold); }
+
+/* §I: the profile display-name edit. */
+.nameedit { margin: 10px 0 2px; display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+
+/* §J2: the 404 page. */
+.notfound__links { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; margin: 6px 0 4px; }

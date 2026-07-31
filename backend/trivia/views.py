@@ -1,6 +1,6 @@
 from django.db import IntegrityError, transaction
-from django.db.models import Q
-from rest_framework import permissions, status, viewsets
+from django.db.models import Count, Q
+from rest_framework import generics, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
@@ -15,7 +15,7 @@ from .bulk_upload import create_new_categories, create_rows, parse_bulk_upload
 
 from .models import Category, ModerationStatus, Question, QuestionReport, Visibility
 from .permissions import IsCreator, IsOwnerOrReadOnlyPublic
-from .serializers import CategorySerializer, QuestionSerializer
+from .serializers import CategorySerializer, PublicCategorySerializer, QuestionSerializer
 
 PUBLIC_APPROVED = Q(visibility=Visibility.PUBLIC, moderation_status=ModerationStatus.APPROVED)
 
@@ -24,6 +24,43 @@ def _incoming_file_bytes(request) -> int:
     """Total size of the request's uploaded files (§F3 storage check input).
     Pre-resize sizes — a conservative upper bound on what will be stored."""
     return sum(f.size for f in request.FILES.values())
+
+
+class PublicCategoryListView(generics.ListAPIView):
+    """§G1 (Handoff #12): `GET /api/categories/public/` — the logged-out
+    marketing funnel. AllowAny, list-only, and DELIBERATELY UNTHROTTLED
+    (it joins game join + the polling snapshot on the pinned unthrottled
+    list; §F's bot gates sit on the anonymous WRITE surface, not here).
+
+    Queryset: active categories that are OFFICIAL (owner is null) or
+    PUBLIC + APPROVED — never private/pending/rejected/deleted (each
+    absence pinned). `question_count` counts ACTIVE questions that are
+    themselves official or public-approved, annotated in one query (do NOT
+    reuse the per-user usable_question_count machinery — it takes a user;
+    this surface has none). Ordering name A→Z; DRF's default pagination
+    (50) is fine at current scale. Registered BEFORE trivia's router
+    include (static-before-parameterized, house rule) so the CategoryViewSet
+    detail route can't swallow /public/ as a pk.
+    """
+
+    serializer_class = PublicCategorySerializer
+    permission_classes = (permissions.AllowAny,)
+    authentication_classes = ()  # anonymous surface: a stale Knox header must never 401 it
+
+    def get_queryset(self):
+        browsable_question = Q(questions__deleted_at__isnull=True) & (
+            Q(questions__owner__isnull=True)
+            | Q(
+                questions__visibility=Visibility.PUBLIC,
+                questions__moderation_status=ModerationStatus.APPROVED,
+            )
+        )
+        return (
+            Category.objects.filter(deleted_at__isnull=True)
+            .filter(Q(owner__isnull=True) | PUBLIC_APPROVED)
+            .annotate(question_count=Count("questions", filter=browsable_question, distinct=True))
+            .order_by("name")
+        )
 
 
 class CategoryViewSet(viewsets.ModelViewSet):

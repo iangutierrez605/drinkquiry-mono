@@ -1,6 +1,8 @@
 import { BrowserRouter, Link, Outlet, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { api, SUPPORT_EMAIL } from "./lib/api";
 import HostPage from "./pages/HostPage";
+import CategoriesPage from "./pages/CategoriesPage";
 import CreatePage from "./pages/CreatePage";
 import BoardPage from "./pages/BoardPage";
 import BuzzerPage from "./pages/BuzzerPage";
@@ -18,8 +20,22 @@ import AgeGate from "./components/AgeGate";
  */
 function Landing() {
   const [code, setCode] = useState("");
+  // §G2 (Handoff #12): a light category teaser — same public endpoint as
+  // /categories, sliced client-side. Fetch failure/empty just hides the
+  // strip (the landing's existing structure stays).
+  const [teaser, setTeaser] = useState([]);
   const navigate = useNavigate();
   const valid = /^[A-Z0-9]{6}$/.test(code);
+  useEffect(() => {
+    let alive = true;
+    api
+      .publicCategories()
+      .then((cats) => alive && setTeaser(cats.slice(0, 4)))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
   return (
     <div className="landingpage">
       <section className="landinghero">
@@ -80,6 +96,25 @@ function Landing() {
         </p>
       </section>
 
+      {teaser.length > 0 && (
+        <section className="teaser">
+          <h2 className="howworks__title">What's on the board</h2>
+          <div className="teaser__strip">
+            {teaser.map((cat) => (
+              <div key={cat.id} className="catcard catcard--browse catcard--teaser">
+                <span className="catcard__name">{cat.name}</span>
+                <span className="catcard__count">
+                  {cat.question_count} question{cat.question_count === 1 ? "" : "s"}
+                </span>
+              </div>
+            ))}
+          </div>
+          <Link className="teaser__more" to="/categories">
+            browse all →
+          </Link>
+        </section>
+      )}
+
       <footer className="landingfoot">
         <span className="wordmark wordmark--small">DRINKQUIRY</span>
         {/* §F3: the footer's Host/Make questions/Profile links moved to the
@@ -115,7 +150,39 @@ function ChromeLayout() {
     <>
       <SiteNav />
       <Outlet />
+      {/* §H1 (Handoff #12): every chrome page gets the support footer for
+          free; the TV board and buzzer stay chrome-free (they're outside
+          this layout already — a bar's TV doesn't need a mailto). */}
+      <footer className="sitefoot">
+        Drinkquiry · <a className="supportlink" href={`mailto:${SUPPORT_EMAIL}`}>{SUPPORT_EMAIL}</a>
+      </footer>
     </>
+  );
+}
+
+/**
+ * §J2 (Handoff #12): the catch-all 404. Stateless (C11 trivially holds);
+ * links home + to the browse page, plus §H's support address.
+ */
+function NotFound() {
+  return (
+    <div className="page page--center notfound">
+      <div className="wordmark">DRINKQUIRY</div>
+      <h1 className="h1">That page doesn't exist</h1>
+      <p>Wrong turn at the bar. These work:</p>
+      <div className="notfound__links">
+        <Link className="btn btn--primary" to="/">
+          Home
+        </Link>
+        <Link className="btn btn--ghost" to="/categories">
+          Browse categories
+        </Link>
+      </div>
+      <p className="footnote">
+        Sure it should be here?{" "}
+        <a className="supportlink" href={`mailto:${SUPPORT_EMAIL}`}>{SUPPORT_EMAIL}</a>
+      </p>
+    </div>
   );
 }
 
@@ -128,12 +195,17 @@ export default function App() {
       <Routes>
         <Route element={<ChromeLayout />}>
           <Route path="/" element={<Landing />} />
+          <Route path="/categories" element={<CategoriesPage />} />
           <Route path="/login" element={<LoginPage />} />
           <Route path="/reset-password" element={<ResetPasswordPage />} />
           <Route path="/host" element={<HostPage />} />
           <Route path="/create" element={<CreatePage />} />
           <Route path="/moderate" element={<ModeratePage />} />
           <Route path="/profile" element={<ProfilePage />} />
+          {/* §J2: catch-all — LAST inside the chrome so real routes win.
+              The two chrome-free game routes below still match before it
+              at the top level. */}
+          <Route path="*" element={<NotFound />} />
         </Route>
         <Route path="/board/:code" element={<BoardPage />} />
         <Route path="/game/buzzer/:code" element={<BuzzerPage />} />

@@ -282,6 +282,19 @@ MAX_PLAYERS_PER_GAME = 6
 # added in the Resend dashboard. Until then, DEFAULT_FROM_EMAIL can point at
 # the already-verified eventquiry.com as a stopgap (works, but off-brand and
 # the from-domain/link-domain mismatch reads phishy — see CHANGES.md).
+# --- §F2 (Handoff #12): Cloudflare Turnstile on register, opt-in via env ---
+# Same shape as the Resend flag below: both default "" and the feature is ON
+# iff the SECRET is set — dev, the suite and the smoke run keyless with the
+# challenge entirely absent. The SITE key is the public widget key; the SPA
+# gets it at build time as VITE_TURNSTILE_SITE_KEY (the VITE_API_BASE
+# pattern). Owner setup lives in CHANGES.md: create the (free) Turnstile
+# widget in the Cloudflare dashboard, set the two env vars here + the one
+# VITE var at frontend build, rebuild. Until then the site runs as today.
+# Verification fails CLOSED (accounts/turnstile.py). Register only — login/
+# forgot deliberately keep throttles as their defense (§F2/§F3).
+TURNSTILE_SECRET_KEY = os.environ.get("TURNSTILE_SECRET_KEY", "")
+TURNSTILE_SITE_KEY = os.environ.get("TURNSTILE_SITE_KEY", "")
+
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 if RESEND_API_KEY:
     EMAIL_BACKEND = "anymail.backends.resend.EmailBackend"

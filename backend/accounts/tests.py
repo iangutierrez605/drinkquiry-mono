@@ -528,6 +528,11 @@ class AuthThrottleTests(APITestCase):
         for _ in range(5):
             res = self.client.get("/api/games/NOSUCH1/")
             self.assertEqual(res.status_code, 404)  # not 429
+        # §G1 (Handoff #12): the public category browse joins the
+        # deliberately-unthrottled list — it's the marketing surface.
+        for _ in range(5):
+            res = self.client.get("/api/categories/public/")
+            self.assertEqual(res.status_code, 200)  # not 429
 
     def test_forgot_throttle_keeps_bodies_identical_before_the_limit(self):
         # §L: cooldown/throttle independence — a throttled forgot is a
@@ -784,3 +789,126 @@ class BrandingTests(QuotaTestBase):
         row = res.data["results"][0]
         self.assertEqual(row["brand_name"], "THE KINGS ARMS")
         self.assertIn("brand_logo", row)
+
+
+# ---------------------------------------------------------------------------
+# §F (Handoff #12) — bot gates on the public register surface
+# ---------------------------------------------------------------------------
+class RegisterHoneypotTests(APITestCase):
+    """§F1: the decoy `website` field. A non-empty value is a bot → the NEW
+    pinned vague 400 (C4: added body, nothing mutated) and NO user row.
+    Empty/absent proceed exactly as today, so every existing client (and the
+    smoke's register calls, C12) is untouched."""
+
+    FIELDS = {"email": "human@test.com", "password": "sturdy-pass-123", "display_name": "H"}
+
+    def test_filled_honeypot_is_the_exact_vague_400_and_creates_nothing(self):
+        res = self.client.post(
+            "/api/auth/register/", {**self.FIELDS, "website": "https://spam.example"}, format="json"
+        )
+        self.assertEqual(res.status_code, 400, res.content)
+        # Exact pinned body — deliberately vague: never names the field,
+        # never hints the mechanism.
+        self.assertEqual(res.json(), {"detail": "Registration failed."})
+        self.assertFalse(User.objects.filter(email="human@test.com").exists())
+
+    def test_whitespace_only_honeypot_reads_as_empty(self):
+        res = self.client.post(
+            "/api/auth/register/", {**self.FIELDS, "website": "   "}, format="json"
+        )
+        self.assertEqual(res.status_code, 201, res.content)
+
+    def test_empty_honeypot_registers_as_today(self):
+        res = self.client.post(
+            "/api/auth/register/", {**self.FIELDS, "website": ""}, format="json"
+        )
+        self.assertEqual(res.status_code, 201, res.content)
+        self.assertTrue(User.objects.filter(email="human@test.com").exists())
+
+    def test_absent_honeypot_registers_as_today(self):
+        res = self.client.post("/api/auth/register/", self.FIELDS, format="json")
+        self.assertEqual(res.status_code, 201, res.content)
+
+
+class TurnstileTests(APITestCase):
+    """§F2: env-gated challenge, OFF by default (the suite runs keyless).
+    ON is simulated with override_settings + a mocked requests.post — the
+    same seam the Resend tests use for their backend."""
+
+    def setUp(self):
+        cache.clear()  # register-throttle counters live in the cache (C10)
+        self.addCleanup(cache.clear)
+
+    FIELDS = {"email": "turn@test.com", "password": "sturdy-pass-123", "display_name": "T"}
+    TURNSTILE_400 = {"detail": "Verification failed — please try again."}
+
+    def register(self, extra=None):
+        return self.client.post("/api/auth/register/", {**self.FIELDS, **(extra or {})}, format="json")
+
+    # --- OFF (the default): the feature is entirely absent -----------------
+    def test_off_by_default_and_a_stray_token_is_ignored(self):
+        res = self.register({"turnstile_token": "unsolicited"})
+        self.assertEqual(res.status_code, 201, res.content)
+
+    # --- ON: override the secret, mock the verify --------------------------
+    @override_settings(TURNSTILE_SECRET_KEY="test-secret")
+    def test_on_missing_token_is_the_exact_400(self):
+        res = self.register()
+        self.assertEqual(res.status_code, 400, res.content)
+        self.assertEqual(res.json(), self.TURNSTILE_400)
+        self.assertFalse(User.objects.filter(email="turn@test.com").exists())
+
+    @override_settings(TURNSTILE_SECRET_KEY="test-secret")
+    def test_on_verify_false_is_400(self):
+        from unittest import mock
+
+        fake = mock.Mock()
+        fake.json.return_value = {"success": False, "error-codes": ["invalid-input-response"]}
+        with mock.patch("accounts.turnstile.requests.post", return_value=fake) as post:
+            res = self.register({"turnstile_token": "bad-token"})
+        self.assertEqual(res.status_code, 400, res.content)
+        self.assertEqual(res.json(), self.TURNSTILE_400)
+        # The verify hit Cloudflare's endpoint with our secret + the token.
+        args, kwargs = post.call_args
+        self.assertIn("challenges.cloudflare.com", args[0])
+        self.assertEqual(kwargs["data"]["secret"], "test-secret")
+        self.assertEqual(kwargs["data"]["response"], "bad-token")
+
+    @override_settings(TURNSTILE_SECRET_KEY="test-secret")
+    def test_on_verify_true_registers(self):
+        from unittest import mock
+
+        fake = mock.Mock()
+        fake.json.return_value = {"success": True}
+        with mock.patch("accounts.turnstile.requests.post", return_value=fake):
+            res = self.register({"turnstile_token": "solved"})
+        self.assertEqual(res.status_code, 201, res.content)
+        self.assertTrue(User.objects.filter(email="turn@test.com").exists())
+
+    @override_settings(TURNSTILE_SECRET_KEY="test-secret")
+    def test_on_verify_timeout_fails_closed(self):
+        # Documented decision: a verify-endpoint outage reads as "not
+        # verified" — a signup can retry; a bot flood cannot be undone.
+        from unittest import mock
+
+        import requests as _requests
+
+        with mock.patch(
+            "accounts.turnstile.requests.post", side_effect=_requests.Timeout("verify hung")
+        ):
+            res = self.register({"turnstile_token": "solved-but-unverifiable"})
+        self.assertEqual(res.status_code, 400, res.content)
+        self.assertEqual(res.json(), self.TURNSTILE_400)
+        self.assertFalse(User.objects.filter(email="turn@test.com").exists())
+
+    @override_settings(TURNSTILE_SECRET_KEY="test-secret")
+    def test_honeypot_still_wins_over_turnstile(self):
+        # Gate order: the free check runs first — a bot that filled the
+        # honeypot never costs us a verify round-trip.
+        from unittest import mock
+
+        with mock.patch("accounts.turnstile.requests.post") as post:
+            res = self.register({"website": "spam", "turnstile_token": "whatever"})
+        self.assertEqual(res.status_code, 400)
+        self.assertEqual(res.json(), {"detail": "Registration failed."})
+        post.assert_not_called()

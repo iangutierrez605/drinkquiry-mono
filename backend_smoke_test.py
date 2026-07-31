@@ -23,6 +23,20 @@ def rest():
     assert r.status_code == 200 and r.json() == {"status": "ok"}, (r.status_code, r.text)
     ok('/api/health/ → 200 {"status": "ok"} exactly (§I3)')
 
+    # §G (Handoff #12): the anonymous browse surface. ONE unthrottled GET —
+    # re-runnable trivially; seed_demo ships 5 official categories (the
+    # standing pristine-seed property). NOTE (§L): NO new register calls in
+    # this smoke — the register throttle budget (5/min, 2 calls/run) is
+    # already fully spoken for.
+    r = requests.get(f"{BASE}/api/categories/public/")
+    assert r.status_code == 200, r.text
+    pub = r.json()["results"]
+    assert len(pub) >= 5, f"expected the 5 seeded official categories, got {len(pub)}"
+    for row in pub:
+        assert set(row) == {"id", "name", "description", "photo", "question_count"}, row
+        assert isinstance(row["question_count"], int)
+    ok(f"public categories (anon, unthrottled): {len(pub)} rows, exact 5-key shape (§G)")
+
     r = requests.post(f"{BASE}/api/auth/register/", json={
         "email": "host@test.com", "password": "sturdy-pass-123", "display_name": "Quizmaster"})
     assert r.status_code in (200, 201) or "already exists" in r.text, r.text
