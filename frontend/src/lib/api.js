@@ -264,9 +264,31 @@ export const api = {
   deleteTheme: (token, id) =>
     request(`/api/moderation/themes/${id}/`, { method: "DELETE", authToken: token }),
 
+  // ---- §I (Handoff #13): tournaments (all host-private, Knox) ----
+  tournaments: (token) => allPages("/api/tournaments/", token),
+  createTournament: (token, { name, location }) =>
+    request("/api/tournaments/", { method: "POST", authToken: token, body: { name, location } }),
+  tournament: (token, id) => request(`/api/tournaments/${id}/`, { authToken: token }),
+  finishTournament: (token, id) =>
+    request(`/api/tournaments/${id}/finish/`, { method: "POST", authToken: token }),
+  deleteTournament: (token, id) =>
+    request(`/api/tournaments/${id}/`, { method: "DELETE", authToken: token }),
+  advanceRound: (token, id, roundNumber, perGame) =>
+    request(`/api/tournaments/${id}/rounds/${roundNumber}/advance/`, {
+      method: "POST",
+      authToken: token,
+      body: { per_game: perGame },
+    }),
+
   // ---- Games ----
-  createGame: (token, { mode, categories, questions_per_category }) =>
-    request("/api/games/", { method: "POST", authToken: token, body: { mode, categories, questions_per_category } }),
+  // §H (#13): buzz_sound (1–4) is the host's per-game sound choice; the
+  // server defaults to 1 when omitted, so older callers keep working.
+  createGame: (token, { mode, categories, questions_per_category, buzz_sound }) =>
+    request("/api/games/", {
+      method: "POST",
+      authToken: token,
+      body: { mode, categories, questions_per_category, ...(buzz_sound ? { buzz_sound } : {}) },
+    }),
   gameSnapshot: (code) => request(`/api/games/${code.toUpperCase()}/`),
   // Host-private answer for the open cell (Handoff #6 §F1). Knox-authed and
   // host-checked server-side; works pre-reveal — that's its whole point. The

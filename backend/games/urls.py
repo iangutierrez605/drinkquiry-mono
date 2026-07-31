@@ -10,6 +10,10 @@ from .views import (
     GameJoinView,
     GameReportView,
     GameStateView,
+    TournamentAdvanceView,
+    TournamentDetailView,
+    TournamentFinishView,
+    TournamentListCreateView,
 )
 
 urlpatterns = [
@@ -25,4 +29,16 @@ urlpatterns = [
     path("games/<str:code>/host-seat/", GameHostSeatView.as_view(), name="game-host-seat"),
     path("games/<str:code>/board/", GameBoardDetailView.as_view(), name="game-board-detail"),
     path("games/<str:code>/cells/<int:cell_id>/replace/", CellReplaceView.as_view(), name="game-cell-replace"),
+    # §I (Handoff #13): tournaments. The collection root registers before its
+    # parameterized children per the house rule; because the child segment is
+    # <int:pk> (not a free string like <str:code>), no static sibling can be
+    # swallowed here — the precedence pin lives with the games/history/ test.
+    path("tournaments/", TournamentListCreateView.as_view(), name="tournament-list-create"),
+    path("tournaments/<int:pk>/", TournamentDetailView.as_view(), name="tournament-detail"),
+    path("tournaments/<int:pk>/finish/", TournamentFinishView.as_view(), name="tournament-finish"),
+    path(
+        "tournaments/<int:pk>/rounds/<int:round_number>/advance/",
+        TournamentAdvanceView.as_view(),
+        name="tournament-advance",
+    ),
 ]

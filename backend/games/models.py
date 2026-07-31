@@ -36,6 +36,17 @@ class Game(models.Model):
     status = models.CharField(max_length=10, choices=GameStatus.choices, default=GameStatus.LOBBY)
     questions_per_category = models.PositiveSmallIntegerField(default=5)
 
+    # §H (Handoff #13): the buzz sound is a HOST choice, per GAME — every
+    # buzzer and the board play THIS sound (the four existing synthesized
+    # WebAudio voices in lib/sounds.js; no audio files, ever — §M). Chosen at
+    # creation only (mid-game change is punted, §M); rides the snapshot as
+    # top-level `buzz_sound` so both transports render it (C2). Pre-#13 games
+    # migrate to 1 (the classic buzzer). Participant.buzzer_sound survives
+    # one session as a vestigial payload field (C12) — nothing reads it now.
+    buzz_sound = models.PositiveSmallIntegerField(
+        choices=[(i, f"Sound {i}") for i in (1, 2, 3, 4)], default=1
+    )
+
     # Live buzzer state — persisted so a page reload recovers everything.
     current_cell = models.ForeignKey(
         "BoardCell", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
@@ -68,6 +79,18 @@ class Game(models.Model):
     winners = models.ManyToManyField(
         "Participant", blank=True, related_name="won_games"
     )
+
+    # §I (Handoff #13): tournament membership — BOTH null for a plain game
+    # (every pre-#13 game migrates that way and behaves exactly as before).
+    # A round is the set of the tournament's games sharing `round_number`;
+    # there is deliberately NO Round table v1 (it would add joins for no v1
+    # behavior — revisit in §M if rounds grow their own state). SET_NULL so
+    # an admin hard-delete of a Tournament row can never take games with it
+    # (normal deletion is soft — Tournament.deleted_at).
+    tournament = models.ForeignKey(
+        "Tournament", null=True, blank=True, on_delete=models.SET_NULL, related_name="games"
+    )
+    round_number = models.PositiveSmallIntegerField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
     started_at = models.DateTimeField(null=True, blank=True)
@@ -209,3 +232,80 @@ class DrinkAssignment(models.Model):
     to_participant = models.ForeignKey(Participant, on_delete=models.CASCADE, related_name="drinks_received")
     amount = models.PositiveIntegerField()
     created_at = models.DateTimeField(auto_now_add=True)
+
+
+# --- §I (Handoff #13): tournament mode v1 ----------------------------------
+# A tournament is a NAMED, BRANDED container of rounds; each round is a set
+# of ordinary games (Game.tournament + Game.round_number above); advancement
+# is computed from finished games' standings and CONFIRMED by the host (the
+# advance endpoint). No auto-seeding, no elimination trees, no cross-venue
+# anything (§M). Creating one is plan-gated through the quota choke point
+# (accounts/quotas: "tournaments", 0 for free) — the categories/questions
+# pattern, so a staff limit_overrides grant works too.
+
+
+class Tournament(models.Model):
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="tournaments"
+    )
+    name = models.CharField(max_length=80)
+    # Optional venue line ("Ian's Bar Venue"). The snapshot's hosted-by line
+    # falls back to the owner's brand_name, then display_name (§I3 — resolved
+    # SERVER-side in the serializer so clients stay dumb renderers).
+    location = models.CharField(max_length=120, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)  # null = live
+    # The house liveness flag (deleted_at on Question/Category, removed_at on
+    # Participant): null = active, the ONLY flag. Soft delete keeps history
+    # (attached games keep rendering their reports) and frees the name via
+    # the partial constraint below.
+    deleted_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            # The FOURTH house partial unique (after category/theme/
+            # participant names): live tournaments are unique per owner by
+            # name; soft delete frees the name immediately. Needs the owner's
+            # Postgres compose pass like the other three (C3).
+            models.UniqueConstraint(
+                fields=["owner", "name"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="unique_tournament_name_per_owner",
+            ),
+        ]
+
+    def __str__(self):
+        return f"Tournament {self.name} ({self.owner_id})"
+
+
+class TournamentAdvancer(models.Model):
+    """§I2: one advancing NAME from one round game.
+
+    Names, not Participant FKs, on purpose: buzzer seats are per-game and
+    anonymous — advancing "TEAM A" means the NAME goes through and re-joins
+    the next round's game by typing it. Cheap, honest, and exactly how bars
+    run this. `rank` is competition-style (1,1,3 on a tie); `source_game`
+    says which game earned it. Rows for a round are REPLACED wholesale when
+    the host re-runs advancement (services.advance_round)."""
+
+    tournament = models.ForeignKey(Tournament, on_delete=models.CASCADE, related_name="advancers")
+    round_number = models.PositiveSmallIntegerField()
+    name = models.CharField(max_length=50)
+    source_game = models.ForeignKey(Game, on_delete=models.CASCADE, related_name="+")
+    rank = models.PositiveSmallIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("round_number", "source_game_id", "rank", "name")
+        constraints = [
+            # Names are unique per game among active seats (the participant
+            # partial), so one row per (round, game, name) is the honest
+            # uniqueness — a tie can repeat a RANK, never a name.
+            models.UniqueConstraint(
+                fields=["tournament", "round_number", "source_game", "name"],
+                name="unique_advancer_per_round_game_name",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.name} → round {self.round_number + 1} of {self.tournament_id}"

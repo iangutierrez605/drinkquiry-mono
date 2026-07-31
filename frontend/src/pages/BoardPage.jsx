@@ -57,33 +57,34 @@ export default function BoardPage() {
   // so boards talking to an older backend (no snapshot field) don't regress.
   const revealedAnswer = game?.revealed_answer ?? (usePolling ? null : ws.revealedAnswer);
 
-  // Flash on new buzzes + (§I) play the buzzing team's sound when toggled on.
-  // Browser autoplay policy needs a user gesture before audio, so sound is
-  // behind a small toggle, default OFF, no persistence. Sound is display-only
-  // side data (rule 1): nothing gates on it.
+  // Flash on new buzzes + play THE GAME'S sound when toggled on (§H #13:
+  // the sound is a host-chosen, per-game field now — snapshot.buzz_sound —
+  // so every buzz makes the same noise on every surface). Browser autoplay
+  // policy needs a user gesture ON THIS DEVICE before audio, so sound stays
+  // behind a small enable control, default OFF, no persistence. Sound is
+  // display-only side data (rule 1): nothing gates on it.
   const [soundOn, setSoundOn] = useState(false);
   const soundOnRef = useRef(soundOn);
   soundOnRef.current = soundOn;
-  const participantsRef = useRef(null);
-  participantsRef.current = game?.participants ?? null;
+  const gameSoundRef = useRef(1);
+  gameSoundRef.current = game?.buzz_sound ?? 1;
 
-  const playForParticipant = (participantId, fallbackOrder) => {
+  const playGameBuzz = () => {
     if (!soundOnRef.current) return;
-    const p = participantsRef.current?.find((x) => x.id === participantId);
-    playBuzz(p?.buzzer_sound ?? fallbackOrder ?? 1);
+    playBuzz(gameSoundRef.current);
   };
 
   // WS mode: consume the hook's existing lastBuzz output (rule 2 — the hook
   // itself is untouched).
   useEffect(() => {
     if (usePolling || !ws.lastBuzz) return;
-    playForParticipant(ws.lastBuzz.participant_id, ws.lastBuzz.order);
+    playGameBuzz();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ws.lastBuzz, usePolling]);
 
   // Both modes flash on buzz-count growth; in POLLING mode that same
-  // snapshot diff (§B4's house technique) also identifies the newest buzz so
-  // its team's sound can play — there is no lastBuzz without a socket.
+  // snapshot diff (§B4's house technique) also triggers the game's sound —
+  // there is no lastBuzz without a socket.
   const prevBuzzCount = useRef(0);
   const [flash, setFlash] = useState(false);
   const buzzes = game?.current_cell?.buzzes;
@@ -91,8 +92,7 @@ export default function BoardPage() {
   useEffect(() => {
     if (buzzCount > prevBuzzCount.current) {
       if (usePolling && buzzes?.length) {
-        const newest = buzzes[buzzes.length - 1];
-        playForParticipant(newest.participant_id, buzzes.length);
+        playGameBuzz();
       }
       setFlash(true);
       const t = setTimeout(() => setFlash(false), 450);
@@ -123,6 +123,9 @@ export default function BoardPage() {
   // §H (#11): venue branding, straight from the snapshot (C2 — polling
   // boards get it free). Null unless the host's creator plan is live.
   const brand = game.brand ?? null;
+  // §I (#13): tournament identity, straight from the snapshot (same C2
+  // free ride). Null for every plain game — the entire block below no-ops.
+  const tournament = game.tournament ?? null;
   const players = game.participants.filter((p) => p.role === "player");
   const hostSeat = game.participants.find((p) => p.role === "host");
   // §F: verdict straight from the snapshot (rule 1) — WS and polling boards
@@ -133,41 +136,86 @@ export default function BoardPage() {
   return (
     <div className={`tv ${flash ? "tv--flash" : ""}`}>
       <header className="tv__head">
-        <span className="wordmark wordmark--small">DRINKQUIRY</span>
-        {/* §H (#11): the small persistent in-play logo — present but never
-            competing with the game (the lobby block below is the big one). */}
-        {brand?.logo && game.status !== "lobby" && (
-          <img src={mediaUrl(brand.logo)} alt={brand.name || "Venue logo"} className="brandlogo brandlogo--tvhead" />
-        )}
-        <button
-          type="button"
-          className={`btn btn--ghost tv__soundtoggle ${soundOn ? "tv__soundtoggle--on" : ""}`}
-          onClick={() => {
-            // The click is the gesture that unlocks WebAudio.
-            const next = !soundOn;
-            if (next) ensureAudio();
-            setSoundOn(next);
-          }}
-          title={soundOn ? "Buzzer sounds on" : "Buzzer sounds off"}
-        >
-          {soundOn ? "🔊 sound on" : "🔇 sound off"}
-        </button>
+        {/* §F (#13): the identity block — wordmark + venue logo (+ §I's
+            tournament chip) live together so they scale as one unit. */}
+        <div className="tv__identity">
+          <span className="wordmark wordmark--small">DRINKQUIRY</span>
+          {/* §H (#11): the small persistent in-play logo — present but never
+              competing with the game (the lobby block below is the big one).
+              §F (#13): scaled up (see .brandlogo--tvhead). */}
+          {brand?.logo && game.status !== "lobby" && (
+            <img src={mediaUrl(brand.logo)} alt={brand.name || "Venue logo"} className="brandlogo brandlogo--tvhead" />
+          )}
+          {/* §I (#13): the compact in-play tournament chip — name + round,
+              never competing with the board. */}
+          {tournament && game.status !== "lobby" && (
+            <span className="tv__tournamentchip">
+              🏆 {tournament.name} · R{tournament.round_number}
+            </span>
+          )}
+        </div>
         <span className="codechip codechip--tv">
           Join: <strong>{game.code}</strong>
         </span>
       </header>
 
+      {/* §H (#13): the audio-ENABLE control must stay on the board DEVICE —
+          browser autoplay law: audio needs a gesture on the device that
+          plays it, so a host's laptop click can NEVER legally unlock this
+          TV's speakers. But it moves out of the header's "weird spot" to a
+          quiet fixed corner icon, and it no longer offers any CHOICE (the
+          host picked the game's sound at creation) — it is purely "this TV
+          may make noise". Default OFF, display-only (rule 1). */}
+      <button
+        type="button"
+        className={`tv__soundcorner ${soundOn ? "tv__soundcorner--on" : ""}`}
+        onClick={() => {
+          // The click is the gesture that unlocks WebAudio.
+          const next = !soundOn;
+          if (next) ensureAudio();
+          setSoundOn(next);
+        }}
+        title={soundOn ? "This TV may make noise — tap to mute" : "Tap once and this TV may make noise"}
+        aria-label={soundOn ? "TV sound on" : "TV sound off"}
+      >
+        {soundOn ? "🔊" : "🔇"}
+      </button>
+
       {game.status === "lobby" && (
         <div className="tv__lobby">
           {/* §H (#11): the paid surface — "tonight's trivia at THE KINGS
-              ARMS" right where the room is looking. */}
-          {brand && (
-            <div className="tv__brand">
-              {brand.logo && <img src={mediaUrl(brand.logo)} alt="" className="brandlogo brandlogo--tvlobby" />}
-              {brand.name && (
-                <p className="tv__brandline">
-                  tonight's trivia at <strong>{brand.name}</strong>
-                </p>
+              ARMS" right where the room is looking. §F (#13): roughly
+              doubled, inside the identity wrapper §I's tournament block
+              shares. */}
+          {(brand || tournament) && (
+            <div className="tv__identity tv__identity--lobby">
+              {/* §I3 (#13): the tournament block sits ABOVE the venue brand
+                  — big name, ROUND N, and the hosted-by line (location is
+                  server-resolved with the brand/display-name fallback, so
+                  this stays a dumb renderer). When a tournament is present
+                  the brand's own "tonight's trivia at" line is suppressed —
+                  hosted-by already says whose night it is; the LOGO still
+                  shows. */}
+              {tournament && (
+                <div className="tv__tournament">
+                  <div className="tv__tournamentname">{tournament.name}</div>
+                  <div className="tv__tournamentround">ROUND {tournament.round_number}</div>
+                  {tournament.location && (
+                    <p className="tv__brandline">
+                      hosted by <strong>{tournament.location}</strong>
+                    </p>
+                  )}
+                </div>
+              )}
+              {brand && (
+                <div className="tv__brand">
+                  {brand.logo && <img src={mediaUrl(brand.logo)} alt="" className="brandlogo brandlogo--tvlobby" />}
+                  {brand.name && !tournament && (
+                    <p className="tv__brandline">
+                      tonight's trivia at <strong>{brand.name}</strong>
+                    </p>
+                  )}
+                </div>
               )}
             </div>
           )}

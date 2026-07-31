@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from .models import BoardCell, BoardColumn, Buzz, CellState, Game, Participant
+from .models import BoardCell, BoardColumn, Buzz, CellState, Game, GameStatus, Participant, Tournament, TournamentAdvancer
 
 
 class ParticipantSerializer(serializers.ModelSerializer):
@@ -137,6 +137,15 @@ class GameStateSerializer(serializers.ModelSerializer):
     # BOTH transports for free (C2). Every snapshot caller select_related's
     # "host" (checked for N+1 like cells_remaining was).
     brand = serializers.SerializerMethodField()
+    # §I (Handoff #13): tournament identity — {"name", "location",
+    # "round_number"} | null. `location` is resolved SERVER-side (clients
+    # are dumb renderers): the tournament's own location, else the host's
+    # brand_name, else their display name, else null (the frontend then just
+    # hides the hosted-by line). Every snapshot caller select_related's
+    # "tournament" (the same no-N+1 rule "host" follows). Deliberately NOT
+    # plan-gated on serve: creation was the gate — hiding "Round 2" on a
+    # mid-tournament plan lapse would break a live event (CHANGES.md).
+    tournament = serializers.SerializerMethodField()
     # §H1 (Handoff #10): cells not yet ANSWERED — derived here, never stored,
     # so the snapshot stays the source of truth and BOTH transports (WS and
     # the polling board) get it for free (C2). An OPEN cell still counts as
@@ -149,9 +158,16 @@ class GameStateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Game
         fields = (
-            "code", "mode", "status", "questions_per_category", "max_players", "cells_remaining",
-            "buzzer_open", "current_cell", "revealed_answer", "columns", "participants",
-            "former_players", "brand", "created_at",
+            # §H (#13): top-level `buzz_sound` — the host's per-game choice;
+            # buzzers AND the board play this one (the cells_remaining
+            # "snapshot field, both transports" template, as a plain model
+            # field). The per-participant `buzzer_sound` inside
+            # `participants` is now VESTIGIAL but stays in the payload for
+            # one session (C12: the suite and the smoke assert it; removing
+            # a public field is #14 territory after clients migrate — §M).
+            "code", "mode", "status", "questions_per_category", "buzz_sound", "max_players",
+            "cells_remaining", "buzzer_open", "current_cell", "revealed_answer", "columns",
+            "participants", "former_players", "brand", "tournament", "created_at",
         )
 
     def get_participants(self, game):
@@ -191,6 +207,14 @@ class GameStateSerializer(serializers.ModelSerializer):
                 url = request.build_absolute_uri(url)
         return {"name": name, "logo": url}
 
+    def get_tournament(self, game):
+        t = game.tournament
+        if t is None:
+            return None
+        host = game.host  # select_related on every snapshot caller already
+        location = t.location or host.brand_name or host.display_name or None
+        return {"name": t.name, "location": location, "round_number": game.round_number}
+
     def get_cells_remaining(self, game):
         # Counted from the SAME prefetched columns/cells `columns` serializes
         # in this pass (every snapshot caller prefetches columns__cells) —
@@ -217,6 +241,68 @@ class CreateGameSerializer(serializers.Serializer):
     mode = serializers.ChoiceField(choices=("drinks", "points"), default="drinks")
     categories = serializers.ListField(child=serializers.IntegerField(), min_length=1, max_length=8)
     questions_per_category = serializers.IntegerField(min_value=1, max_value=10, default=5)
+    # §H (#13): the host's per-game sound choice — validated 1–4 (rule 4:
+    # the picker's four options are cosmetic; 0, 5 and "x" all 400 here),
+    # default 1 when omitted so old clients keep working unchanged.
+    buzz_sound = serializers.IntegerField(min_value=1, max_value=4, default=1)
+    # §I (#13): optional tournament attach — BOTH or NEITHER (the service
+    # enforces the pairing; the view resolves ownership/liveness/finished).
+    tournament = serializers.IntegerField(required=False, allow_null=True, default=None, min_value=1)
+    round_number = serializers.IntegerField(required=False, allow_null=True, default=None, min_value=1)
+
+
+# --- §I (Handoff #13): tournament payloads ---------------------------------
+# ALL host-private (Knox), and by design carrying NO question content — a
+# tournament surface is names + scores + game codes only (rule 5; pinned the
+# grep way, like #12's public categories).
+
+
+class TournamentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Tournament
+        fields = ("id", "name", "location", "created_at", "finished_at")
+        read_only_fields = ("id", "created_at", "finished_at")
+
+
+class TournamentAdvancerSerializer(serializers.ModelSerializer):
+    source_game = serializers.CharField(source="source_game.code", read_only=True)
+
+    class Meta:
+        model = TournamentAdvancer
+        fields = ("round_number", "name", "rank", "source_game")
+
+
+class TournamentGameSerializer(serializers.ModelSerializer):
+    """One game card in the tournament control room: code/status/standings —
+    deliberately nothing board-shaped, nothing question-shaped (rule 5)."""
+
+    standings = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Game
+        fields = ("code", "mode", "status", "round_number", "created_at", "finished_at", "standings")
+
+    def get_standings(self, game):
+        # Standings exist once the game is FINISHED — the same truths the
+        # winners computation reads (services.game_standings docstring).
+        if game.status != GameStatus.FINISHED:
+            return None
+        from .services import game_standings
+
+        return game_standings(game)
+
+
+class TournamentDetailSerializer(TournamentSerializer):
+    """GET /api/tournaments/<id>/ — the control-room payload: games grouped
+    client-side by round_number, plus every advancer row. The view prefetches
+    games (ordered) + their participants + advancers, so nothing here
+    queries."""
+
+    games = TournamentGameSerializer(many=True, read_only=True)
+    advancers = TournamentAdvancerSerializer(many=True, read_only=True)
+
+    class Meta(TournamentSerializer.Meta):
+        fields = TournamentSerializer.Meta.fields + ("games", "advancers")
 
 
 class JoinGameSerializer(serializers.Serializer):

@@ -2039,12 +2039,27 @@ class MediaTemplateZipTests(BaseCase):
     frontend/public (built from the template directory) and must import
     cleanly through the bulk upload — dry-run AND real — using the exact
     committed bytes. It contains a pipe row (TV|80s), so this doubles as a
-    live multi-category check on the shipped template."""
+    live multi-category check on the shipped template.
+
+    #13 fix — environment-aware, invariant intact: the docker api image
+    contains ONLY the backend, so inside the compose container the whole
+    ``frontend/`` tree is legitimately absent and these tests SKIP (with a
+    visible reason) rather than error. But if ``frontend/`` EXISTS and the
+    zip is missing, that is the C5 packaging-loss scenario and the tests
+    still FAIL — the skip keys off the tree, never off the file."""
 
     ZIP_PATH = (
         pathlib.Path(__file__).resolve().parent.parent.parent
         / "frontend" / "public" / "question-media-template.zip"
     )
+
+    def setUp(self):
+        super().setUp()
+        if not self.ZIP_PATH.parent.parent.exists():  # no frontend/ tree at all
+            self.skipTest(
+                "frontend/ tree not present in this environment (docker api "
+                "container) — run these from a full repo checkout"
+            )
 
     def upload(self, **data):
         self.auth(self.creator)

@@ -45,9 +45,7 @@ class RegisterView(generics.CreateAPIView):
         # F2 — Cloudflare Turnstile, opt-in via env (ON iff the secret is
         # set; entirely absent otherwise — a stray turnstile_token is
         # ignored when OFF). Verification fails CLOSED (see turnstile.py).
-        print('check turnstile')
         if turnstile_enabled():
-            print('turnstile is enabled', turnstile_enabled)
             token = str(request.data.get("turnstile_token") or "")
             if not verify_turnstile(token, remoteip=request.META.get("REMOTE_ADDR")):
                 return Response(

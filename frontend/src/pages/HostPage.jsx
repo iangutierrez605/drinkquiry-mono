@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { api, errorText, quotaError } from "../lib/api";
 import {
   clearHostGame,
@@ -11,6 +11,7 @@ import {
   saveSeat,
 } from "../lib/storage";
 import { useGameSocket } from "../lib/useGameSocket";
+import { ensureAudio, playBuzz } from "../lib/sounds";
 import AuthScreen from "../components/AuthScreen";
 import {
   BoardGrid,
@@ -58,18 +59,33 @@ export default function HostPage() {
     const seat = loadSeat(code);
     return seat?.token ? { code, token: seat.token } : null;
   });
+  // #13 fix: arriving with ?tournament= is an explicit "create ANOTHER
+  // game" intent — a tournament runs many games, so the stored active game
+  // must not gate the create screen (it used to: after game 1, "+ game in
+  // round N" landed the host back in game 1's console with no way to make
+  // game 2). The params are cleared on create/resume so the wrapper then
+  // falls through to the new game's console; the previous game stays
+  // resumable (its seat is stored per code) from the tournament page,
+  // /profile, or the create screen's resume panel.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tournamentCreate = searchParams.has("tournament");
+  const clearParams = () => setSearchParams({}, { replace: true });
 
   if (!auth) return <AuthScreen onAuthed={setAuth} />;
-  if (!active)
+  if (!active || tournamentCreate)
     return (
       <CreateScreen
         auth={auth}
         onCreated={(code, token, participantId) => {
           saveSeat(code, { token, participantId, role: "host" });
           saveHostGame(code);
+          clearParams();
           setActive({ code, token });
         }}
-        onResumed={setActive}
+        onResumed={(a) => {
+          clearParams();
+          setActive(a);
+        }}
       />
     );
   return (
@@ -106,6 +122,17 @@ function CreateScreen({ auth, onCreated, onResumed }) {
   const [resumeBusy, setResumeBusy] = useState(null);
   const [mode, setMode] = useState("drinks");
   const [perCategory, setPerCategory] = useState(5);
+  // §H (#13): the game's ONE buzz sound — a host choice at creation (the
+  // preview tap is the WebAudio gesture). Server validates 1–4 (rule 4).
+  const [buzzSound, setBuzzSound] = useState(1);
+  // §I4 (#13): arriving from a tournament control room carries
+  // ?tournament=ID&round=N — the create request then attaches the game.
+  // The banner is display; the SERVER re-validates ownership/liveness/
+  // finished on create (rule 4), so a stale or hand-typed URL just errors.
+  const [searchParams] = useSearchParams();
+  const tournamentId = Number(searchParams.get("tournament")) || null;
+  const roundNumber = tournamentId ? Number(searchParams.get("round")) || 1 : null;
+  const [tournamentInfo, setTournamentInfo] = useState(null); // {name, location} | "error" | null
   const [selected, setSelected] = useState([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
@@ -133,6 +160,21 @@ function CreateScreen({ auth, onCreated, onResumed }) {
       .then((games) => setUnfinished(games.filter((g) => g.status !== "finished")))
       .catch(() => setUnfinished([])); // the panel is optional sugar
   }, [auth.token]);
+
+  // §I4: the tournament banner data (name + venue). Separate keyed effect —
+  // it only runs when arriving with ?tournament=, and its failure just makes
+  // the banner say so (create still sends the ids; the server is the gate).
+  useEffect(() => {
+    if (!tournamentId) return undefined;
+    let alive = true;
+    api
+      .tournament(auth.token, tournamentId)
+      .then((t) => alive && setTournamentInfo(t))
+      .catch(() => alive && setTournamentInfo("error"));
+    return () => {
+      alive = false;
+    };
+  }, [auth.token, tournamentId]);
 
   const resume = async (code) => {
     setResumeBusy(code);
@@ -175,6 +217,10 @@ function CreateScreen({ auth, onCreated, onResumed }) {
         mode,
         categories: selected,
         questions_per_category: perCategory,
+        buzz_sound: buzzSound,
+        // §I4: attach when arriving from a tournament (both or neither —
+        // the server enforces the pairing and re-checks ownership).
+        ...(tournamentId ? { tournament: tournamentId, round_number: roundNumber } : {}),
       });
       const code = res.game.code;
       const hostParticipant = res.game.participants.find((p) => p.role === "host");
@@ -197,6 +243,36 @@ function CreateScreen({ auth, onCreated, onResumed }) {
           links, Log out) moved wholesale into the SiteNav — one identity
           bar per page, not two. */}
       <h1 className="h1">New game</h1>
+
+      {tournamentId && (
+        <section className="panel tournamentbanner">
+          {tournamentInfo === "error" ? (
+            <p className="formerror">
+              Couldn't load that tournament — creating will double-check it.{" "}
+              <Link to="/tournaments">Back to tournaments</Link>
+            </p>
+          ) : (
+            <>
+              <p className="tournamentbanner__line">
+                🏆 This game joins <strong>{tournamentInfo?.name ?? `tournament #${tournamentId}`}</strong> as{" "}
+                <strong>round {roundNumber}</strong>
+                {tournamentInfo?.location ? ` at ${tournamentInfo.location}` : ""}.
+              </p>
+              {/* §I5: the difficulty NUDGE, v1 — a hint, not machinery
+                  (auto-hard-mode per round is §M). */}
+              {roundNumber > 1 && (
+                <p className="footnote">
+                  Later rounds usually want a harder board — a fresh category set or more questions per
+                  category does it.
+                </p>
+              )}
+              <Link className="btn btn--ghost btn--sm" to={`/tournaments/${tournamentId}`}>
+                Back to the tournament
+              </Link>
+            </>
+          )}
+        </section>
+      )}
 
       {unfinished?.length > 0 && (
         <section className="panel resumepanel">
@@ -250,6 +326,40 @@ function CreateScreen({ auth, onCreated, onResumed }) {
             onChange={(e) => setPerCategory(Number(e.target.value))}
           />
           <span className="stepper__value">{perCategory}</span>
+        </div>
+      </section>
+
+      {/* §H (#13): the buzz sound is now a HOST choice — one sound for the
+          whole game (every phone and the TV play it). Tapping an option
+          selects it AND previews it: the tap is the user gesture WebAudio's
+          autoplay policy wants, so the preview always sounds here. No sound
+          choice exists anywhere else — the board's corner icon is only
+          "this TV may make noise" (autoplay law), and phones just play. */}
+      <section className="panel">
+        <h2 className="h2">
+          Buzz sound <span className="field__hint">(tap to hear — everyone's buzzer plays this one)</span>
+        </h2>
+        <div className="soundpick">
+          {[
+            { id: 1, emoji: "🚨", label: "Classic buzzer" },
+            { id: 2, emoji: "🛎️", label: "Ding-ding" },
+            { id: 3, emoji: "📯", label: "Honk" },
+            { id: 4, emoji: "🎺", label: "Triple beep" },
+          ].map((s) => (
+            <button
+              key={s.id}
+              type="button"
+              className={`soundcard ${buzzSound === s.id ? "soundcard--on" : ""}`}
+              onClick={() => {
+                ensureAudio(); // the click is the gesture
+                playBuzz(s.id);
+                setBuzzSound(s.id);
+              }}
+            >
+              <span className="soundcard__emoji">{s.emoji}</span>
+              <strong>{s.label}</strong>
+            </button>
+          ))}
         </div>
       </section>
 

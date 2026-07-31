@@ -213,6 +213,15 @@ code { font-family: var(--font-mono); color: var(--teal); font-size: 0.9em; }
   min-height: 66px;
   display: flex; align-items: center; justify-content: center;
   transition: filter 0.1s ease, transform 0.1s ease;
+  /* #13 fix: cells must NOT resize when their content changes (a won cell
+     swaps the big gold value for a small winner name). flex-basis 0 makes
+     every cell in a column take an EQUAL share regardless of content — on
+     the host board they all sit at the 66px floor; on the TV (min-height 0,
+     stretched columns) they all split the column evenly. overflow:hidden
+     stops a long name from forcing growth (.cell__done--name already
+     clamps + ellipsizes). */
+  flex: 1 1 0;
+  overflow: hidden;
 }
 .cell__value { font-family: var(--font-display); font-size: clamp(20px, 3vw, 32px); letter-spacing: 0.04em; color: var(--gold); text-shadow: 0 2px 0 rgba(0, 0, 0, 0.45); }
 .cell:not(:disabled):hover { filter: brightness(1.35); transform: translateY(-1px); }
@@ -306,8 +315,18 @@ code { font-family: var(--font-mono); color: var(--teal); font-size: 0.9em; }
 .tv__lobby { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; text-align: center; }
 .tv__lede { font-size: clamp(18px, 2.4vw, 26px); color: var(--dim); margin: 0; }
 .tv__teamcount { margin: 4px 0 0; color: var(--dim); font-size: clamp(14px, 1.8vw, 20px); letter-spacing: 0.06em; }
-.tv__soundtoggle { font-size: 14px; opacity: 0.55; }
-.tv__soundtoggle--on { opacity: 1; }
+/* §H (#13): the board's audio-ENABLE — a quiet fixed corner icon (replaces
+   the header's .tv__soundtoggle "weird spot"). It stays on the board DEVICE
+   because of autoplay law (the gesture must happen where the audio plays)
+   and offers no choice — the host picked the game's sound at creation. */
+.tv__soundcorner {
+  position: fixed; right: 14px; bottom: 14px; z-index: 30;
+  width: 46px; height: 46px; border-radius: 50%;
+  background: rgba(0, 0, 0, 0.35); border: 1px solid var(--line);
+  font-size: 20px; line-height: 1; opacity: 0.4;
+  display: flex; align-items: center; justify-content: center;
+}
+.tv__soundcorner--on { opacity: 1; border-color: var(--gold); background: rgba(0, 0, 0, 0.55); }
 .tv__bigcode { font-family: var(--font-mono); font-size: clamp(70px, 14vw, 160px); letter-spacing: 0.3em; margin-left: 0.3em; color: var(--gold); text-shadow: 0 0 46px rgba(237, 166, 63, 0.5); }
 .tv__joiners { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; margin-top: 14px; }
 /* §H3: team boxes get the 🙂 treatment — bigger, rounder, 3D-button-like
@@ -1000,13 +1019,26 @@ code { font-family: var(--font-mono); color: var(--teal); font-size: 0.9em; }
 
 /* ---------- §H (Handoff #11): venue branding ---------- */
 .brandlogo { object-fit: contain; border-radius: 10px; background: rgba(255, 255, 255, 0.04); }
-.brandlogo--tvlobby { max-height: 110px; max-width: 260px; }
-.brandlogo--tvhead { max-height: 34px; max-width: 120px; }
+/* §F (Handoff #13): the venue paid for this — it should read from across a
+   bar. Lobby logo roughly doubles (110×260 → up to 220×480), the in-game
+   header logo goes 34→up to 64px tall. Both clamp() against viewport units
+   so a 720p TV lands nearer the lower bound and the grid keeps priority
+   (eyeballed at 1280×720 and 1920×1080; the header row grows ~30px, which
+   the flexible .tv column absorbs without pushing cells off-screen). */
+.brandlogo--tvlobby { max-height: clamp(160px, 24vh, 220px); max-width: clamp(360px, 38vw, 480px); }
+.brandlogo--tvhead { max-height: clamp(48px, 6.5vh, 64px); max-width: clamp(150px, 16vw, 240px); }
 .brandlogo--preview { max-height: 80px; max-width: 200px; border: 1px solid var(--line); }
 .brandlogo--thumb { max-height: 48px; max-width: 120px; border: 1px solid var(--line); }
 .tv__brand { display: flex; flex-direction: column; align-items: center; gap: 8px; margin: 0 0 10px; }
-.tv__brandline { margin: 0; color: var(--dim); font-size: clamp(16px, 2vw, 24px); }
+/* §F (#13): scales with the bigger logo. */
+.tv__brandline { margin: 0; color: var(--dim); font-size: clamp(20px, 2.6vw, 32px); }
 .tv__brandline strong { color: var(--gold); letter-spacing: 0.04em; }
+/* §F (#13): the TV identity block — ONE home for everything that says whose
+   night this is (wordmark + venue logo in the header; tournament block +
+   venue block in the lobby), so §I's tournament header slots in with no
+   second layout pass. Purely cosmetic wrappers. */
+.tv__identity { display: flex; align-items: center; gap: 14px; min-width: 0; }
+.tv__identity--lobby { flex-direction: column; gap: 10px; margin: 0 0 6px; }
 .joinbrand { margin: -6px 0 2px; color: var(--dim); font-size: 14px; }
 .joinbrand strong { color: var(--gold); letter-spacing: 0.03em; }
 .brandpanel__logo { display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap; margin: 6px 0; }
@@ -1049,3 +1081,101 @@ code { font-family: var(--font-mono); color: var(--teal); font-size: 0.9em; }
 
 /* §J2: the 404 page. */
 .notfound__links { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; margin: 6px 0 4px; }
+
+/* ---------- Handoff #13 ---------- */
+
+/* §H2: the host's buzz-sound picker — modecard-family cards, tap = select
+   AND preview (the tap is the WebAudio gesture). */
+.soundpick { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+.soundcard {
+  background: var(--ink-3); border: 2px solid var(--line); border-radius: 14px;
+  padding: 12px 10px; display: flex; flex-direction: column; align-items: center; gap: 6px;
+  text-align: center;
+}
+.soundcard--on { border-color: var(--gold); box-shadow: 0 0 14px rgba(237, 166, 63, 0.25); }
+.soundcard__emoji { font-size: 26px; }
+
+/* §I3: tournament identity on the TV. The lobby block sits above the venue
+   brand inside .tv__identity--lobby; the in-play chip rides the header
+   identity row. */
+.tv__tournament { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.tv__tournamentname {
+  font-family: var(--font-display);
+  font-size: clamp(38px, 5.2vw, 68px);
+  letter-spacing: 0.05em;
+  color: var(--paper);
+  text-align: center;
+  line-height: 1.05;
+}
+.tv__tournamentround {
+  font-family: var(--font-display);
+  font-size: clamp(20px, 2.6vw, 34px);
+  letter-spacing: 0.22em;
+  color: var(--gold);
+}
+.tv__tournamentchip {
+  color: var(--gold);
+  font-size: clamp(13px, 1.5vw, 18px);
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 4px 12px;
+  background: rgba(0, 0, 0, 0.25);
+}
+
+/* §I3: the buzzer join screen's compact tournament line (above .joinbrand). */
+.jointournament {
+  margin: 0;
+  color: var(--gold);
+  font-size: 15px;
+  letter-spacing: 0.03em;
+  text-align: center;
+}
+
+/* §I4: /tournaments list + create. */
+.tournamentform { display: flex; flex-direction: column; gap: 12px; max-width: 480px; }
+.tournamentlist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.tournamentrow {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  background: var(--ink-3); border: 1px solid var(--line); border-radius: 12px;
+  padding: 12px 14px; text-decoration: none; color: inherit;
+}
+.tournamentrow:hover { border-color: var(--gold); }
+.tournamentrow__name { font-size: 17px; }
+.tournamentrow__meta { color: var(--muted); font-size: 14px; margin-right: auto; }
+.badge {
+  font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase;
+  border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; color: var(--muted);
+}
+.badge--live { color: var(--gold); border-color: var(--gold); }
+
+/* §I4: /tournaments/:id — the control room. Rounds as columns. */
+.tournamenthead { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.tournamenthead__actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.roundcols { display: flex; gap: 14px; overflow-x: auto; align-items: flex-start; padding-bottom: 8px; }
+.roundcol {
+  min-width: 250px; max-width: 330px; flex: 1 0 250px;
+  background: var(--ink-2); border: 1px solid var(--line); border-radius: 14px;
+  padding: 12px; display: flex; flex-direction: column; gap: 10px;
+}
+.roundcol--next { border-style: dashed; background: transparent; }
+.roundcol__title { margin: 0; font-family: var(--font-display); font-size: 22px; letter-spacing: 0.06em; }
+.roundcol__actions { display: flex; flex-direction: column; gap: 8px; }
+.advancebtns { display: flex; gap: 8px; flex-wrap: wrap; }
+.tgamecard { background: var(--ink-3); border: 1px solid var(--line); border-radius: 12px; padding: 10px; }
+.tgamecard__head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 6px; }
+.tgamecard__status { color: var(--muted); font-size: 13px; }
+.tstandings { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.tstanding { display: flex; justify-content: space-between; gap: 8px; font-size: 14px; }
+.tstanding__rank { color: var(--gold); font-variant-numeric: tabular-nums; }
+.advancerbox {
+  border: 1px solid var(--gold); border-radius: 12px; padding: 10px;
+  background: rgba(237, 166, 63, 0.08); font-size: 14px;
+}
+.advancerlist { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
+
+/* §I4/§I5: the HostPage create-screen tournament banner. */
+.tournamentbanner { border-color: var(--gold); display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.tournamentbanner__line { margin: 0; font-size: 16px; }
+.tgamecard__host { margin: 4px 0 8px; width: 100%; }

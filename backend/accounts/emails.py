@@ -26,13 +26,24 @@ def _send(subject: str, body: str, to_email: str) -> None:
         logger.warning("Email send failed (subject=%r, to=%r)", subject, to_email, exc_info=True)
 
 
+def greeting_name(user) -> str:
+    """§G (Handoff #13): what an email calls the person — display name if
+    set, else the email's LOCAL-PART ("sam", not "sam@gmail.com"). The ONE
+    place this rule lives (C1); every greeting below flows through it — the
+    same full-email fallback #12 killed in the navbar, killed here too.
+    Never returns a full address."""
+    if user.display_name:
+        return user.display_name
+    return (user.email or "").split("@")[0]
+
+
 def send_password_reset_email(user, reset_url: str) -> None:
     """§K1: the forgot-password link. The caller guarantees the user exists —
     the enumeration-safe 200 is the VIEW's job, not this helper's."""
     _send(
         "Reset your Drinkquiry password",
         (
-            f"Hi {user.display_name or user.email},\n\n"
+            f"Hi {greeting_name(user)},\n\n"
             "Someone (hopefully you) asked to reset the password for this "
             "Drinkquiry account. Follow this link to pick a new one:\n\n"
             f"{reset_url}\n\n"
@@ -49,7 +60,7 @@ def send_password_changed_email(user) -> None:
     _send(
         "Your Drinkquiry password was changed",
         (
-            f"Hi {user.display_name or user.email},\n\n"
+            f"Hi {greeting_name(user)},\n\n"
             "Your Drinkquiry password was just changed, and every other "
             "signed-in session was logged out.\n\n"
             "If this wasn't you, reset your password right away from the "
@@ -88,7 +99,7 @@ def send_moderation_outcome_email(item, *, approved: bool, actor) -> None:
     if approved:
         subject = f"Your {kind} was approved"
         body = (
-            f"Hi {owner.display_name or owner.email},\n\n"
+            f"Hi {greeting_name(owner)},\n\n"
             f"Good news — your {kind} '{label}'{where} passed review and is "
             "now live for everyone's games.\n\n"
             "— Drinkquiry"
@@ -96,7 +107,7 @@ def send_moderation_outcome_email(item, *, approved: bool, actor) -> None:
     else:
         subject = f"Your {kind} wasn't approved"
         body = (
-            f"Hi {owner.display_name or owner.email},\n\n"
+            f"Hi {greeting_name(owner)},\n\n"
             f"A moderator reviewed your {kind} '{label}'{where} and didn't "
             "approve it for public play. Their note:\n\n"
             f"  {item.moderation_note or '(no note)'}\n\n"

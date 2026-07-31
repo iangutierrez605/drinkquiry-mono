@@ -291,7 +291,7 @@ class AdminUserApiTests(QuotaTestBase):
             "brand_name", "brand_logo",
         }
         self.assertEqual(set(row), expected_keys)
-        self.assertEqual(set(row["usage"]), {"games_this_month", "categories", "questions", "storage"})
+        self.assertEqual(set(row["usage"]), {"games_this_month", "categories", "questions", "storage", "tournaments"})
         # search by email fragment and by display name
         res = self.client.get("/api/moderation/users/?search=paid@")
         self.assertEqual([r["email"] for r in res.data["results"]], ["paid@test.com"])
@@ -459,6 +459,55 @@ class ChangePasswordTests(PasswordFlowTestBase):
                                    **self.bearer(token))
         self.assertEqual(res.status_code, 200, res.content)
         self.knox_login("free@test.com", "fresh-pass-456")
+
+
+# ---------------------------------------------------------------------------
+# Handoff #13 §G — emails greet the person, never the address
+# ---------------------------------------------------------------------------
+class EmailGreetingTests(PasswordFlowTestBase):
+    """§G: every greeting flows through emails.greeting_name — display name
+    if set, else the email LOCAL-PART. A full address must never appear in a
+    greeting line (the same rule #12 pinned for the navbar)."""
+
+    def setUp(self):
+        super().setUp()
+        # A user who never set a display name — the fallback case.
+        self.nameless = User.objects.create_user("sam.quiz@test.com", "sturdy-pass-123")
+        self.assertEqual(self.nameless.display_name, "")
+
+    def greeting_line(self):
+        self.assertEqual(len(mail.outbox), 1)
+        return mail.outbox[0].body.splitlines()[0]
+
+    def test_reset_email_greets_display_name(self):
+        self.client.post("/api/auth/password/forgot/", {"email": "free@test.com"})
+        self.assertEqual(self.greeting_line(), "Hi Free,")
+
+    def test_reset_email_falls_back_to_local_part_never_the_address(self):
+        self.client.post("/api/auth/password/forgot/", {"email": "sam.quiz@test.com"})
+        line = self.greeting_line()
+        self.assertEqual(line, "Hi sam.quiz,")
+        self.assertNotIn("sam.quiz@test.com", line)
+        # Stronger: the full address appears nowhere in the reset body at all
+        # (the link carries a base64 uid, not the email).
+        self.assertNotIn("sam.quiz@test.com", mail.outbox[0].body)
+
+    def test_changed_email_greets_local_part_for_nameless_user(self):
+        token = self.knox_login("sam.quiz@test.com", "sturdy-pass-123")
+        res = self.client.post("/api/auth/password/change/",
+                               {"current_password": "sturdy-pass-123", "new_password": "fresh-pass-456"},
+                               **self.bearer(token))
+        self.assertEqual(res.status_code, 200, res.content)
+        line = self.greeting_line()
+        self.assertEqual(line, "Hi sam.quiz,")
+        self.assertNotIn("@", line)
+
+    def test_changed_email_greets_display_name(self):
+        token = self.knox_login("free@test.com", "sturdy-pass-123")
+        self.client.post("/api/auth/password/change/",
+                         {"current_password": "sturdy-pass-123", "new_password": "fresh-pass-456"},
+                         **self.bearer(token))
+        self.assertEqual(self.greeting_line(), "Hi Free,")
 
 
 # ---------------------------------------------------------------------------

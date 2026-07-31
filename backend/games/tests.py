@@ -15,7 +15,9 @@ environment-parity rule, once through docker compose against Postgres before
 shipping).
 """
 import json
+from datetime import timedelta
 
+from django.utils import timezone
 from rest_framework.test import APITestCase
 
 from accounts.models import User
@@ -24,13 +26,16 @@ from trivia.models import Category, Question
 from rest_framework.exceptions import ValidationError as DRFValidationError
 
 from .models import BoardCell, BoardColumn, Game, GameStatus, Participant, ParticipantRole
+from .models import Tournament, TournamentAdvancer
 from .services import (
     ActionError,
     StructuredActionError,
+    advance_round,
     assign_drink,
     close_cell,
     create_game,
     finalize_game,
+    game_standings,
     judge_buzz,
     open_cell,
     register_buzz,
@@ -436,6 +441,67 @@ class JoinCapAndSoundTests(GameTestBase):
         # carries "TEAM A" for a "Team A" join.
         self.assertEqual(by_name["TEAM A"]["buzzer_sound"], 1)
         self.assertIn("buzzer_sound", by_name["Host"])  # host seat has one, never plays it
+
+
+# ---------------------------------------------------------------------------
+# Handoff #13 §H — the buzz sound is a HOST choice, per GAME
+# ---------------------------------------------------------------------------
+class GameBuzzSoundTests(GameTestBase):
+    """§H: Game.buzz_sound (1–4, default 1) — set at creation only, rides the
+    snapshot top-level so buzzers AND the board play the same sound. The
+    per-participant `buzzer_sound` stays in payloads untouched this session
+    (C12 — its tests above keep pinning it; removal is §M)."""
+
+    def setUp(self):
+        self.cat = seed_category("Soundcat")
+        self.as_host()
+
+    def create_via_api(self, **extra):
+        body = {"mode": "drinks", "categories": [self.cat.id], "questions_per_category": 2, **extra}
+        return self.client.post("/api/games/", body, format="json")
+
+    def test_create_with_each_valid_sound(self):
+        for sound in (1, 2, 3, 4):
+            res = self.create_via_api(buzz_sound=sound)
+            self.assertEqual(res.status_code, 201, res.data)
+            code = res.json()["game"]["code"]
+            self.assertEqual(Game.objects.get(code=code).buzz_sound, sound)
+            # And the create response's own snapshot already carries it.
+            self.assertEqual(res.json()["game"]["buzz_sound"], sound)
+
+    def test_invalid_sounds_400(self):
+        for bad in (0, 5, "x"):
+            res = self.create_via_api(buzz_sound=bad)
+            self.assertEqual(res.status_code, 400, (bad, res.data))
+            self.assertIn("buzz_sound", res.json())
+        self.assertEqual(Game.objects.count(), 0)  # nothing half-created
+
+    def test_default_is_1_when_omitted(self):
+        res = self.create_via_api()
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertEqual(res.json()["game"]["buzz_sound"], 1)
+
+    def test_service_validates_too(self):
+        # rule 4 lives where the mutation lives — the suite (and the socket)
+        # call services directly, so the serializer alone is not the gate.
+        with self.assertRaises(DRFValidationError):
+            create_game(host=self.host, mode="drinks", category_ids=[self.cat.id],
+                        questions_per_category=2, buzz_sound=7)
+
+    def test_snapshot_carries_top_level_buzz_sound(self):
+        game = create_game(host=self.host, mode="drinks", category_ids=[self.cat.id],
+                           questions_per_category=2, buzz_sound=3)
+        snap = self.client.get(f"/api/games/{game.code}/").json()
+        self.assertEqual(snap["buzz_sound"], 3)
+
+    def test_pre_13_game_defaults_to_1(self):
+        # Forward-path sanity in-suite: a Game row created without the field
+        # (exactly what the migration leaves behind for old games) snapshots
+        # buzz_sound=1. The pristine-tree migration run (C9) covers the real
+        # thing; this pins the default the snapshot serves.
+        game = make_game(self.host)
+        snap = self.client.get(f"/api/games/{game.code}/").json()
+        self.assertEqual(snap["buzz_sound"], 1)
 
 
 # ---------------------------------------------------------------------------
@@ -1363,3 +1429,441 @@ class CellSerializerTripwireTests(GameTestBase):
             set(data), {"id", "row", "value", "state", "answered_by", "answered_correctly"}
         )
         self.assertEqual(data["answered_by"], a.id)
+
+
+# ---------------------------------------------------------------------------
+# Handoff #13 §I — tournament mode v1
+# ---------------------------------------------------------------------------
+class TournamentTestBase(GameTestBase):
+    """Shared plumbing: a CREATOR host (tournament creation is plan-gated
+    through the quota choke point — free's limit is 0), plus helpers to
+    build attached round games and score them."""
+
+    def setUp(self):
+        self.host.plan = "creator"
+        self.host.save(update_fields=["plan"])
+        self.as_host()
+
+    def api_create(self, name="Summer Fest Trivia Tournament", location="Ian's Bar Venue"):
+        return self.client.post("/api/tournaments/", {"name": name, "location": location}, format="json")
+
+    def make_tournament(self, owner=None, **kw):
+        kw.setdefault("name", f"Cup {Tournament.objects.count()}")
+        return Tournament.objects.create(owner=owner or self.host, **kw)
+
+    def attached_game(self, tournament, round_number=1, n=2):
+        cat = seed_category(f"TCat-{Game.objects.count()}", n_questions=n)
+        return create_game(
+            host=self.host, mode="points", category_ids=[cat.id],
+            questions_per_category=n, tournament=tournament, round_number=round_number,
+        )
+
+    def score_and_finish(self, game, scores: dict):
+        """Add players with the given name→score map, then finalize."""
+        players = {}
+        for name, score in scores.items():
+            p = Participant.objects.create(game=game, name=name, score=score)
+            players[name] = p
+        finalize_game(code=game.code)
+        return players
+
+
+class TournamentCrudTests(TournamentTestBase):
+    def test_create_exact_shape_and_list_own_only(self):
+        res = self.api_create()
+        self.assertEqual(res.status_code, 201, res.data)
+        body = res.json()
+        self.assertEqual(
+            set(body), {"id", "name", "location", "created_at", "finished_at"}
+        )
+        self.assertEqual(body["name"], "Summer Fest Trivia Tournament")
+        self.assertEqual(body["location"], "Ian's Bar Venue")
+        self.assertIsNone(body["finished_at"])
+        # someone else's tournament never shows in my list
+        self.make_tournament(owner=self.rival, name="Rival Cup")
+        rows = self.client.get("/api/tournaments/").json()["results"]
+        self.assertEqual([r["name"] for r in rows], ["Summer Fest Trivia Tournament"])
+
+    def test_location_optional_and_name_bounds(self):
+        res = self.client.post("/api/tournaments/", {"name": "No Venue"}, format="json")
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertEqual(res.json()["location"], "")
+        self.assertEqual(self.client.post("/api/tournaments/", {}, format="json").status_code, 400)
+        res = self.client.post("/api/tournaments/", {"name": "x" * 81}, format="json")
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("name", res.json())
+
+    def test_duplicate_live_name_400_reusable_after_soft_delete(self):
+        first = self.api_create().json()
+        res = self.api_create()  # same name, same owner, still live
+        self.assertEqual(res.status_code, 400, res.data)
+        self.assertEqual(res.json(), {"name": ["You already have a live tournament with that name."]})
+        # a DIFFERENT owner may reuse the name (per-owner constraint)
+        self.make_tournament(owner=self.rival, name="Summer Fest Trivia Tournament")
+        # soft delete frees it for me too (the FOURTH house partial)
+        self.assertEqual(self.client.delete(f"/api/tournaments/{first['id']}/").status_code, 204)
+        self.assertEqual(self.api_create().status_code, 201)
+        row = Tournament.objects.get(pk=first["id"])
+        self.assertIsNotNone(row.deleted_at)  # soft, not gone
+
+    def test_retrieve_is_owner_scoped_404(self):
+        other = self.make_tournament(owner=self.rival)
+        self.assertEqual(self.client.get(f"/api/tournaments/{other.pk}/").status_code, 404)
+        deleted = self.make_tournament(deleted_at=timezone.now())
+        self.assertEqual(self.client.get(f"/api/tournaments/{deleted.pk}/").status_code, 404)
+
+    def test_finish_is_idempotent(self):
+        t = self.make_tournament()
+        first = self.client.post(f"/api/tournaments/{t.pk}/finish/").json()
+        self.assertIsNotNone(first["finished_at"])
+        second = self.client.post(f"/api/tournaments/{t.pk}/finish/")
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.json()["finished_at"], first["finished_at"])  # never rewritten
+
+    def test_unauthenticated_401(self):
+        self.client.force_authenticate(user=None)
+        self.assertEqual(self.client.get("/api/tournaments/").status_code, 401)
+        self.assertEqual(self.client.post("/api/tournaments/", {"name": "X"}).status_code, 401)
+
+    def test_list_route_not_swallowed(self):
+        # Precedence pin (§I2): the collection root resolves as itself — and
+        # the long-standing games/history/ pin lives in HistoryEndpointTests.
+        self.assertEqual(self.client.get("/api/tournaments/").status_code, 200)
+
+
+class TournamentQuotaTests(TournamentTestBase):
+    def assert_quota_403(self, res, used, limit):
+        self.assertEqual(res.status_code, 403, res.content)
+        body = res.json()
+        self.assertEqual(set(body), {"detail", "code", "used", "limit"})
+        self.assertEqual(body["code"], "quota_tournaments")
+        self.assertEqual(body["used"], used)
+        self.assertEqual(body["limit"], limit)
+
+    def test_free_user_structured_403(self):
+        # The plan gate IS the quota choke point: free's limit is 0.
+        self.client.force_authenticate(self.rival)  # plain free account
+        res = self.client.post("/api/tournaments/", {"name": "Nope"}, format="json")
+        self.assert_quota_403(res, used=0, limit=0)
+        self.assertIn("creator", res.json()["detail"])  # the upsell copy
+
+    def test_expired_creator_plan_collapses_to_free(self):
+        self.host.plan_expires_at = timezone.now() - timedelta(days=1)
+        self.host.save(update_fields=["plan_expires_at"])
+        self.assert_quota_403(self.api_create(), used=0, limit=0)
+
+    def test_override_grants_a_free_user_through_the_choke_point(self):
+        self.rival.limit_overrides = {"tournaments": 1}
+        self.rival.save(update_fields=["limit_overrides"])
+        self.client.force_authenticate(self.rival)
+        self.assertEqual(self.client.post("/api/tournaments/", {"name": "Granted"}, format="json").status_code, 201)
+        res = self.client.post("/api/tournaments/", {"name": "One too many"}, format="json")
+        self.assert_quota_403(res, used=1, limit=1)
+
+    def test_soft_delete_frees_the_slot(self):
+        self.host.limit_overrides = {"tournaments": 1}
+        self.host.save(update_fields=["limit_overrides"])
+        first = self.api_create().json()
+        self.assert_quota_403(self.api_create(name="Another"), used=1, limit=1)
+        self.client.delete(f"/api/tournaments/{first['id']}/")
+        self.assertEqual(self.api_create(name="Another").status_code, 201)
+
+    def test_profile_usage_carries_the_meter(self):
+        self.make_tournament()
+        usage = self.client.get("/api/auth/profile/").json()["usage"]
+        self.assertEqual(usage["tournaments"], {"used": 1, "limit": 25})
+
+
+class TournamentAttachTests(TournamentTestBase):
+    def setUp(self):
+        super().setUp()
+        self.t = self.make_tournament(name="Attach Cup")
+        self.cat = seed_category("AttachCat")
+
+    def api_create_game(self, **extra):
+        body = {"mode": "points", "categories": [self.cat.id], "questions_per_category": 2, **extra}
+        return self.client.post("/api/games/", body, format="json")
+
+    def test_attach_persists_and_snapshots(self):
+        res = self.api_create_game(tournament=self.t.pk, round_number=1)
+        self.assertEqual(res.status_code, 201, res.data)
+        game = Game.objects.get(code=res.json()["game"]["code"])
+        self.assertEqual(game.tournament_id, self.t.pk)
+        self.assertEqual(game.round_number, 1)
+        self.assertEqual(
+            res.json()["game"]["tournament"],
+            # location "" falls back server-side (→ brand_name → display
+            # name) — the full chain is pinned in SnapshotTournamentTests.
+            {"name": "Attach Cup", "location": "Host", "round_number": 1},
+        )
+
+    def test_someone_elses_tournament_404_no_leak(self):
+        other = self.make_tournament(owner=self.rival, name="Rival Cup")
+        res = self.api_create_game(tournament=other.pk, round_number=1)
+        self.assertEqual(res.status_code, 404)
+        self.assertEqual(res.json(), {"detail": "No such tournament."})
+        self.assertEqual(Game.objects.count(), 0)
+
+    def test_deleted_and_unknown_tournament_read_identically(self):
+        deleted = self.make_tournament(deleted_at=timezone.now())
+        r1 = self.api_create_game(tournament=deleted.pk, round_number=1)
+        r2 = self.api_create_game(tournament=999999, round_number=1)
+        self.assertEqual((r1.status_code, r2.status_code), (404, 404))
+        self.assertEqual(r1.json(), r2.json())
+
+    def test_finished_tournament_409_exact_shape(self):
+        self.t.finished_at = timezone.now()
+        self.t.save(update_fields=["finished_at"])
+        res = self.api_create_game(tournament=self.t.pk, round_number=2)
+        self.assertEqual(res.status_code, 409, res.data)
+        body = res.json()
+        self.assertEqual(set(body), {"detail", "code"})
+        self.assertEqual(body["code"], "tournament_finished")
+        self.assertEqual(Game.objects.count(), 0)
+
+    def test_pairing_is_both_or_neither(self):
+        res = self.api_create_game(tournament=self.t.pk)  # no round_number
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("round_number", res.json())
+        res = self.api_create_game(round_number=2)  # no tournament
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("round_number", res.json())
+        with self.assertRaises(DRFValidationError):  # the service is the gate too
+            create_game(host=self.host, mode="points", category_ids=[self.cat.id],
+                        questions_per_category=2, tournament=self.t)
+
+    def test_round_zero_rejected(self):
+        res = self.api_create_game(tournament=self.t.pk, round_number=0)
+        self.assertEqual(res.status_code, 400)
+        self.assertIn("round_number", res.json())
+
+
+class TournamentAdvanceTests(TournamentTestBase):
+    def setUp(self):
+        super().setUp()
+        self.t = self.make_tournament(name="Advance Cup")
+
+    def advance(self, round_number=1, per_game=1, tournament=None):
+        t = tournament or self.t
+        return self.client.post(
+            f"/api/tournaments/{t.pk}/rounds/{round_number}/advance/",
+            {"per_game": per_game}, format="json",
+        )
+
+    def test_game_standings_competition_ranking(self):
+        game = self.attached_game(self.t)
+        self.score_and_finish(game, {"A": 7, "B": 7, "C": 2})
+        game = Game.objects.prefetch_related("participants").get(pk=game.pk)
+        self.assertEqual(
+            game_standings(game),
+            [{"name": "A", "score": 7, "rank": 1},
+             {"name": "B", "score": 7, "rank": 1},
+             {"name": "C", "score": 2, "rank": 3}],
+        )
+
+    def test_unfinished_round_409_exact_shape(self):
+        self.attached_game(self.t)  # never finished
+        res = self.advance()
+        self.assertEqual(res.status_code, 409, res.data)
+        body = res.json()
+        self.assertEqual(set(body), {"detail", "code"})
+        self.assertEqual(body["code"], "tournament_round_incomplete")
+        self.assertEqual(TournamentAdvancer.objects.count(), 0)
+
+    def test_empty_round_409_exact_shape(self):
+        res = self.advance(round_number=3)
+        self.assertEqual(res.status_code, 409)
+        body = res.json()
+        self.assertEqual(set(body), {"detail", "code"})
+        self.assertEqual(body["code"], "tournament_round_empty")
+
+    def test_top_1_across_two_games_ties_included(self):
+        g1 = self.attached_game(self.t)
+        self.score_and_finish(g1, {"A": 5, "B": 3})
+        g2 = self.attached_game(self.t)
+        self.score_and_finish(g2, {"C": 7, "D": 7, "E": 2})  # tie at the top
+        res = self.advance(per_game=1)
+        self.assertEqual(res.status_code, 200, res.data)
+        body = res.json()
+        self.assertEqual(body["round_number"], 1)
+        self.assertEqual(body["per_game"], 1)
+        rows = body["advancers"]
+        self.assertEqual(
+            rows,
+            [{"round_number": 1, "name": "A", "rank": 1, "source_game": g1.code},
+             {"round_number": 1, "name": "C", "rank": 1, "source_game": g2.code},
+             {"round_number": 1, "name": "D", "rank": 1, "source_game": g2.code}],
+        )
+
+    def test_top_2_uses_competition_ranks(self):
+        g1 = self.attached_game(self.t)
+        self.score_and_finish(g1, {"A": 5, "B": 3, "C": 1})
+        g2 = self.attached_game(self.t)
+        self.score_and_finish(g2, {"D": 7, "E": 7, "F": 2})  # F is rank 3
+        res = self.advance(per_game=2)
+        names = [(r["name"], r["rank"]) for r in res.json()["advancers"]]
+        self.assertEqual(names, [("A", 1), ("B", 2), ("D", 1), ("E", 1)])  # F stays out
+
+    def test_rerun_replaces_the_rounds_rows(self):
+        g1 = self.attached_game(self.t)
+        self.score_and_finish(g1, {"A": 5, "B": 3})
+        self.advance(per_game=1)
+        self.assertEqual(TournamentAdvancer.objects.count(), 1)
+        res = self.advance(per_game=2)  # the host changed their mind
+        self.assertEqual(res.status_code, 200)
+        rows = TournamentAdvancer.objects.filter(tournament=self.t, round_number=1)
+        self.assertEqual({(r.name, r.rank) for r in rows}, {("A", 1), ("B", 2)})
+        self.assertEqual(rows.count(), 2)  # replaced, not appended
+
+    def test_rounds_are_independent(self):
+        g1 = self.attached_game(self.t, round_number=1)
+        self.score_and_finish(g1, {"A": 5})
+        self.advance(round_number=1, per_game=1)
+        g2 = self.attached_game(self.t, round_number=2)
+        self.score_and_finish(g2, {"A": 9})
+        self.advance(round_number=2, per_game=1)
+        by_round = {r.round_number for r in TournamentAdvancer.objects.filter(tournament=self.t)}
+        self.assertEqual(by_round, {1, 2})
+        # re-running round 2 leaves round 1 untouched
+        self.advance(round_number=2, per_game=1)
+        self.assertEqual(TournamentAdvancer.objects.filter(round_number=1).count(), 1)
+
+    def test_removed_players_never_advance(self):
+        game = self.attached_game(self.t)
+        players = self.score_and_finish(game, {"A": 9, "B": 3})
+        players["A"].removed_at = timezone.now()
+        players["A"].save(update_fields=["removed_at"])
+        res = self.advance(per_game=1)
+        self.assertEqual([r["name"] for r in res.json()["advancers"]], ["B"])
+
+    def test_per_game_strictly_1_or_2(self):
+        game = self.attached_game(self.t)
+        self.score_and_finish(game, {"A": 1})
+        for bad in (0, 3, True, "1", None):
+            res = self.client.post(
+                f"/api/tournaments/{self.t.pk}/rounds/1/advance/", {"per_game": bad}, format="json"
+            )
+            self.assertEqual(res.status_code, 400, (bad, res.data))
+            self.assertIn("per_game", res.json())
+        # omitted → defaults to 1
+        res = self.client.post(f"/api/tournaments/{self.t.pk}/rounds/1/advance/", {}, format="json")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["per_game"], 1)
+
+    def test_finished_tournament_rejects_advance(self):
+        game = self.attached_game(self.t)
+        self.score_and_finish(game, {"A": 1})
+        self.t.finished_at = timezone.now()
+        self.t.save(update_fields=["finished_at"])
+        res = self.advance()
+        self.assertEqual(res.status_code, 409)
+        self.assertEqual(res.json()["code"], "tournament_finished")
+
+    def test_advance_is_owner_scoped(self):
+        other = self.make_tournament(owner=self.rival, name="Rival Cup")
+        self.assertEqual(self.advance(tournament=other).status_code, 404)
+
+    def test_service_is_atomic_on_rejection(self):
+        # An unfinished game ANYWHERE in the round leaves prior rows intact:
+        # the delete+rewrite happens inside one transaction that never commits.
+        g1 = self.attached_game(self.t)
+        self.score_and_finish(g1, {"A": 5})
+        self.advance(per_game=1)
+        self.attached_game(self.t)  # a second, unfinished round-1 game
+        res = self.advance(per_game=1)
+        self.assertEqual(res.status_code, 409)
+        self.assertEqual(TournamentAdvancer.objects.filter(round_number=1).count(), 1)  # round 1's rows survived
+
+
+class TournamentDetailAndRule5Tests(TournamentTestBase):
+    def test_detail_games_standings_and_advancers(self):
+        t = self.make_tournament(name="Detail Cup", location="The Snug")
+        g1 = self.attached_game(t)
+        self.score_and_finish(g1, {"A": 5, "B": 3})
+        live = self.attached_game(t, round_number=2)  # unfinished → null standings
+        advance_round(tournament=t, round_number=1, per_game=1)
+        body = self.client.get(f"/api/tournaments/{t.pk}/").json()
+        self.assertEqual(
+            set(body), {"id", "name", "location", "created_at", "finished_at", "games", "advancers"}
+        )
+        by_code = {g["code"]: g for g in body["games"]}
+        self.assertEqual(
+            set(by_code[g1.code]),
+            {"code", "mode", "status", "round_number", "created_at", "finished_at", "standings"},
+        )
+        self.assertEqual(
+            by_code[g1.code]["standings"],
+            [{"name": "A", "score": 5, "rank": 1}, {"name": "B", "score": 3, "rank": 2}],
+        )
+        self.assertIsNone(by_code[live.code]["standings"])
+        self.assertEqual(
+            body["advancers"],
+            [{"round_number": 1, "name": "A", "rank": 1, "source_game": g1.code}],
+        )
+
+    def test_no_question_content_anywhere_in_tournament_payloads(self):
+        # Rule 5, the grep way (#12's public-categories pattern): play a full
+        # cell — question opened, answer revealed, cell closed — then assert
+        # the seeded SECRET- answers and any question text appear NOWHERE in
+        # the detail or advance payloads.
+        t = self.make_tournament(name="Secret Cup")
+        game = self.attached_game(t)
+        (player,) = self.add_players(game, "A")
+        cell = self.cells(game)[0]
+        open_cell(code=game.code, cell_id=cell.id)
+        set_buzzer(code=game.code, is_open=True)
+        register_buzz(code=game.code, participant=player)
+        judge_buzz(code=game.code, participant_id=player.pk, correct=True)
+        close_cell(code=game.code)
+        finalize_game(code=game.code)
+        detail = self.client.get(f"/api/tournaments/{t.pk}/").json()
+        adv = self.client.post(
+            f"/api/tournaments/{t.pk}/rounds/1/advance/", {"per_game": 1}, format="json"
+        ).json()
+        for payload in (detail, adv):
+            blob = json.dumps(payload)
+            self.assertNotIn("SECRET-", blob)
+            self.assertNotIn("question_text", blob)
+            self.assertNotIn("answer", blob)
+
+
+class SnapshotTournamentTests(TournamentTestBase):
+    def test_plain_game_snapshot_tournament_null(self):
+        # The forward-path shape: every pre-#13 game (and every plain new
+        # one) carries tournament: null and behaves exactly as before.
+        game = make_game(self.host)
+        snap = self.client.get(f"/api/games/{game.code}/").json()
+        self.assertIsNone(snap["tournament"])
+
+    def test_attached_game_snapshot_block_exact_shape(self):
+        t = self.make_tournament(name="Snap Cup", location="Ian's Bar Venue")
+        game = self.attached_game(t, round_number=2)
+        snap = self.client.get(f"/api/games/{game.code}/").json()
+        self.assertEqual(
+            snap["tournament"],
+            {"name": "Snap Cup", "location": "Ian's Bar Venue", "round_number": 2},
+        )
+
+    def test_location_falls_back_to_brand_then_display_name(self):
+        t = self.make_tournament(name="Fallback Cup")  # location ""
+        game = self.attached_game(t)
+        code = game.code
+        self.host.brand_name = "THE KINGS ARMS"
+        self.host.save(update_fields=["brand_name"])
+        snap = self.client.get(f"/api/games/{code}/").json()
+        self.assertEqual(snap["tournament"]["location"], "THE KINGS ARMS")
+        self.host.brand_name = ""
+        self.host.save(update_fields=["brand_name"])
+        snap = self.client.get(f"/api/games/{code}/").json()
+        self.assertEqual(snap["tournament"]["location"], "Host")  # display_name
+        self.host.display_name = ""
+        self.host.save(update_fields=["display_name"])
+        snap = self.client.get(f"/api/games/{code}/").json()
+        self.assertIsNone(snap["tournament"]["location"])  # frontend hides the line
+
+    def test_join_response_snapshot_carries_it(self):
+        t = self.make_tournament(name="Join Cup", location="The Snug")
+        game = self.attached_game(t)
+        res = self.client.post(f"/api/games/{game.code}/join/", {"name": "Team A"}, format="json")
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.json()["game"]["tournament"]["name"], "Join Cup")

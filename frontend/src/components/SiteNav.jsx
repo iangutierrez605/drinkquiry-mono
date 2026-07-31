@@ -73,6 +73,12 @@ export default function SiteNav() {
         <NavLink to="/host" className={navClass}>
           Host
         </NavLink>
+        {/* §I (Handoff #13): the tournament control room. Visible to all
+            signed-in states — the page itself upsells free accounts (the
+            server's meter is the gate, so overrides just work). */}
+        <NavLink to="/tournaments" className={navClass}>
+          Tournaments
+        </NavLink>
         <NavLink to="/create" className={navClass}>
           Make questions
         </NavLink>

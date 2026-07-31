@@ -70,8 +70,29 @@ def _preference_ordered(qs, host):
 
 
 @transaction.atomic
-def create_game(*, host, mode: str, category_ids: list[int], questions_per_category: int) -> Game:
+def create_game(
+    *,
+    host,
+    mode: str,
+    category_ids: list[int],
+    questions_per_category: int,
+    buzz_sound: int = 1,
+    tournament=None,
+    round_number: int | None = None,
+) -> Game:
     """Build a game board from `category_ids`, in the order given.
+
+    §H (Handoff #13): `buzz_sound` is the host's per-game sound choice (1–4,
+    the four synthesized voices) — set at creation ONLY (mid-game change is
+    §M). Validated here as well as in the serializer because the suite calls
+    this directly (rule 4 lives where the mutation lives).
+
+    §I (Handoff #13): `tournament` is an already-RESOLVED Tournament instance
+    (or None) — ownership, liveness and the finished check are the VIEW's job
+    (they're HTTP-shaped: owner-scoped 404, the pinned tournament_finished
+    409 — the quota_denial placement pattern). Here we only enforce the
+    pairing: a tournament game always knows its round, a plain game has
+    neither.
 
     §G (Handoff #10), deliberate: this API is THEME-UNAWARE. Themes are a
     discovery/selection layer on the host create screen — they filter and
@@ -86,6 +107,12 @@ def create_game(*, host, mode: str, category_ids: list[int], questions_per_categ
     """
     if not (1 <= questions_per_category <= 10):
         raise ValidationError({"questions_per_category": "Must be between 1 and 10."})
+    if buzz_sound not in (1, 2, 3, 4):
+        raise ValidationError({"buzz_sound": "Pick one of the four sounds (1–4)."})
+    if (tournament is None) != (round_number is None):
+        raise ValidationError({"round_number": "A tournament game needs both a tournament and a round number."})
+    if round_number is not None and round_number < 1:
+        raise ValidationError({"round_number": "Rounds start at 1."})
     if not (1 <= len(category_ids) <= 8):
         raise ValidationError({"categories": "Pick between 1 and 8 categories."})
     if len(set(category_ids)) != len(category_ids):
@@ -146,7 +173,14 @@ def create_game(*, host, mode: str, category_ids: list[int], questions_per_categ
             }
         )
 
-    game = Game.objects.create(host=host, mode=mode, questions_per_category=questions_per_category)
+    game = Game.objects.create(
+        host=host,
+        mode=mode,
+        questions_per_category=questions_per_category,
+        buzz_sound=buzz_sound,
+        tournament=tournament,
+        round_number=round_number,
+    )
 
     ordered = {c.id: c for c in categories}
     for position, category_id in enumerate(category_ids):
@@ -483,3 +517,86 @@ def finalize_game(*, code: str) -> Game:
         top = max(p.score for p in players)
         game.winners.set([p for p in players if p.score == top])
     return game
+
+
+# --- §I (Handoff #13): tournament standings + advancement -------------------
+
+
+def game_standings(game) -> list[dict]:
+    """§I2: {name, score, rank} rows for one game's ACTIVE players, best
+    first — computed from the SAME truths finalize_game uses (highest score
+    among role=player, removed excluded; the documented drinks-mode reading:
+    score is the credit side, so highest score == most drinks dealt).
+    Competition ranking (1, 1, 3): ties share a rank, exactly as ties share
+    the winners crown. Names only + scores — rule 5: no question content on
+    any tournament surface. Filters the PREFETCHED participants in Python
+    (the get_participants convention) so detail views pay no extra query."""
+    players = [
+        p for p in game.participants.all()
+        if p.role == ParticipantRole.PLAYER and p.removed_at is None
+    ]
+    players.sort(key=lambda p: (-p.score, p.name))
+    standings = []
+    prev_score = None
+    prev_rank = 0
+    for position, player in enumerate(players, start=1):
+        rank = prev_rank if player.score == prev_score else position
+        standings.append({"name": player.name, "score": player.score, "rank": rank})
+        prev_score, prev_rank = player.score, rank
+    return standings
+
+
+@transaction.atomic
+def advance_round(*, tournament, round_number: int, per_game: int) -> list:
+    """§I2: compute + persist who goes through from round N — host-CONFIRMED
+    (this only runs when the host presses Advance), server-COMPUTED (rule 4).
+
+    `per_game` (1 or 2 — "winners and/or 2nd") means everyone with rank <=
+    per_game in their game advances; a tie at a qualifying rank advances
+    everyone in it (ties are real, exactly like Game.winners).
+
+    Chosen semantics, pinned by tests: RE-RUNNABLE, not merely idempotent —
+    a second call REPLACES the round's advancers wholesale (delete + rewrite
+    inside this transaction), so a host can change their mind (top-1 →
+    top-2) before round N+1 starts. The row lock on the tournament
+    serializes concurrent calls; the caller still catches IntegrityError
+    OUTSIDE this atomic block (the house rule — this mutation is exactly the
+    kind of place that foot-gun bites).
+
+    Rejections (StructuredActionError, new C4-pinned codes):
+      - a round with no games        → "tournament_round_empty"
+      - any round game not finished  → "tournament_round_incomplete"
+    """
+    from .models import Tournament, TournamentAdvancer  # local: keeps module import order simple
+
+    locked = Tournament.objects.select_for_update().get(pk=tournament.pk)
+    games = list(
+        locked.games.filter(round_number=round_number)
+        .order_by("created_at", "id")
+        .prefetch_related("participants")
+    )
+    if not games:
+        raise StructuredActionError(
+            f"Round {round_number} has no games yet.", "tournament_round_empty"
+        )
+    unfinished = [g.code for g in games if g.status != GameStatus.FINISHED]
+    if unfinished:
+        raise StructuredActionError(
+            f"Round {round_number} isn't finished — still playing: {', '.join(sorted(unfinished))}.",
+            "tournament_round_incomplete",
+        )
+    TournamentAdvancer.objects.filter(tournament=locked, round_number=round_number).delete()
+    rows = [
+        TournamentAdvancer(
+            tournament=locked,
+            round_number=round_number,
+            name=entry["name"],
+            source_game=game,
+            rank=entry["rank"],
+        )
+        for game in games
+        for entry in game_standings(game)
+        if entry["rank"] <= per_game
+    ]
+    TournamentAdvancer.objects.bulk_create(rows)
+    return rows

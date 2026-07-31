@@ -241,9 +241,10 @@ class GameConsumer(AsyncJsonWebsocketConsumer):
     def _snapshot(self):
         game = (
             Game.objects.prefetch_related("columns__cells", "columns__category", "participants")
-            # "host" feeds §H's brand — selected here so no snapshot pays an
-            # extra query for it (the cells_remaining N+1 lesson).
-            .select_related("current_cell__question", "judged_participant", "host")
+            # "host" feeds the brand, "tournament" §I's identity block —
+            # selected here so no snapshot pays an extra query for either
+            # (the cells_remaining N+1 lesson).
+            .select_related("current_cell__question", "judged_participant", "host", "tournament")
             .get(code=self.code)
         )
         data = GameStateSerializer(game).data

@@ -33,11 +33,18 @@ function JoinForm({ code, existing, onJoined, onDropSeat }) {
   // ARMS"). Pre-join there's no socket yet, so one unauthenticated snapshot
   // fetch supplies it — optional sugar, a failure just shows nothing.
   const [brand, setBrand] = useState(null);
+  // §I (#13): the join screen's compact tournament line — same snapshot
+  // fetch, another display-only field.
+  const [tournament, setTournament] = useState(null);
   useEffect(() => {
     let alive = true;
     api
       .gameSnapshot(code)
-      .then((snap) => alive && setBrand(snap.brand ?? null))
+      .then((snap) => {
+        if (!alive) return;
+        setBrand(snap.brand ?? null);
+        setTournament(snap.tournament ?? null);
+      })
       .catch(() => {});
     return () => {
       alive = false;
@@ -46,6 +53,13 @@ function JoinForm({ code, existing, onJoined, onDropSeat }) {
   const brandLine = brand?.name ? (
     <p className="joinbrand">
       hosted by <strong>{brand.name}</strong>
+    </p>
+  ) : null;
+  // §I3 (#13): above the brand line at both render sites — teams should see
+  // they're joining ROUND N of a named thing before they type.
+  const tournamentLine = tournament ? (
+    <p className="jointournament">
+      🏆 {tournament.name} — Round {tournament.round_number}
     </p>
   ) : null;
 
@@ -86,6 +100,7 @@ function JoinForm({ code, existing, onJoined, onDropSeat }) {
     return (
       <div className="page page--center page--buzzer">
         <div className="wordmark">DRINKQUIRY</div>
+        {tournamentLine}
         {brandLine}
         <p className="joincode">
           Game <strong>{code}</strong>
@@ -111,6 +126,7 @@ function JoinForm({ code, existing, onJoined, onDropSeat }) {
   return (
     <div className="page page--center page--buzzer">
       <div className="wordmark">DRINKQUIRY</div>
+      {tournamentLine}
       {brandLine}
       <p className="joincode">
         Game <strong>{code}</strong>
@@ -204,15 +220,16 @@ function BuzzerLive({ code, seat, onBadSeat }) {
   const canBuzz = game?.status === "active" && !!cell && game.buzzer_open && !alreadyBuzzed;
 
   // Press feedback independent of network. The tap itself is the user
-  // gesture, so playing our OWN sound here (§I) satisfies autoplay policy and
-  // gives tactile feedback before the server round-trip. Sound id comes from
-  // the snapshot (server-assigned), never guessed locally.
+  // gesture, so playing here satisfies autoplay policy and gives tactile
+  // feedback before the server round-trip. §H (#13): the sound is now THE
+  // GAME'S (host-chosen snapshot.buzz_sound) — every phone makes the same
+  // noise, as asked. Server state, never guessed locally (rule 1).
   const [pressed, setPressed] = useState(false);
   const pressTimer = useRef(null);
   const buzz = () => {
     if (!canBuzz) return;
     ensureAudio();
-    playBuzz(self?.buzzer_sound ?? 1);
+    playBuzz(game?.buzz_sound ?? 1);
     send("buzz");
     setPressed(true);
     clearTimeout(pressTimer.current);

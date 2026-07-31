@@ -39,6 +39,10 @@ def rest():
 
     r = requests.post(f"{BASE}/api/auth/register/", json={
         "email": "host@test.com", "password": "sturdy-pass-123", "display_name": "Quizmaster"})
+    assert "Verification failed" not in r.text, (
+        "This server has TURNSTILE_SECRET_KEY set — the smoke cannot solve a "
+        "Turnstile challenge. Run it against an env without the key (dev/"
+        "compose smoke env), or unset it for the run.")
     assert r.status_code in (200, 201) or "already exists" in r.text, r.text
     ok("register (or already registered)")
     r = requests.post(f"{BASE}/api/auth/login/", json={"email": "host@test.com", "password": "sturdy-pass-123"})
@@ -152,10 +156,16 @@ def rest():
     ok(f"shortage 400 surfaced: {r.json()['categories'][0][:60]}…")
 
     r = requests.post(f"{BASE}/api/games/", headers={"Authorization": f"Token {knox}"},
-                      json={"mode": "drinks", "categories": [c["id"] for c in cats[:3]], "questions_per_category": 5})
+                      json={"mode": "drinks", "categories": [c["id"] for c in cats[:3]], "questions_per_category": 5,
+                            "buzz_sound": 3})
     assert r.status_code == 201, r.text
     d = r.json(); code, host_token = d["game"]["code"], d["participant_token"]
-    ok(f"create game → {code}, host participant token")
+    # §H (#13): the host's per-game sound rides the snapshot; §I: a plain
+    # game carries tournament: null (the forward-path shape). Both asserted
+    # on the create response we already have — zero new requests (§L).
+    assert d["game"]["buzz_sound"] == 3, d["game"].get("buzz_sound")
+    assert d["game"]["tournament"] is None, d["game"].get("tournament")
+    ok(f"create game → {code}; snapshot buzz_sound=3 (host's pick, §H), tournament=null (plain game, §I)")
 
     r = requests.get(f"{BASE}/api/games/{code}/")
     assert r.status_code == 200 and r.json()["status"] == "lobby"
@@ -245,10 +255,13 @@ async def ws_flow(code, host_tok, a_tok, a_id, b_tok, b_id, knox, fknox):
         s = (await latest_state(host))["game"]
         assert {p["name"] for p in s["participants"]} >= {"TEAM A", "TEAM B"}
         assert all(c["cells"][0]["value"] == 1 for c in s["columns"])
+        # §H (#13): the same snapshot field over the socket — the board's
+        # WS path plays this sound (asserted on a frame we already read).
+        assert s["buzz_sound"] == 3, s.get("buzz_sound")
         # §H1 (Handoff #10): total = questions_per_category × columns at lobby.
         total_cells = sum(len(c["cells"]) for c in s["columns"])
         assert s["cells_remaining"] == total_cells == 15, (s.get("cells_remaining"), total_cells)
-        ok(f"snapshot on connect; drinks-mode values = row drinks; cells_remaining == {total_cells} (§H1)")
+        ok(f"snapshot on connect carries buzz_sound=3 over WS too (§H); cells_remaining == {total_cells} (§H1)")
 
         async def act(ws, action, **payload):
             await ws.send(json.dumps({"action": action, **payload}))
@@ -486,6 +499,102 @@ def media_round_trip():
     requests.delete(f"{BASE}/api/categories/{cat.json()['id']}/", headers=h)
     ok("media round-trip cleanup: question + category deleted (storage quota freed)")
 
+
+
+def tournament_story(knox, fknox):
+    """§I (Handoff #13): tournaments over the live wire — with ZERO new
+    register calls (§L: the 5/min register budget stays 2/run; joins are
+    unthrottled).
+
+    Two layers:
+      1. ALWAYS: the plan gate. The guaranteed-free account's create is the
+         structured quota_tournaments 403 (free's limit is 0 — that IS the
+         creator gate, same choke point as categories).
+      2. The FULL round-trip (create → attach a round-1 game → join →
+         advance-too-early 409 → WS finish → advance → detail) runs when the
+         MAIN smoke account can create. Promote host@test.com to creator in
+         /admin (or grant it a tournaments limit override) to light it up; a
+         default zero-setup run prints the SKIP line instead — the
+         media_round_trip convention.
+
+    RE-RUNNABLE: the tournament name is timestamped, so the per-owner
+    live-name constraint never collides across runs (chosen over
+    delete-at-end so the record stays inspectable after the run — soft
+    delete would also have freed the name, but a vanished tournament is a
+    worse debugging artifact than a pile of Smoke Cups).
+    """
+    fh = {"Authorization": f"Token {fknox}"}
+    r = requests.post(f"{BASE}/api/tournaments/", headers=fh, json={"name": "Nope Cup"})
+    b = r.json()
+    assert r.status_code == 403 and b.get("code") == "quota_tournaments", r.text
+    assert b["used"] == 0 and b["limit"] == 0 and "detail" in b, b
+    ok("free user tournament create → structured 403 {code: quota_tournaments, used: 0, limit: 0} (§I plan gate)")
+
+    hh = {"Authorization": f"Token {knox}"}
+    tname = f"Smoke Cup {int(time.time())}"
+    r = requests.post(f"{BASE}/api/tournaments/", headers=hh,
+                      json={"name": tname, "location": "Ian's Bar Venue"})
+    if r.status_code == 403 and r.json().get("code") == "quota_tournaments":
+        ok("SKIP full tournament story — host@test.com isn't a creator; promote it in /admin to light this up")
+        return
+    assert r.status_code == 201, r.text
+    tid = r.json()["id"]
+    assert r.json()["finished_at"] is None, r.text
+    ok(f"tournament created: '{tname}' at Ian's Bar Venue (id {tid})")
+
+    # Attach a round-1 game: the ORDINARY create call + the two §I fields.
+    cats = requests.get(f"{BASE}/api/categories/public/").json()["results"]
+    r = requests.post(f"{BASE}/api/games/", headers=hh,
+                      json={"mode": "points", "categories": [cats[0]["id"]],
+                            "questions_per_category": 1, "tournament": tid, "round_number": 1})
+    assert r.status_code == 201, r.text
+    d = r.json()
+    tcode, ttok = d["game"]["code"], d["participant_token"]
+    assert d["game"]["tournament"] == {"name": tname, "location": "Ian's Bar Venue",
+                                       "round_number": 1}, d["game"]["tournament"]
+    ok(f"round-1 game {tcode} attached; snapshot tournament block exact {{name, location, round_number}} (§I3)")
+
+    # One team, so advancement has someone to advance.
+    r = requests.post(f"{BASE}/api/games/{tcode}/join/", json={"name": "Cup Team"})
+    assert r.status_code == 201, r.text
+
+    # Advancing before the round's games finish → the pinned 409.
+    r = requests.post(f"{BASE}/api/tournaments/{tid}/rounds/1/advance/", headers=hh, json={"per_game": 1})
+    assert r.status_code == 409, r.text
+    b = r.json()
+    assert set(b) == {"detail", "code"} and b["code"] == "tournament_round_incomplete", b
+    ok('advance before the game finishes → 409 {"detail", code: "tournament_round_incomplete"} exact (§I2)')
+
+    async def finish_the_game():
+        async with websockets.connect(f"{WS}/ws/game/{tcode}/?token={ttok}", origin=ORIGIN) as host:
+            await recv_until(host, "state")
+            await host.send(json.dumps({"action": "start_game"}))
+            await recv_until(host, "state")
+            await host.send(json.dumps({"action": "finish_game"}))
+            s = (await latest_state(host))["game"]
+            assert s["status"] == "finished", s["status"]
+    asyncio.run(finish_the_game())
+    ok("round-1 game finished over WS (start → finish; a 0-point solo run is a fine result)")
+
+    r = requests.post(f"{BASE}/api/tournaments/{tid}/rounds/1/advance/", headers=hh, json={"per_game": 1})
+    assert r.status_code == 200, r.text
+    adv = r.json()
+    assert adv["round_number"] == 1 and adv["per_game"] == 1, adv
+    assert [(a["name"], a["rank"], a["source_game"]) for a in adv["advancers"]] == \
+        [("CUP TEAM", 1, tcode)], adv
+    ok("advance top-1 → CUP TEAM (rank 1) goes through (§I2)")
+
+    r = requests.get(f"{BASE}/api/tournaments/{tid}/", headers=hh)
+    assert r.status_code == 200, r.text
+    detail = r.json()
+    assert [a["name"] for a in detail["advancers"]] == ["CUP TEAM"], detail["advancers"]
+    games = {g["code"]: g for g in detail["games"]}
+    assert games[tcode]["standings"] == [{"name": "CUP TEAM", "score": 0, "rank": 1}], games[tcode]
+    blob = json.dumps(detail)
+    assert "question_text" not in blob and "SECRET" not in blob, \
+        "rule 5: no question content in tournament payloads"
+    ok("detail: game standings + advancers; NO question content anywhere in the payload (§I2, rule 5)")
+
 def password_flows(knox, fknox):
     """Handoff #9 §K4 — RE-RUNNABLE by construction: the smoke user's
     password is changed and changed BACK within this run (with a re-login in
@@ -537,6 +646,9 @@ def password_flows(knox, fknox):
 
 code, ht, at, aid, bt, bid, knox, fknox = rest()
 asyncio.run(ws_flow(code, ht, at, aid, bt, bid, knox, fknox))
+# §I (#13): BEFORE password_flows — that flow ends by killing the original
+# knox session (change-back revokes other sessions), and this story needs it.
+tournament_story(knox, fknox)
 password_flows(knox, fknox)
 if os.environ.get("SMOKE_MEDIA") == "1":
     media_round_trip()

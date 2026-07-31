@@ -8,6 +8,8 @@ import BoardPage from "./pages/BoardPage";
 import BuzzerPage from "./pages/BuzzerPage";
 import ModeratePage from "./pages/ModeratePage";
 import ProfilePage from "./pages/ProfilePage";
+import TournamentsPage from "./pages/TournamentsPage";
+import TournamentDetailPage from "./pages/TournamentDetailPage";
 import ResetPasswordPage from "./pages/ResetPasswordPage";
 import AuthScreen from "./components/AuthScreen";
 import SiteNav from "./components/SiteNav";
@@ -202,6 +204,10 @@ export default function App() {
           <Route path="/create" element={<CreatePage />} />
           <Route path="/moderate" element={<ModeratePage />} />
           <Route path="/profile" element={<ProfilePage />} />
+          {/* §I (Handoff #13): tournaments — inside ChromeLayout (SiteNav),
+              auth-funneled by the pages themselves like /host. */}
+          <Route path="/tournaments" element={<TournamentsPage />} />
+          <Route path="/tournaments/:id" element={<TournamentDetailPage />} />
           {/* §J2: catch-all — LAST inside the chrome so real routes win.
               The two chrome-free game routes below still match before it
               at the top level. */}

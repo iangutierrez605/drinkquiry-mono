@@ -2,6 +2,7 @@
 Drinkquiry settings — Django 6.0, environment-driven.
 """
 import os
+import sys
 from pathlib import Path
 
 import dj_database_url
@@ -262,9 +263,13 @@ if SECURE_HSTS_SECONDS:
 # its categories/questions quotas are 0); None = unlimited stays supported.
 # A missing key also reads as unlimited so older PLAN_LIMITS overrides in
 # tests keep working.
+# §I (Handoff #13): "tournaments" counts LIVE (non-soft-deleted) tournaments.
+# Free is 0 — that IS the creator-plan gate, via the same quota choke point
+# categories/questions use (structured quota_tournaments 403 with an upsell,
+# and a staff limit_overrides grant works for free accounts too).
 PLAN_LIMITS = {
-    "free":    {"games_per_month": None, "categories": 0,  "questions": 0,   "storage_bytes": 0},
-    "creator": {"games_per_month": None, "categories": 25, "questions": 500, "storage_bytes": 500 * 1024 * 1024},
+    "free":    {"games_per_month": None, "categories": 0,  "questions": 0,   "storage_bytes": 0,                 "tournaments": 0},
+    "creator": {"games_per_month": None, "categories": 25, "questions": 500, "storage_bytes": 500 * 1024 * 1024, "tournaments": 25},
 }
 
 # §G: hard cap on player (team) seats per game, enforced atomically in the
@@ -294,6 +299,19 @@ MAX_PLAYERS_PER_GAME = 6
 # forgot deliberately keep throttles as their defense (§F2/§F3).
 TURNSTILE_SECRET_KEY = os.environ.get("TURNSTILE_SECRET_KEY", "")
 TURNSTILE_SITE_KEY = os.environ.get("TURNSTILE_SITE_KEY", "")
+
+# #13 fix: the "suite runs keyless" promise is now ENFORCED, not assumed.
+# Running `manage.py test` inside an environment whose .env sets the
+# Turnstile secret (the compose api container, a configured droplet) used to
+# leak the feature into the suite — every register-touching test then 400'd
+# with "Verification failed" because verification fails CLOSED and tests
+# send no token. Under the test runner the keys are blanked; TurnstileTests
+# still exercises the ON behavior via its own explicit override_settings
+# (a decorator override beats this module-level default).
+TESTING = len(sys.argv) > 1 and sys.argv[1] == "test"
+if TESTING:
+    TURNSTILE_SECRET_KEY = ""
+    TURNSTILE_SITE_KEY = ""
 
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 if RESEND_API_KEY:

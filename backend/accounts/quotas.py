@@ -22,6 +22,8 @@ KINDS = {
     "games": "games this month",
     "categories": "custom categories",
     "questions": "custom questions",
+    # §I (Handoff #13): live tournaments — 0 for free IS the creator gate.
+    "tournaments": "tournaments",
 }
 
 
@@ -39,7 +41,7 @@ def limits_for(user) -> dict:
 
 # Valid override keys + the shared validator (§J2's PATCH uses this; kept
 # here so the key set can never drift from what limits_for merges).
-OVERRIDE_KEYS = ("games_per_month", "categories", "questions", "storage_bytes")
+OVERRIDE_KEYS = ("games_per_month", "categories", "questions", "storage_bytes", "tournaments")
 
 
 def validate_overrides(value) -> dict:
@@ -90,6 +92,13 @@ def questions_used(user) -> int:
     return Question.objects.filter(owner=user, deleted_at__isnull=True).count()
 
 
+def tournaments_used(user) -> int:
+    # §I (Handoff #13): live tournaments only — soft delete frees the slot,
+    # the same "active surface" convention questions/categories follow.
+    Tournament = apps.get_model("games", "Tournament")
+    return Tournament.objects.filter(owner=user, deleted_at__isnull=True).count()
+
+
 def storage_bytes_used(user) -> int:
     """§F3: summed from the persisted media_bytes/photo_bytes columns —
     maintained at save time by the models, so this never lists a bucket.
@@ -125,8 +134,14 @@ _COUNTERS = {
     "games": games_used_this_month,
     "categories": categories_used,
     "questions": questions_used,
+    "tournaments": tournaments_used,
 }
-_LIMIT_KEYS = {"games": "games_per_month", "categories": "categories", "questions": "questions"}
+_LIMIT_KEYS = {
+    "games": "games_per_month",
+    "categories": "categories",
+    "questions": "questions",
+    "tournaments": "tournaments",
+}
 
 
 def _storage_limit(user):
@@ -142,12 +157,17 @@ def usage(user) -> dict:
         "categories": {"used": categories_used(user), "limit": limits["categories"]},
         "questions": {"used": questions_used(user), "limit": limits["questions"]},
         "storage": {"used": storage_bytes_used(user), "limit": limits.get("storage_bytes")},
+        # §I (Handoff #13): the tournaments meter (.get: missing = unlimited).
+        "tournaments": {"used": tournaments_used(user), "limit": limits.get("tournaments")},
     }
 
 
 def _denial(user, kind: str, count: int) -> dict | None:
     """None if the user may create `count` more of `kind`; else the 403 body."""
-    limit = limits_for(user)[_LIMIT_KEYS[kind]]
+    # .get: a missing PLAN_LIMITS key reads as unlimited — the documented
+    # convention (see the settings comment; _storage_limit already does this)
+    # and what keeps older test override dicts working as new kinds land.
+    limit = limits_for(user).get(_LIMIT_KEYS[kind])
     if limit is None:  # unlimited
         return None
     used = _COUNTERS[kind](user)
