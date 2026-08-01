@@ -336,15 +336,52 @@ function UsageBadge({ count, noun = "time" }) {
 /**
  * §K1: nearest existing approved questions, fetched per card (its own
  * endpoint keeps the queue list snappy). A review AID — nothing here acts.
+ * #14c: the fetches are GATED. A full queue page mounts up to 50 cards
+ * (PAGE_SIZE) and HTTP/2 fires every per-card /similar simultaneously —
+ * a thundering herd that pinned 50+ DB connections at once and, with a
+ * mid-load reload stacking a second herd (the server keeps working on
+ * abandoned requests), hit Postgres' 100-connection cap. At most
+ * MAX_CONCURRENT_SIMILAR run at a time; cards still fill progressively
+ * top-to-bottom, and the whole page finishes FASTER because the calls no
+ * longer fight each other for CPU and connections.
  */
+const MAX_CONCURRENT_SIMILAR = 6;
+let similarInFlight = 0;
+const similarQueue = [];
+function acquireSimilarSlot() {
+  if (similarInFlight < MAX_CONCURRENT_SIMILAR) {
+    similarInFlight += 1;
+    return Promise.resolve();
+  }
+  // Full: wait. The slot is handed over directly in releaseSimilarSlot()
+  // (no decrement/increment gap), so the cap can never be overshot.
+  return new Promise((resolve) => similarQueue.push(resolve));
+}
+function releaseSimilarSlot() {
+  const next = similarQueue.shift();
+  if (next) next(); // pass the slot straight to the next waiter
+  else similarInFlight -= 1;
+}
+
 function SimilarMatches({ auth, questionId }) {
   const [similar, setSimilar] = useState(null);
   useEffect(() => {
     let alive = true;
-    api
-      .moderationSimilar(auth.token, questionId)
-      .then((r) => alive && setSimilar(r.similar))
-      .catch(() => alive && setSimilar([])); // the aid is optional; approve/reject still work
+    (async () => {
+      await acquireSimilarSlot();
+      if (!alive) {
+        releaseSimilarSlot(); // unmounted while queued (e.g. tab switch)
+        return;
+      }
+      try {
+        const r = await api.moderationSimilar(auth.token, questionId);
+        if (alive) setSimilar(r.similar);
+      } catch {
+        if (alive) setSimilar([]); // the aid is optional; approve/reject still work
+      } finally {
+        releaseSimilarSlot();
+      }
+    })();
     return () => {
       alive = false;
     };
