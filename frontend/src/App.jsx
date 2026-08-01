@@ -42,7 +42,7 @@ function Landing() {
     <div className="landingpage">
       <section className="landinghero">
         <div className="wordmark wordmark--hero">DRINKQUIRY</div>
-        <p className="tagline">Bar trivia where the losers drink.</p>
+        <p className="tagline">The most edudcational pre-game</p>
         <form
           className="panel landing"
           onSubmit={(e) => {

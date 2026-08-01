@@ -83,10 +83,20 @@ TEMPLATES = [
 WSGI_APPLICATION = "config.wsgi.application"
 ASGI_APPLICATION = "config.asgi.application"
 
+# Handoff #14b: conn_max_age MUST stay 0 (the dj-database-url default) on
+# this stack. Persistent connections are a WSGI-era feature: under ASGI
+# (daphne), every request runs its ORM work on its own short-lived thread
+# (ThreadSensitiveContext), so a persistent connection outlives its thread
+# and is stranded until timeout/GC — each request LEAKS one connection.
+# With conn_max_age=600 a normal click-through piled ~100 idle connections
+# into Postgres (default max_connections=100) and live traffic 500'd with
+# "sorry, too many clients already". Reconnect-per-request costs ~1ms on
+# the compose network. If pooling is ever wanted: Django's native psycopg
+# pool (DATABASES OPTIONS {"pool": {...}} + psycopg[binary,pool]) — NOT
+# conn_max_age.
 DATABASES = {
     "default": dj_database_url.config(
         default=f"sqlite:///{BASE_DIR / 'db.sqlite3'}",
-        conn_max_age=600,
     )
 }
 
