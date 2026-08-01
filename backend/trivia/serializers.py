@@ -77,15 +77,28 @@ class QuestionSerializer(serializers.ModelSerializer):
     categories = serializers.PrimaryKeyRelatedField(
         many=True, queryset=Category.objects.filter(deleted_at__isnull=True)
     )
+    # §F1/§F7 (Handoff #15): display names ride the row so the /create "My
+    # content" list can label a question's categories WITHOUT fetching the
+    # whole category table (the old client-side id→name resolve needed the
+    # fetch-all this session removes). ACTIVE names only — a soft-deleted
+    # category's name drops out here (matching every other active surface),
+    # which is what lets the frontend's "no live categories" fallback fire
+    # naturally. Read-only and additive; writes still use `categories` ids.
+    category_names = serializers.SerializerMethodField()
 
     class Meta:
         model = Question
         fields = (
-            "id", "categories", "question_text", "answer", "difficulty",
+            "id", "categories", "category_names", "question_text", "answer", "difficulty",
             "media_type", "image", "audio", "video",
             "owner", "visibility", "moderation_status", "moderation_note", "created_at",
         )
         read_only_fields = ("moderation_status", "moderation_note")
+
+    def get_category_names(self, obj):
+        # Reads the list prefetch when present; single-row responses
+        # (create/PATCH) pay one tiny query. §F5: active names only.
+        return sorted(c.name for c in obj.categories.all() if c.deleted_at is None)
 
     def get_fields(self):
         # `categories` is required on create but optional on PATCH (an update
@@ -194,6 +207,11 @@ class ModerationQuestionSerializer(_UsageCountMixin, _OwnerContextMixin, Questio
     # leaks into game snapshots (OpenCellSerializer excludes it).
     # §F4 (Handoff #10): `category_name` became `category_names` (sorted list)
     # with the M2M — our serializer, our frontend, so REPLACED, not aliased.
+    # §F1 (#15): the FIELD now lives on QuestionSerializer (the /create list
+    # needs it); this override keeps the STAFF semantics — ALL category
+    # names, deleted included — because the library's ?deleted= graveyard
+    # views must still say where a dead row used to live. Deliberate
+    # divergence from the parent's active-only reading.
     category_names = serializers.SerializerMethodField()
     # §I4: lifecycle context for the library — deleted_at (null = active) and
     # the id of the revision that superseded this row, if any. Read-only,
@@ -201,8 +219,9 @@ class ModerationQuestionSerializer(_UsageCountMixin, _OwnerContextMixin, Questio
     replaced_by = serializers.PrimaryKeyRelatedField(read_only=True)
 
     class Meta(QuestionSerializer.Meta):
+        # `category_names` arrives via QuestionSerializer.Meta.fields (#15).
         fields = QuestionSerializer.Meta.fields + (
-            "owner_email", "owner_display_name", "category_names", "usage_count",
+            "owner_email", "owner_display_name", "usage_count",
             "deleted_at", "replaced_by",
         )
 

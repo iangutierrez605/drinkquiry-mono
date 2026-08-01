@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, errorText, mediaUrl } from "../lib/api";
+import { useDebounced } from "../lib/hooks";
 import { loadAuth, onAuthChange } from "../lib/storage";
 
 /**
@@ -11,23 +12,56 @@ import { loadAuth, onAuthChange } from "../lib/storage";
  * which shows the AuthScreen when logged out (the funnel already exists).
  * Inside ChromeLayout (SiteNav on top); the AgeGate still sits above
  * everything — deliberate, it's a drinking product.
+ *
+ * §F5 (Handoff #15): search-and-page shaped. The grid renders ONE server
+ * page at a time (debounced server-side ?search=, Load more appends) —
+ * never the fetch-everything allPages sweep that would mean 40+ sequential
+ * requests and a 2,000-card render at the current corpus (C21). Fetches
+ * carry a sequence number so a stale slow response can never clobber a
+ * newer one (§G top trap).
  */
 export default function CategoriesPage() {
   // Hooks first, early returns after (C11).
-  const [cats, setCats] = useState(null); // null = loading
-  const [error, setError] = useState(null);
   const [auth, setAuth] = useState(loadAuth());
+  const [search, setSearch] = useState("");
+  const debounced = useDebounced(search);
+  // search+page move ATOMICALLY (one state, one fetch effect) so a search
+  // change can't race its own page reset into a duplicate request.
+  const [params, setParams] = useState({ search: "", page: 1 });
+  const [rows, setRows] = useState(null); // accumulated pages; null = first load
+  const [count, setCount] = useState(0);
+  const [hasNext, setHasNext] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const seq = useRef(0);
+
   useEffect(() => onAuthChange(() => setAuth(loadAuth())), []);
+
+  // Debounced input → params (page resets to 1). The identity guard skips
+  // the initial no-op so mount fires exactly one fetch.
   useEffect(() => {
-    let alive = true;
+    setParams((p) => (p.search === debounced ? p : { search: debounced, page: 1 }));
+  }, [debounced]);
+
+  useEffect(() => {
+    const mySeq = ++seq.current; // stale-response guard (§G)
+    setLoading(true);
     api
-      .publicCategories()
-      .then((rows) => alive && (setCats(rows), setError(null)))
-      .catch((err) => alive && setError(errorText(err)));
-    return () => {
-      alive = false;
-    };
-  }, []);
+      .publicCategoriesPage({ search: params.search, page: params.page })
+      .then((d) => {
+        if (seq.current !== mySeq) return;
+        setRows((prev) => (params.page === 1 ? d.results : [...(prev ?? []), ...d.results]));
+        setCount(d.count);
+        setHasNext(!!d.next);
+        setError(null);
+        setLoading(false);
+      })
+      .catch((err) => {
+        if (seq.current !== mySeq) return;
+        setError(errorText(err));
+        setLoading(false);
+      });
+  }, [params]);
 
   const cta = (
     <section className="panel panel--center ctabanner">
@@ -51,14 +85,6 @@ export default function CategoriesPage() {
     </section>
   );
 
-  if (error)
-    return (
-      <div className="page">
-        <h1 className="h1">Categories</h1>
-        <p className="formerror formerror--block">{error}</p>
-      </div>
-    );
-
   return (
     <div className="page">
       <h1 className="h1">Categories</h1>
@@ -67,25 +93,54 @@ export default function CategoriesPage() {
         creator plan. Questions stay under wraps until game night, obviously.
       </p>
       {cta}
-      {cats == null && <p className="footnote">Loading…</p>}
-      {cats?.length === 0 && (
-        <p className="footnote">Nothing here yet — the official packs are on their way. 🍺</p>
+      <input
+        className="listsearch"
+        type="search"
+        placeholder="Search categories…"
+        value={search}
+        onChange={(e) => setSearch(e.target.value)}
+        aria-label="Search categories"
+      />
+      {error && <p className="formerror formerror--block">{error}</p>}
+      {rows == null && !error && <p className="footnote">Loading…</p>}
+      {rows != null && count === 0 && !loading && (
+        <p className="footnote">
+          {params.search
+            ? `Nothing matches “${params.search}” — try fewer words.`
+            : "Nothing here yet — the official packs are on their way. 🍺"}
+        </p>
       )}
-      {cats?.length > 0 && (
-        <div className="browsegrid">
-          {cats.map((cat) => (
-            <div key={cat.id} className="catcard catcard--browse">
-              {cat.photo && (
-                <img className="catcard__photo" src={mediaUrl(cat.photo)} alt="" loading="lazy" />
-              )}
-              <span className="catcard__name">{cat.name}</span>
-              {cat.description && <span className="catcard__desc">{cat.description}</span>}
-              <span className="catcard__count">
-                {cat.question_count} question{cat.question_count === 1 ? "" : "s"}
-              </span>
-            </div>
-          ))}
-        </div>
+      {rows?.length > 0 && (
+        <>
+          <div className="browsegrid">
+            {rows.map((cat) => (
+              <div key={cat.id} className="catcard catcard--browse">
+                {cat.photo && (
+                  <img className="catcard__photo" src={mediaUrl(cat.photo)} alt="" loading="lazy" />
+                )}
+                <span className="catcard__name">{cat.name}</span>
+                {cat.description && <span className="catcard__desc">{cat.description}</span>}
+                <span className="catcard__count">
+                  {cat.question_count} question{cat.question_count === 1 ? "" : "s"}
+                </span>
+              </div>
+            ))}
+          </div>
+          <div className="loadmore">
+            <span className="listmeta">
+              Showing {rows.length} of {count}
+            </span>
+            {hasNext && (
+              <button
+                className="btn btn--ghost"
+                disabled={loading}
+                onClick={() => setParams((p) => ({ ...p, page: p.page + 1 }))}
+              >
+                {loading ? "Loading…" : "Load more"}
+              </button>
+            )}
+          </div>
+        </>
       )}
     </div>
   );

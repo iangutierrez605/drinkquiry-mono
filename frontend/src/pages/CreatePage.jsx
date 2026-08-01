@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, ApiError, errorText, quotaError } from "../lib/api";
 import { clearAuth, loadAuth, onAuthChange } from "../lib/storage";
+import CategoryPicker from "../components/CategoryPicker";
 import { Toast, UsageMeterLine } from "../components/shared";
 
 /**
@@ -109,59 +110,70 @@ function Shell({ user, token, children }) {
 
 /* ---------------- Creator workspace ---------------- */
 
-function CreatorWorkspace({ auth, profile }) {
-  const [categories, setCategories] = useState(null);
-  const [questions, setQuestions] = useState(null);
-  const [loadError, setLoadError] = useState(null);
-  const [toast, setToast] = useState(null);
-
-  const refresh = useCallback(async () => {
-    try {
-      const [cats, qs] = await Promise.all([api.categories(auth.token), api.questions(null, auth.token)]);
-      setCategories(cats);
-      setQuestions(qs);
-      setLoadError(null);
-    } catch (err) {
-      setLoadError(errorText(err));
-    }
-  }, [auth.token]);
+/**
+ * §F7 (Handoff #15): one "my content" pager — a page-appending fetch over an
+ * OWNER-ONLY server list (?mine=1; the old flow fetched EVERY visible row —
+ * all 10,000+ public questions — just to client-filter down to the owner's,
+ * C21). `count` is the server-truth owned total (feeds the usage meters);
+ * refresh() rewinds to page 1 and refetches (create/delete/visibility
+ * changes). Stale responses are sequence-guarded (§G).
+ */
+function useMinePager(auth, kind) {
+  const [params, setParams] = useState({ page: 1, nonce: 0 });
+  const [rows, setRows] = useState(null); // accumulated pages; null = first load
+  const [count, setCount] = useState(0);
+  const [hasNext, setHasNext] = useState(false);
+  const [error, setError] = useState(null);
+  const seq = useRef(0);
 
   useEffect(() => {
-    refresh();
-  }, [refresh]);
+    const mySeq = ++seq.current;
+    const call =
+      kind === "categories"
+        ? api.categoriesPage(auth.token, { mine: 1, page: params.page })
+        : api.questionsPage(auth.token, { mine: 1, page: params.page });
+    call
+      .then((d) => {
+        if (seq.current !== mySeq) return;
+        setRows((prev) => (params.page === 1 ? d.results : [...(prev ?? []), ...d.results]));
+        setCount(d.count);
+        setHasNext(!!d.next);
+        setError(null);
+      })
+      .catch((err) => seq.current === mySeq && setError(errorText(err)));
+  }, [auth.token, kind, params]);
 
-  const mine = useMemo(
-    () => ({
-      categories: (categories ?? []).filter((c) => c.owner === profile.id),
-      questions: (questions ?? []).filter((q) => q.owner === profile.id),
-    }),
-    [categories, questions, profile.id],
-  );
+  // Stable identities (setParams itself is stable) so consumers can list
+  // these in hook deps without re-firing.
+  const more = useCallback(() => setParams((p) => ({ ...p, page: p.page + 1 })), []);
+  const refresh = useCallback(() => setParams((p) => ({ page: 1, nonce: p.nonce + 1 })), []);
+  return { rows, count, hasNext, error, more, refresh };
+}
 
-  // Question form needs somewhere to put questions: own categories, or
-  // official/public ones (the server allows adding to publicly visible cats).
-  const targetCategories = useMemo(
-    () => (categories ?? []).filter((c) => c.owner === profile.id || c.owner === null || c.visibility === "public"),
-    [categories, profile.id],
-  );
+function CreatorWorkspace({ auth, profile }) {
+  const [toast, setToast] = useState(null);
+  const ownCats = useMinePager(auth, "categories");
+  const ownQs = useMinePager(auth, "questions");
+  const loadError = ownCats.error || ownQs.error;
+
+  const refreshCats = ownCats.refresh;
+  const refreshQs = ownQs.refresh;
+  const refresh = useCallback(() => {
+    refreshCats();
+    refreshQs();
+  }, [refreshCats, refreshQs]);
 
   return (
     <Shell user={profile} token={auth.token}>
       {loadError && <p className="formerror formerror--block">{loadError}</p>}
 
-      <UsageMeters mine={mine} usage={profile.usage} />
+      <UsageMeters ownCats={ownCats} ownQs={ownQs} usage={profile.usage} />
 
       <CategoryForm auth={auth} onSaved={refresh} onToast={setToast} />
-      <QuestionForm auth={auth} categories={targetCategories} onSaved={refresh} onToast={setToast} />
+      <QuestionForm auth={auth} onSaved={refresh} onToast={setToast} />
       <BulkUpload auth={auth} isStaff={!!profile.is_staff} onImported={refresh} onToast={setToast} />
 
-      <MyContent
-        auth={auth}
-        mine={mine}
-        allCategories={categories ?? []}
-        onChanged={refresh}
-        onToast={setToast}
-      />
+      <MyContent auth={auth} ownCats={ownCats} ownQs={ownQs} onChanged={refresh} onToast={setToast} />
 
       <Toast message={toast} tone="info" onDone={() => setToast(null)} />
     </Shell>
@@ -171,21 +183,19 @@ function CreatorWorkspace({ auth, profile }) {
 /* ---------------- Usage meters ---------------- */
 
 /**
- * "2 of 25 categories · 41 of 500 questions". `used` comes from the live
- * content lists (so it updates on create/delete without refetching the
- * profile); limits come from the profile's usage block. limit === null
- * means unlimited.
+ * "2 of 25 categories · 41 of 500 questions". §F7 (#15): `used` is now the
+ * ?mine=1 pagers' server `count` — the TRUE owned totals even when only one
+ * page is loaded (the old list-length reading breaks under pagination);
+ * refresh() after create/delete refetches, so the meters stay live. Limits
+ * come from the profile's usage block; limit === null means unlimited.
  */
-function UsageMeters({ mine, usage }) {
-  // Formatting lives in the shared UsageMeterLine (also used by /profile —
-  // Handoff #6 §G3); this wrapper only feeds it live `used` counts from the
-  // content lists so the meters update on create/delete without refetching.
+function UsageMeters({ ownCats, ownQs, usage }) {
   const storage = usage?.storage; // §F3: bytes from the profile payload
   return (
     <UsageMeterLine
       entries={[
-        { used: mine.categories.length, block: usage?.categories, noun: "categories" },
-        { used: mine.questions.length, block: usage?.questions, noun: "questions" },
+        { used: ownCats.count, block: usage?.categories, noun: "categories" },
+        { used: ownQs.count, block: usage?.questions, noun: "questions" },
         storage && {
           used: fmtMB(storage.used),
           block: storage.limit == null ? { limit: null } : { limit: fmtMB(storage.limit) },
@@ -265,10 +275,12 @@ function CategoryForm({ auth, onSaved, onToast }) {
 
 /* ---------------- Question form ---------------- */
 
-function QuestionForm({ auth, categories, onSaved, onToast }) {
-  // §F6 (Handoff #10): a question can live in SEVERAL categories — the old
-  // single select became a chalkboard-native checkbox list (no new deps).
-  const [selectedCats, setSelectedCats] = useState([]);
+function QuestionForm({ auth, onSaved, onToast }) {
+  // §F6 (Handoff #10): a question can live in SEVERAL categories. §F7
+  // (#15): the fetch-all checkbox list became the shared searchable
+  // CategoryPicker — `picked` is a Map(id → {id, name}) captured at click
+  // (the pinning rule), so a selection survives any search.
+  const [picked, setPicked] = useState(() => new Map());
   const [questionText, setQuestionText] = useState("");
   const [answer, setAnswer] = useState("");
   const [difficulty, setDifficulty] = useState(3);
@@ -294,10 +306,8 @@ function QuestionForm({ auth, categories, onSaved, onToast }) {
     setError(null);
     try {
       const fd = new FormData();
-      // §F2: repeated `categories` entries — the API reads the list; the
-      // legacy single `category` write stays server-side for one session
-      // but this frontend is already on the new field.
-      selectedCats.forEach((id) => fd.append("categories", id));
+      // §F2: repeated `categories` entries — the API reads the list.
+      [...picked.keys()].forEach((id) => fd.append("categories", id));
       fd.append("question_text", questionText.trim());
       fd.append("answer", answer.trim());
       fd.append("difficulty", String(difficulty));
@@ -309,7 +319,7 @@ function QuestionForm({ auth, categories, onSaved, onToast }) {
       setQuestionText("");
       setAnswer("");
       setFile(null);
-      setSelectedCats([]);
+      setPicked(new Map());
       onSaved();
     } catch (err) {
       setError(quotaMessage(err) ?? (err instanceof ApiError && err.status === 403 ? UPSELL_403 : errorText(err)));
@@ -322,31 +332,13 @@ function QuestionForm({ auth, categories, onSaved, onToast }) {
     <section className="panel">
       <h2 className="h2">New question</h2>
       <form onSubmit={submit}>
-        <fieldset className="field catpick">
-          <legend>
-            Categories <span className="field__hint">(pick one or more — a question can live in several)</span>
-          </legend>
-          <div className="catpick__list">
-            {categories.map((c) => {
-              const on = selectedCats.includes(String(c.id));
-              return (
-                <label key={c.id} className={`catpick__item ${on ? "catpick__item--on" : ""}`}>
-                  <input
-                    type="checkbox"
-                    checked={on}
-                    onChange={() =>
-                      setSelectedCats((sel) =>
-                        on ? sel.filter((x) => x !== String(c.id)) : [...sel, String(c.id)],
-                      )
-                    }
-                  />
-                  {c.name}
-                  {c.owner === null ? " (official)" : ""}
-                </label>
-              );
-            })}
-          </div>
-        </fieldset>
+        <CategoryPicker
+          auth={auth}
+          value={picked}
+          onChange={setPicked}
+          legend="Categories"
+          hint="(pick one or more — a question can live in several)"
+        />
         <label className="field">
           Question
           <textarea value={questionText} onChange={(e) => setQuestionText(e.target.value)} required rows={3} maxLength={500} />
@@ -387,7 +379,7 @@ function QuestionForm({ auth, categories, onSaved, onToast }) {
         {error && <p className="formerror">{error}</p>}
         <button
           className="btn btn--primary"
-          disabled={busy || selectedCats.length === 0 || !questionText.trim() || !answer.trim()}
+          disabled={busy || picked.size === 0 || !questionText.trim() || !answer.trim()}
         >
           {busy ? "Saving…" : "Add question"}
         </button>
@@ -625,9 +617,12 @@ function ModerationBadge({ item }) {
   );
 }
 
-function MyContent({ auth, mine, allCategories, onChanged, onToast }) {
-  const catName = (id) => allCategories.find((c) => c.id === id)?.name ?? `#${id}`;
-
+function MyContent({ auth, ownCats, ownQs, onChanged, onToast }) {
+  // §F7 (#15): both lists are ?mine=1 server pages (Load more appends) —
+  // the old flow fetched EVERY visible row and client-filtered to the
+  // owner's. Category labels ride each question row as `category_names`
+  // (active names, server-provided) — no more id→name resolving against a
+  // fetched-in-full category table.
   const act = async (fn, doneMsg) => {
     try {
       await fn();
@@ -638,15 +633,18 @@ function MyContent({ auth, mine, allCategories, onChanged, onToast }) {
     }
   };
 
+  const cats = ownCats.rows ?? [];
+  const questions = ownQs.rows ?? [];
+
   return (
     <section className="panel">
       <h2 className="h2">My content</h2>
 
-      {mine.categories.length === 0 && mine.questions.length === 0 && (
+      {ownCats.rows != null && ownQs.rows != null && ownCats.count === 0 && ownQs.count === 0 && (
         <p className="footnote">Nothing yet — your categories and questions will show up here.</p>
       )}
 
-      {mine.categories.map((c) => (
+      {cats.map((c) => (
         <div key={c.id} className="ownrow">
           <div className="ownrow__main">
             <strong>{c.name}</strong>
@@ -682,15 +680,25 @@ function MyContent({ auth, mine, allCategories, onChanged, onToast }) {
           />
         </div>
       ))}
+      {ownCats.hasNext && (
+        <div className="loadmore loadmore--tight">
+          <span className="listmeta">
+            {cats.length} of {ownCats.count} categories
+          </span>
+          <button className="btn btn--ghost btn--sm" onClick={ownCats.more}>
+            More categories
+          </button>
+        </div>
+      )}
 
-      {mine.questions.map((q) => (
+      {questions.map((q) => (
         <div key={q.id} className="ownrow">
           <div className="ownrow__main">
             <span className="ownrow__q">{q.question_text}</span>
             <span className="ownrow__meta">
-              {/* §F6: all of the question's categories (ids from the API,
-                  resolved against the visible category list). */}
-              {(q.categories ?? []).map(catName).join(" · ") || "no live categories"} · difficulty {q.difficulty} ·{" "}
+              {/* §F6/§F7: the row's ACTIVE category names, straight from the
+                  serializer (a category you delete drops out here). */}
+              {(q.category_names ?? []).join(" · ") || "no live categories"} · difficulty {q.difficulty} ·{" "}
               {q.media_type === "none" ? "text" : q.media_type}
             </span>
           </div>
@@ -720,6 +728,16 @@ function MyContent({ auth, mine, allCategories, onChanged, onToast }) {
           />
         </div>
       ))}
+      {ownQs.hasNext && (
+        <div className="loadmore loadmore--tight">
+          <span className="listmeta">
+            {questions.length} of {ownQs.count} questions
+          </span>
+          <button className="btn btn--ghost btn--sm" onClick={ownQs.more}>
+            More questions
+          </button>
+        </div>
+      )}
     </section>
   );
 }

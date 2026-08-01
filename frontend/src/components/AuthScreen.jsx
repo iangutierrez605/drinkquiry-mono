@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api, errorText, SUPPORT_EMAIL } from "../lib/api";
+import { displayUrl } from "../lib/displayUrl";
 import { saveAuth } from "../lib/storage";
 
 // §F2 (Handoff #12): the Turnstile SITE key reaches the SPA at build time
@@ -231,7 +232,8 @@ export default function AuthScreen({ onAuthed }) {
         )}
       </form>
       <p className="footnote">
-        Players don't need accounts — only the host logs in. Buzzers join at <code>/game/buzzer/CODE</code>.
+        {/* §F9 (#15): full-host display string, derived — never hardcoded. */}
+        Players don't need accounts — only the host logs in. Buzzers join at <code>{displayUrl("/game/buzzer/CODE")}</code>.
       </p>
       {/* §H2 (Handoff #12): login trouble is THE support moment. */}
       <p className="footnote">

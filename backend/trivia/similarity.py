@@ -49,6 +49,66 @@ def jaccard(a: frozenset, b: frozenset) -> float:
     return len(a & b) / len(a | b)
 
 
+def _match_row(candidate: Question, score: float) -> dict:
+    """One match row — the ONE shape both the single and batch endpoints
+    return (§K1 pinned by the #15 parity test). category_names deliberately
+    lists ALL of the candidate's categories, deleted included — same reading
+    as the single endpoint has always had."""
+    return {
+        "id": candidate.id,
+        "question_text": candidate.question_text,
+        "answer": candidate.answer,
+        # §F4: the list replaces the old category_id/category_name pair.
+        "category_names": sorted(cat.name for cat in candidate.categories.all()),
+        "score": round(score, 3),
+        "usage_count": candidate.usage_count,
+    }
+
+
+def similar_questions_batch(questions, *, top_n: int = TOP_N) -> dict[int, list[dict]]:
+    """§F2 (Handoff #15): similar_questions() for MANY targets in ONE pass.
+
+    The #14c herd was 50 per-card calls, each independently loading (and,
+    for thin categories, re-scanning) the whole approved corpus. Here the
+    corpus is fetched ONCE (with category ids + the §J1 usage annotation),
+    `significant_words` is computed ONCE per candidate, and each target then
+    runs the same pool logic in Python over the prefetched category-id sets:
+    primary pool = approved questions sharing ANY category (soft-deleted
+    categories still count as shared, exactly like the single endpoint's
+    `categories__in` SQL), global fallback when the pool is thinner than
+    MIN_CATEGORY_POOL, the target always excluded from both.
+
+    PARITY CONTRACT (tested): for every target, the returned rows equal
+    `similar_questions(target)` exactly — same candidates, same scores,
+    same (-score, pk) ordering, same row shape. Change one, change both.
+    Returns {target_pk: [match_row, ...]} for every target passed in.
+    """
+    approved = Q(moderation_status=ModerationStatus.APPROVED)
+    corpus = list(
+        Question.objects.filter(approved, deleted_at__isnull=True)
+        .annotate(usage_count=Count("boardcell", distinct=True))
+        .prefetch_related("categories")
+    )
+    words = {c.pk: significant_words(c.question_text) for c in corpus}
+    category_ids = {c.pk: {cat.pk for cat in c.categories.all()} for c in corpus}
+
+    results: dict[int, list[dict]] = {}
+    for question in questions:
+        target_categories = {cat.pk for cat in question.categories.all()}
+        pool = [c for c in corpus if c.pk != question.pk and (category_ids[c.pk] & target_categories)]
+        if len(pool) < MIN_CATEGORY_POOL:
+            pool = [c for c in corpus if c.pk != question.pk]
+        target = significant_words(question.question_text)
+        scored = []
+        for candidate in pool:
+            score = jaccard(target, words[candidate.pk])
+            if score > 0:
+                scored.append((score, candidate))
+        scored.sort(key=lambda pair: (-pair[0], pair[1].pk))
+        results[question.pk] = [_match_row(c, score) for score, c in scored[:top_n]]
+    return results
+
+
 def similar_questions(question: Question, *, top_n: int = TOP_N) -> list[dict]:
     """Top matches for `question` among approved questions, each with the
     §J1 usage count (cells referencing it, across all games) and the answer —
@@ -74,15 +134,6 @@ def similar_questions(question: Question, *, top_n: int = TOP_N) -> list[dict]:
         if score > 0:
             scored.append((score, candidate))
     scored.sort(key=lambda pair: (-pair[0], pair[1].pk))
-    return [
-        {
-            "id": c.id,
-            "question_text": c.question_text,
-            "answer": c.answer,
-            # §F4: the list replaces the old category_id/category_name pair.
-            "category_names": sorted(cat.name for cat in c.categories.all()),
-            "score": round(score, 3),
-            "usage_count": c.usage_count,
-        }
-        for score, c in scored[:top_n]
-    ]
+    # §F2 (#15): rows come from the shared _match_row — the batch endpoint
+    # returns the SAME shape and the parity test compares them verbatim.
+    return [_match_row(c, score) for score, c in scored[:top_n]]

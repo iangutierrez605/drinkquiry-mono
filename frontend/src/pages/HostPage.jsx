@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api, errorText, quotaError } from "../lib/api";
+import { displayUrl } from "../lib/displayUrl";
+import { useDebounced } from "../lib/hooks";
 import {
   clearHostGame,
   loadAuth,
@@ -108,12 +110,26 @@ export default function HostPage() {
 /* ---------------- Game creation ---------------- */
 
 function CreateScreen({ auth, onCreated, onResumed }) {
-  const [categories, setCategories] = useState(null);
+  // §F6 (Handoff #15): the create grid is search-and-page shaped — ONE
+  // server page at a time (debounced ?search=, Load more appends), never
+  // the fetch-all sweep (C21: 40+ requests / 2,000 cards at current scale).
+  const [catSearch, setCatSearch] = useState("");
+  const debouncedCatSearch = useDebounced(catSearch);
+  const [catParams, setCatParams] = useState({ search: "", page: 1 }); // atomic: search change resets page
+  const [catRows, setCatRows] = useState(null); // accumulated pages; null = first load
+  const [catCount, setCatCount] = useState(0);
+  const [catHasNext, setCatHasNext] = useState(false);
+  const [catLoading, setCatLoading] = useState(true);
+  const catSeq = useRef(0); // stale-response guard (§G)
   // §G3 (Handoff #10): themes filter the category grid and offer a one-tap
-  // "Pick for me". Pure discovery/selection sugar — `selected` stays the one
-  // selection state, the create request still sends category_ids, and the
-  // server's shortage refusal (§F3) remains the real gate (rule 4).
+  // "Pick for me". Pure discovery/selection sugar — the picked Map stays the
+  // one selection state, the create request still sends category_ids, and
+  // the server's shortage refusal (§F3) remains the real gate (rule 4).
+  // §F6 (#15): the strip shows the first ~12 + a server-side theme search.
   const [themes, setThemes] = useState(null);
+  const [themeSearch, setThemeSearch] = useState("");
+  const debouncedThemeSearch = useDebounced(themeSearch);
+  const themeSeq = useRef(0);
   const [activeTheme, setActiveTheme] = useState(null); // null = "All categories"
   // §I: unfinished games this host can jump back into. Discoverability lives
   // here (the "no active game" screen) AND on /profile; both share
@@ -133,7 +149,11 @@ function CreateScreen({ auth, onCreated, onResumed }) {
   const tournamentId = Number(searchParams.get("tournament")) || null;
   const roundNumber = tournamentId ? Number(searchParams.get("round")) || 1 : null;
   const [tournamentInfo, setTournamentInfo] = useState(null); // {name, location} | "error" | null
-  const [selected, setSelected] = useState([]);
+  // §F6 (#15) SELECTION PINNING: picked categories live in a Map(id →
+  // {id, name, usable_question_count}) captured AT CLICK — never derived
+  // from whatever page/search/theme the grid currently shows (§G trap:
+  // "selection ≠ current page"). Searching away and back can't lose a pick.
+  const [picked, setPicked] = useState(() => new Map());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   // Full profile: usage.games_this_month feeds the (cosmetic) meter — limit
@@ -144,14 +164,6 @@ function CreateScreen({ auth, onCreated, onResumed }) {
 
   useEffect(() => {
     api
-      .categories(auth.token)
-      .then(setCategories)
-      .catch((err) => setError(errorText(err)));
-    api
-      .themes(auth.token)
-      .then(setThemes)
-      .catch(() => setThemes([])); // the strip is optional sugar
-    api
       .profile(auth.token)
       .then(setProfile)
       .catch(() => {}); // meter/link are optional; creation errors surface on their own
@@ -160,6 +172,41 @@ function CreateScreen({ auth, onCreated, onResumed }) {
       .then((games) => setUnfinished(games.filter((g) => g.status !== "finished")))
       .catch(() => setUnfinished([])); // the panel is optional sugar
   }, [auth.token]);
+
+  // Debounced grid search → params (page resets); identity guard skips the
+  // mount no-op so the initial render fires exactly one fetch.
+  useEffect(() => {
+    setCatParams((p) => (p.search === debouncedCatSearch ? p : { search: debouncedCatSearch, page: 1 }));
+  }, [debouncedCatSearch]);
+
+  useEffect(() => {
+    const mySeq = ++catSeq.current;
+    setCatLoading(true);
+    api
+      .categoriesPage(auth.token, { search: catParams.search, page: catParams.page })
+      .then((d) => {
+        if (catSeq.current !== mySeq) return;
+        setCatRows((prev) => (catParams.page === 1 ? d.results : [...(prev ?? []), ...d.results]));
+        setCatCount(d.count);
+        setCatHasNext(!!d.next);
+        setCatLoading(false);
+      })
+      .catch((err) => {
+        if (catSeq.current !== mySeq) return;
+        setCatLoading(false);
+        setError(errorText(err));
+      });
+  }, [auth.token, catParams]);
+
+  // Theme strip: server-side search (§F6). The unfiltered call feeds the
+  // "first ~12" default view; typing re-queries. Failure = no strip (sugar).
+  useEffect(() => {
+    const mySeq = ++themeSeq.current;
+    api
+      .themes(auth.token, debouncedThemeSearch)
+      .then((rows) => themeSeq.current === mySeq && setThemes(rows))
+      .catch(() => themeSeq.current === mySeq && setThemes([]));
+  }, [auth.token, debouncedThemeSearch]);
 
   // §I4: the tournament banner data (name + venue). Separate keyed effect —
   // it only runs when arriving with ?tournament=, and its failure just makes
@@ -186,8 +233,16 @@ function CreateScreen({ auth, onCreated, onResumed }) {
     }
   };
 
-  const toggle = (id) =>
-    setSelected((sel) => (sel.includes(id) ? sel.filter((x) => x !== id) : sel.length < 8 ? [...sel, id] : sel));
+  // Capture display data AT CLICK (§F6 pinning) — a pick made from any
+  // page, search or theme survives every later view change. Cap of 8 kept.
+  const capture = (cat) => ({ id: cat.id, name: cat.name, usable_question_count: cat.usable_question_count ?? 0 });
+  const togglePick = (cat) =>
+    setPicked((prev) => {
+      const next = new Map(prev);
+      if (next.has(cat.id)) next.delete(cat.id);
+      else if (next.size < 8) next.set(cat.id, capture(cat));
+      return next;
+    });
 
   // §G3 "Pick for me": up to 5 of the theme's categories that can actually
   // fill a column (usable count >= perCategory), highest counts first. 5
@@ -197,17 +252,21 @@ function CreateScreen({ auth, onCreated, onResumed }) {
     const picks = theme.categories
       .filter((c) => (c.usable_question_count ?? 0) >= perCategory)
       .sort((a, b) => (b.usable_question_count ?? 0) - (a.usable_question_count ?? 0))
-      .slice(0, 5)
-      .map((c) => c.id);
-    setSelected(picks);
+      .slice(0, 5);
+    setPicked(new Map(picks.map((c) => [c.id, capture(c)])));
   };
 
-  // Filtering is a VIEW, not a reset: switching themes never touches
-  // `selected` — categories chosen under another filter stay chosen.
-  const themeCategoryIds = activeTheme ? new Set(activeTheme.categories.map((c) => c.id)) : null;
-  const visibleCategories = themeCategoryIds
-    ? (categories ?? []).filter((c) => themeCategoryIds.has(c.id))
-    : categories;
+  // Filtering is a VIEW, not a reset: switching themes never touches the
+  // picked Map — categories chosen under another filter stay chosen (and
+  // render in the pinned row even when the current view hides them).
+  // Theme active → the grid shows the theme's OWN category list (staff-
+  // curated, bounded, already per-user counted), with the search box
+  // narrowing it client-side; no theme → the server page(s).
+  const gridCats = activeTheme
+    ? activeTheme.categories.filter(
+        (c) => !debouncedCatSearch || c.name.toLowerCase().includes(debouncedCatSearch.toLowerCase()),
+      )
+    : (catRows ?? []);
 
   const create = async () => {
     setBusy(true);
@@ -215,7 +274,7 @@ function CreateScreen({ auth, onCreated, onResumed }) {
     try {
       const res = await api.createGame(auth.token, {
         mode,
-        categories: selected,
+        categories: [...picked.keys()],
         questions_per_category: perCategory,
         buzz_sound: buzzSound,
         // §I4: attach when arriving from a tournament (both or neither —
@@ -365,9 +424,12 @@ function CreateScreen({ auth, onCreated, onResumed }) {
 
       <section className="panel">
         <h2 className="h2">
-          Categories <span className="field__hint">(pick 1–8)</span>
+          Categories <span className="field__hint">(pick 1–8 — search finds packs beyond the first page)</span>
         </h2>
-        {themes && themes.length > 0 && (
+        {/* §F6 (#15): the strip shows the FIRST ~12 themes; the search box
+            queries the server for the rest. The active theme's chip is
+            pinned into view even when a search would hide it. */}
+        {themes != null && (themes.length > 0 || themeSearch !== "") && (
           <div className="themestrip">
             <button
               type="button"
@@ -376,7 +438,17 @@ function CreateScreen({ auth, onCreated, onResumed }) {
             >
               All categories
             </button>
-            {themes.map((t) => {
+            {activeTheme && !themes.slice(0, 12).some((t) => t.id === activeTheme.id) && (
+              <button
+                type="button"
+                className="themechip themechip--on"
+                title={activeTheme.description || ""}
+                onClick={() => setActiveTheme(null)}
+              >
+                {activeTheme.name}
+              </button>
+            )}
+            {themes.slice(0, 12).map((t) => {
               // A theme is "thin" when NO visible category in it can fill a
               // column at the current per-category setting.
               const thin = !t.categories.some((c) => (c.usable_question_count ?? 0) >= perCategory);
@@ -395,26 +467,71 @@ function CreateScreen({ auth, onCreated, onResumed }) {
                 </button>
               );
             })}
+            {themes.length > 12 && (
+              <span className="themestrip__more">+{themes.length - 12} more — search:</span>
+            )}
+            <input
+              className="themestrip__search"
+              type="search"
+              placeholder="Search themes…"
+              value={themeSearch}
+              onChange={(e) => setThemeSearch(e.target.value)}
+              aria-label="Search themes"
+            />
+            {themes.length === 0 && themeSearch !== "" && (
+              <span className="themestrip__more">no themes match</span>
+            )}
             {activeTheme && (
               <span className="themestrip__actions">
                 <button type="button" className="btn btn--gold btn--sm" onClick={() => pickForMe(activeTheme)}>
                   ✨ Pick for me
                 </button>
-                <span className="themestrip__count">{selected.length} selected</span>
+                <span className="themestrip__count">{picked.size} selected</span>
               </span>
             )}
           </div>
         )}
-        {!categories && !error && <p>Loading…</p>}
+        {/* §F6 pinned selections — always visible ABOVE the results, no
+            matter what page/search/theme the grid shows. Deselect works from
+            here or from a matching grid card. */}
+        {picked.size > 0 && (
+          <div className="pinnedrow">
+            <span className="pinnedrow__label">On your board ({picked.size})</span>
+            {[...picked.values()].map((cat) => {
+              const short = (cat.usable_question_count ?? 0) < perCategory;
+              return (
+                <button
+                  key={cat.id}
+                  type="button"
+                  className={`pinnedchip ${short ? "pinnedchip--short" : ""}`}
+                  title={short ? `Only ${cat.usable_question_count} usable questions; ${perCategory} needed` : "Tap to remove"}
+                  onClick={() => togglePick(cat)}
+                >
+                  {cat.name}
+                  {short && " ⚠️"} ✕
+                </button>
+              );
+            })}
+          </div>
+        )}
+        <input
+          className="listsearch"
+          type="search"
+          placeholder={activeTheme ? `Search inside ${activeTheme.name}…` : "Search categories…"}
+          value={catSearch}
+          onChange={(e) => setCatSearch(e.target.value)}
+          aria-label="Search categories"
+        />
+        {!activeTheme && catRows == null && !error && <p>Loading…</p>}
         <div className="catgrid">
-          {visibleCategories?.map((cat) => {
+          {gridCats.map((cat) => {
             const short = (cat.usable_question_count ?? 0) < perCategory;
-            const on = selected.includes(cat.id);
+            const on = picked.has(cat.id);
             return (
               <button
                 key={cat.id}
                 className={`catcard ${on ? "catcard--on" : ""} ${short ? "catcard--short" : ""}`}
-                onClick={() => toggle(cat.id)}
+                onClick={() => togglePick(cat)}
                 title={short ? `Only ${cat.usable_question_count} usable questions; ${perCategory} needed` : cat.description || ""}
               >
                 <span className="catcard__name">{cat.name}</span>
@@ -426,9 +543,35 @@ function CreateScreen({ auth, onCreated, onResumed }) {
             );
           })}
         </div>
-        {categories?.length === 0 && (
+        {!activeTheme && catRows != null && (
+          <div className="loadmore">
+            <span className="listmeta">
+              Showing {catRows.length} of {catCount}
+            </span>
+            {catHasNext && (
+              <button
+                type="button"
+                className="btn btn--ghost btn--sm"
+                disabled={catLoading}
+                onClick={() => setCatParams((p) => ({ ...p, page: p.page + 1 }))}
+              >
+                {catLoading ? "Loading…" : "Load more"}
+              </button>
+            )}
+          </div>
+        )}
+        {activeTheme && gridCats.length === 0 && (
+          <p className="footnote">No categories in this theme match “{debouncedCatSearch}”.</p>
+        )}
+        {!activeTheme && catRows != null && catCount === 0 && (
           <p className="footnote">
-            No categories visible. Run <code>seed_demo</code> on the backend or create content in <code>/admin/</code>.
+            {catParams.search ? (
+              <>Nothing matches “{catParams.search}” — try fewer words.</>
+            ) : (
+              <>
+                No categories visible. Run <code>seed_demo</code> on the backend or create content in <code>/admin/</code>.
+              </>
+            )}
           </p>
         )}
       </section>
@@ -441,8 +584,8 @@ function CreateScreen({ auth, onCreated, onResumed }) {
         </p>
       )}
 
-      <button className="btn btn--primary btn--big" disabled={busy || selected.length === 0} onClick={create}>
-        {busy ? "Creating…" : `Create ${mode} game (${selected.length} ${selected.length === 1 ? "category" : "categories"})`}
+      <button className="btn btn--primary btn--big" disabled={busy || picked.size === 0} onClick={create}>
+        {busy ? "Creating…" : `Create ${mode} game (${picked.size} ${picked.size === 1 ? "category" : "categories"})`}
       </button>
     </div>
   );
@@ -573,7 +716,11 @@ function HostGame({ code, token, auth, onLeave }) {
           <p className="lobby__lede">Send buzzers to</p>
           <div className="lobby__code">{game.code}</div>
           <p className="lobby__hint">
-            Each team opens <code>/game/buzzer/{game.code}</code> on one phone. Project <code>/board/{game.code}</code> on the TV.
+            {/* §F9 (#15): full-host display strings — drinkquiry.com/… on
+                prod, localhost:5173/… in dev — derived, never hardcoded.
+                DISPLAY only; the render paths are untouched. */}
+            Each team opens <code>{displayUrl(`/game/buzzer/${game.code}`)}</code> on one phone. Project{" "}
+            <code>{displayUrl(`/board/${game.code}`)}</code> on the TV.
           </p>
           <div className="panel">
             <h2 className="h2">

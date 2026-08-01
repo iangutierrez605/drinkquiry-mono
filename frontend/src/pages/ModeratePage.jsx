@@ -1,18 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, ApiError, errorText, mediaUrl } from "../lib/api";
+import { useDebounced } from "../lib/hooks";
 import { clearAuth, loadAuth, onAuthChange } from "../lib/storage";
+import CategoryPicker from "../components/CategoryPicker";
 import { Toast } from "../components/shared";
 
 /**
  * /moderate — staff review queue (Handoff #4 §F3, grown every handoff since).
  *
- * Tabs: the pending Questions/Categories queues and the Flagged worklist
- * (small lists, allPages), plus Handoff #9's Library (§I5 — ALL questions,
- * searchable, properly paginated) and Users (§J3 — plans, demo expiries,
- * per-user allowance overrides). The is_staff gate here is cosmetic: every
- * /api/moderation/* endpoint is IsAdminUser server-side. Plain REST +
- * refresh — no WS involvement.
+ * Tabs: the pending Questions/Categories queues (SERVER-PAGED since #15 —
+ * the fetch-all sweep here is what detonated #14c at 500 pending), the
+ * Flagged worklist (its own unpaginated endpoint, kept near-empty by
+ * design), Handoff #9's Library (§I5 — ALL questions, searchable, properly
+ * paginated) and Users (§J3 — plans, demo expiries, per-user allowance
+ * overrides). Duplicate-check lines arrive ONE BATCH PER PAGE (§F2 #15),
+ * not per card. The is_staff gate here is cosmetic: every /api/moderation/*
+ * endpoint is IsAdminUser server-side. Plain REST + refresh — no WS
+ * involvement.
  */
 
 export default function ModeratePage() {
@@ -99,52 +104,108 @@ function Shell({ user, children }) {
 
 /* ---------------- Queue ---------------- */
 
+// Mirrors the server's page sizes so the pager can say "page X of Y":
+// questions ride LibraryPagination (25), categories the global PAGE_SIZE
+// (50) — same house pattern as the Library tab's hardcoded 25.
+const QUEUE_PAGE_SIZE = { questions: 25, categories: 50 };
+
 function ReviewQueue({ auth, profile }) {
   const [tab, setTab] = useState("questions"); // questions | categories | flagged | library | users | themes
-  const [items, setItems] = useState(null); // pending items for the active QUEUE tab
+  const [page, setPage] = useState(1); // paged queue tabs only
+  // Paged tabs: the DRF envelope {results, count, next, previous};
+  // flagged: normalized to {results} (its endpoint's own shape).
+  const [data, setData] = useState(null);
   const [counts, setCounts] = useState(null);
+  // §F2 (#15): the §K1 duplicate-check aid, ONE BATCH PER PAGE — id → rows;
+  // a missing key means "still checking". Replaces the per-card fetches and
+  // the #14c 6-slot gate entirely (superseded: with one request per page
+  // there is no herd left to throttle).
+  const [similarByQ, setSimilarByQ] = useState({});
   const [loadError, setLoadError] = useState(null);
   const [toast, setToast] = useState(null);
-  const queueTab = tab === "questions" || tab === "categories" || tab === "flagged";
+  const seq = useRef(0); // stale-response guard (tab hops, page hops, slow batches)
+  const pagedTab = tab === "questions" || tab === "categories";
+  const queueTab = pagedTab || tab === "flagged";
+
+  // Changing tab always restarts at page 1.
+  useEffect(() => {
+    setPage(1);
+  }, [tab]);
 
   const refresh = useCallback(async () => {
     if (!queueTab) return; // §I5/§J3: Library and Users manage their own data
+    const mySeq = ++seq.current;
     try {
       // §K2: the Flagged tab has its own endpoint; the counts payload keeps
       // its pinned pre-#8 shape, so the tab count comes from the list itself.
       const [list, c] = await Promise.all([
         tab === "flagged"
-          ? api.moderationFlags(auth.token).then((r) => r.results)
-          : api.moderationList(auth.token, tab),
+          ? api.moderationFlags(auth.token)
+          : api.moderationPage(tab, auth.token, { page }),
         api.moderationCounts(auth.token),
       ]);
-      setItems(list);
+      if (seq.current !== mySeq) return;
+      setData(list);
       setCounts(c);
       setLoadError(null);
+      // Question-bearing tabs get their duplicate-check lines page-at-a-time.
+      if (tab === "questions" || tab === "flagged") {
+        setSimilarByQ({});
+        const ids = (list.results ?? []).map((it) => it.id);
+        // The endpoint caps a batch at 50; the flagged worklist is
+        // unpaginated so chunk defensively (queue pages are 25/50 anyway).
+        for (let i = 0; i < ids.length; i += 50) {
+          const chunk = ids.slice(i, i + 50);
+          try {
+            const res = await api.moderationSimilarBatch(auth.token, chunk);
+            if (seq.current !== mySeq) return; // page/tab moved on mid-batch
+            setSimilarByQ((m) => {
+              const next = { ...m };
+              for (const id of chunk) next[id] = res[String(id)] ?? [];
+              return next;
+            });
+          } catch {
+            if (seq.current !== mySeq) return;
+            // The aid is optional; approve/reject still work.
+            setSimilarByQ((m) => {
+              const next = { ...m };
+              for (const id of chunk) next[id] = [];
+              return next;
+            });
+          }
+        }
+      }
     } catch (err) {
-      setLoadError(errorText(err));
+      if (seq.current === mySeq) setLoadError(errorText(err));
     }
-  }, [auth.token, tab, queueTab]);
+  }, [auth.token, tab, page, queueTab]);
 
   useEffect(() => {
-    setItems(null);
+    setData(null);
     setLoadError(null);
     refresh();
   }, [refresh]);
 
-  // On action: card leaves the list, counts drop, and a background refresh
-  // keeps us honest if another reviewer is working the same queue.
+  // §F8 action flow: with server pages, optimistic removal + background
+  // refresh would leave a 24-card page 1 while a card from page 2 goes
+  // unseen — so an action REFETCHES the current page; and when the LAST
+  // item of a page > 1 is acted on, step back a page instead of rendering
+  // an empty one (the page-state change triggers the refetch).
   const onActed = (id, message) => {
-    setItems((list) => (list ?? []).filter((it) => it.id !== id));
-    setCounts((c) => (c ? { ...c, [tab]: Math.max(0, (c[tab] ?? 1) - 1) } : c));
     if (message) setToast(message);
+    const remaining = (data?.results ?? []).filter((it) => it.id !== id).length;
+    if (pagedTab && remaining === 0 && page > 1) setPage((p) => p - 1);
+    else refresh();
   };
 
   const onConflict = (id) => {
-    // 409: someone else already actioned it — drop the card and resync.
+    // 409: someone else already actioned it — resync says so.
     onActed(id, "Already reviewed by someone else — removed from your queue.");
-    refresh();
   };
+
+  const items = data?.results ?? null;
+  const count = pagedTab ? (data?.count ?? 0) : (items?.length ?? 0);
+  const pageCount = pagedTab ? Math.max(1, Math.ceil(count / QUEUE_PAGE_SIZE[tab])) : 1;
 
   return (
     <Shell user={profile}>
@@ -187,12 +248,42 @@ function ReviewQueue({ auth, profile }) {
 
           {items?.map((item) =>
             tab === "questions" ? (
-              <QuestionCard key={item.id} auth={auth} item={item} onActed={onActed} onConflict={onConflict} onToast={setToast} />
+              <QuestionCard
+                key={item.id}
+                auth={auth}
+                item={item}
+                similar={similarByQ[item.id]}
+                onActed={onActed}
+                onConflict={onConflict}
+                onToast={setToast}
+              />
             ) : tab === "categories" ? (
               <CategoryCard key={item.id} auth={auth} item={item} onActed={onActed} onConflict={onConflict} onToast={setToast} />
             ) : (
-              <FlaggedCard key={item.id} auth={auth} item={item} onActed={onActed} onConflict={onConflict} onToast={setToast} />
+              <FlaggedCard
+                key={item.id}
+                auth={auth}
+                item={item}
+                similar={similarByQ[item.id]}
+                onActed={onActed}
+                onConflict={onConflict}
+                onToast={setToast}
+              />
             ),
+          )}
+
+          {pagedTab && data && count > 0 && (
+            <div className="libpager">
+              <button className="btn btn--ghost btn--sm" disabled={!data.previous} onClick={() => setPage((p) => p - 1)}>
+                ← Prev
+              </button>
+              <span className="libpager__where">
+                page {page} of {pageCount} · {count} pending
+              </span>
+              <button className="btn btn--ghost btn--sm" disabled={!data.next} onClick={() => setPage((p) => p + 1)}>
+                Next →
+              </button>
+            </div>
           )}
         </>
       )}
@@ -269,7 +360,7 @@ function ReviewActions({ auth, kind, item, onActed, onConflict, onToast }) {
   );
 }
 
-function QuestionCard({ auth, item, onActed, onConflict, onToast }) {
+function QuestionCard({ auth, item, similar, onActed, onConflict, onToast }) {
   return (
     <section className="panel modcard">
       <div className="modcard__meta">
@@ -293,7 +384,7 @@ function QuestionCard({ auth, item, onActed, onConflict, onToast }) {
       {item.media_type === "video" && item.video && (
         <video className="qmedia qmedia--video" src={mediaUrl(item.video)} controls />
       )}
-      <SimilarMatches auth={auth} questionId={item.id} />
+      <SimilarMatches similar={similar} />
       <ReviewActions auth={auth} kind="questions" item={item} onActed={onActed} onConflict={onConflict} onToast={onToast} />
     </section>
   );
@@ -334,60 +425,21 @@ function UsageBadge({ count, noun = "time" }) {
 }
 
 /**
- * §K1: nearest existing approved questions, fetched per card (its own
- * endpoint keeps the queue list snappy). A review AID — nothing here acts.
- * #14c: the fetches are GATED. A full queue page mounts up to 50 cards
- * (PAGE_SIZE) and HTTP/2 fires every per-card /similar simultaneously —
- * a thundering herd that pinned 50+ DB connections at once and, with a
- * mid-load reload stacking a second herd (the server keeps working on
- * abandoned requests), hit Postgres' 100-connection cap. At most
- * MAX_CONCURRENT_SIMILAR run at a time; cards still fill progressively
- * top-to-bottom, and the whole page finishes FASTER because the calls no
- * longer fight each other for CPU and connections.
+ * §K1: nearest existing approved questions — a review AID, nothing here
+ * acts. PRESENTATIONAL since #15 (§F2): the rows arrive via prop from the
+ * queue's ONE batch-per-page request (/similar/batch/), so this component
+ * fetches nothing. `similar` undefined = the page's batch hasn't landed
+ * yet; [] = none found (or the optional aid failed — approve/reject work
+ * regardless).
+ *
+ * History: the per-card fetch this replaces detonated #14c (50 concurrent
+ * /similar calls per queue page, doubled by reloads → Postgres' connection
+ * cap) and was patched with a 6-slot client gate. The batch endpoint
+ * SUPERSEDES that gate — one request per page leaves no herd to throttle —
+ * so the gate machinery is deleted, not kept dormant.
  */
-const MAX_CONCURRENT_SIMILAR = 6;
-let similarInFlight = 0;
-const similarQueue = [];
-function acquireSimilarSlot() {
-  if (similarInFlight < MAX_CONCURRENT_SIMILAR) {
-    similarInFlight += 1;
-    return Promise.resolve();
-  }
-  // Full: wait. The slot is handed over directly in releaseSimilarSlot()
-  // (no decrement/increment gap), so the cap can never be overshot.
-  return new Promise((resolve) => similarQueue.push(resolve));
-}
-function releaseSimilarSlot() {
-  const next = similarQueue.shift();
-  if (next) next(); // pass the slot straight to the next waiter
-  else similarInFlight -= 1;
-}
-
-function SimilarMatches({ auth, questionId }) {
-  const [similar, setSimilar] = useState(null);
-  useEffect(() => {
-    let alive = true;
-    (async () => {
-      await acquireSimilarSlot();
-      if (!alive) {
-        releaseSimilarSlot(); // unmounted while queued (e.g. tab switch)
-        return;
-      }
-      try {
-        const r = await api.moderationSimilar(auth.token, questionId);
-        if (alive) setSimilar(r.similar);
-      } catch {
-        if (alive) setSimilar([]); // the aid is optional; approve/reject still work
-      } finally {
-        releaseSimilarSlot();
-      }
-    })();
-    return () => {
-      alive = false;
-    };
-  }, [auth.token, questionId]);
-
-  if (!similar) return <p className="footnote">Checking for lookalikes…</p>;
+function SimilarMatches({ similar }) {
+  if (similar === undefined) return <p className="footnote">Checking for lookalikes…</p>;
   if (similar.length === 0) return <p className="footnote">No similar approved questions found. ✨</p>;
   return (
     <div className="similar">
@@ -415,7 +467,7 @@ function SimilarMatches({ auth, questionId }) {
  * Reject-with-note. The copy documents what rejection actually does; games
  * already containing the question keep their copy.
  */
-function FlaggedCard({ auth, item, onActed, onConflict, onToast }) {
+function FlaggedCard({ auth, item, similar, onActed, onConflict, onToast }) {
   const [rejecting, setRejecting] = useState(false);
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
@@ -454,7 +506,7 @@ function FlaggedCard({ auth, item, onActed, onConflict, onToast }) {
           </li>
         ))}
       </ul>
-      <SimilarMatches auth={auth} questionId={item.id} />
+      <SimilarMatches similar={similar} />
       {rejecting ? (
         <div className="modcard__reject">
           <label className="field">
@@ -494,14 +546,70 @@ function FlaggedCard({ auth, item, onActed, onConflict, onToast }) {
 
 /* ---------------- §I5 (Handoff #9): the Library tab ---------------- */
 
-/** Debounce a value; the library search waits ~300ms of quiet. */
-function useDebounced(value, ms = 300) {
-  const [debounced, setDebounced] = useState(value);
+/* useDebounced moved to lib/hooks.js (§F4, Handoff #15) — three pages
+   debounce their server-side searches now; imported at the top, verbatim. */
+
+/**
+ * §F8 (#15): a compact SINGLE category pick for the library filters —
+ * type-to-search over the server's ?search= (top 8 matches), tap to pick;
+ * the pick renders as a chip with ✕ to clear. `value` is {id, name} | null.
+ * Replaces a <select> that fetched every visible category for its options.
+ */
+function CategoryFilterPick({ auth, value, onChange }) {
+  const [search, setSearch] = useState("");
+  const debounced = useDebounced(search);
+  const [rows, setRows] = useState(null); // null = closed; [] = no match
+  const seq = useRef(0);
+
   useEffect(() => {
-    const t = setTimeout(() => setDebounced(value), ms);
-    return () => clearTimeout(t);
-  }, [value, ms]);
-  return debounced;
+    if (!debounced.trim()) {
+      setRows(null);
+      return;
+    }
+    const mySeq = ++seq.current; // stale-response guard
+    api
+      .categoriesPage(auth.token, { search: debounced })
+      .then((d) => seq.current === mySeq && setRows(d.results.slice(0, 8)))
+      .catch(() => seq.current === mySeq && setRows([]));
+  }, [auth.token, debounced]);
+
+  if (value)
+    return (
+      <button type="button" className="pinnedchip" title="Clear the category filter" onClick={() => onChange(null)}>
+        {value.name} ✕
+      </button>
+    );
+
+  return (
+    <span className="filterpick">
+      <input
+        type="search"
+        placeholder="all — type to filter"
+        value={search}
+        onChange={(e) => setSearch(e.target.value)}
+        aria-label="Filter by category"
+      />
+      {rows != null && (
+        <span className="filterpick__results">
+          {rows.length === 0 && <span className="filterpick__none">no match</span>}
+          {rows.map((c) => (
+            <button
+              key={c.id}
+              type="button"
+              className="filterpick__opt"
+              onClick={() => {
+                onChange({ id: c.id, name: c.name });
+                setSearch("");
+                setRows(null);
+              }}
+            >
+              {c.name}
+            </button>
+          ))}
+        </span>
+      )}
+    </span>
+  );
 }
 
 /**
@@ -515,20 +623,17 @@ function useDebounced(value, ms = 300) {
 function LibraryTab({ auth, onToast }) {
   const [search, setSearch] = useState("");
   const debouncedSearch = useDebounced(search);
-  const [category, setCategory] = useState("");
+  // §F8 (#15): the category filter is a SEARCHABLE pick ({id, name} | null)
+  // now — the old <select> loaded EVERY visible category to offer options
+  // (its "small list; allPages is fine HERE" claim died at 2,000 rows, C21).
+  const [category, setCategory] = useState(null);
   const [status, setStatus] = useState("all");
   const [deleted, setDeleted] = useState("active");
   const [ordering, setOrdering] = useState("-created_at");
   const [page, setPage] = useState(1);
   const [data, setData] = useState(null); // {results, count, next, previous}
   const [error, setError] = useState(null);
-  const [categories, setCategories] = useState(null);
   const seq = useRef(0);
-
-  // Category options for the filter select (small list; allPages is fine HERE).
-  useEffect(() => {
-    api.categories(auth.token).then(setCategories).catch(() => setCategories([]));
-  }, [auth.token]);
 
   // Any filter change resets to page 1.
   useEffect(() => {
@@ -540,7 +645,7 @@ function LibraryTab({ auth, onToast }) {
     api
       .moderationLibrary(auth.token, {
         search: debouncedSearch,
-        category,
+        category: category?.id ?? "",
         status,
         deleted,
         ordering,
@@ -573,14 +678,7 @@ function LibraryTab({ auth, onToast }) {
         />
         <label className="libfilters__field">
           Category
-          <select value={category} onChange={(e) => setCategory(e.target.value)}>
-            <option value="">all</option>
-            {categories?.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.name}
-              </option>
-            ))}
-          </select>
+          <CategoryFilterPick auth={auth} value={category} onChange={setCategory} />
         </label>
         <label className="libfilters__field">
           Status
@@ -1083,13 +1181,13 @@ function UserRow({ auth, user, onToast, onSaved }) {
 /**
  * Staff-curated tag table: a theme groups categories so hosts can find "all
  * music categories" in one tap on /host. List + inline create/edit (name,
- * description, category multi-select fed by api.categories) + soft delete
- * with confirm — the Library tab's row/form patterns, reused. Unpaginated
- * (staff-curated scale). Everything is IsAdminUser server-side.
+ * description, categories via the shared searchable CategoryPicker — §F7
+ * #15, no more fetch-all option list) + soft delete with confirm — the
+ * Library tab's row/form patterns, reused. Unpaginated (staff-curated
+ * scale). Everything is IsAdminUser server-side.
  */
 function ThemesTab({ auth, onToast }) {
   const [themes, setThemes] = useState(null);
-  const [categories, setCategories] = useState(null);
   const [error, setError] = useState(null);
   const [creating, setCreating] = useState(false);
 
@@ -1105,8 +1203,7 @@ function ThemesTab({ auth, onToast }) {
 
   useEffect(() => {
     refresh();
-    api.categories(auth.token).then(setCategories).catch(() => setCategories([]));
-  }, [auth.token, refresh]);
+  }, [refresh]);
 
   return (
     <>
@@ -1123,7 +1220,6 @@ function ThemesTab({ auth, onToast }) {
           <h2 className="h2">New theme</h2>
           <ThemeForm
             auth={auth}
-            categories={categories ?? []}
             onCancel={() => setCreating(false)}
             onDone={() => {
               setCreating(false);
@@ -1144,20 +1240,13 @@ function ThemesTab({ auth, onToast }) {
         </section>
       )}
       {themes?.map((theme) => (
-        <ThemeRow
-          key={theme.id}
-          auth={auth}
-          theme={theme}
-          categories={categories ?? []}
-          onToast={onToast}
-          onChanged={refresh}
-        />
+        <ThemeRow key={theme.id} auth={auth} theme={theme} onToast={onToast} onChanged={refresh} />
       ))}
     </>
   );
 }
 
-function ThemeRow({ auth, theme, categories, onToast, onChanged }) {
+function ThemeRow({ auth, theme, onToast, onChanged }) {
   const [editing, setEditing] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -1217,7 +1306,6 @@ function ThemeRow({ auth, theme, categories, onToast, onChanged }) {
         <ThemeForm
           auth={auth}
           theme={theme}
-          categories={categories}
           onCancel={() => setEditing(false)}
           onDone={() => {
             setEditing(false);
@@ -1231,10 +1319,19 @@ function ThemeRow({ auth, theme, categories, onToast, onChanged }) {
 }
 
 /** Shared create/edit form. `theme` present = edit (PATCH), absent = create. */
-function ThemeForm({ auth, theme, categories, onCancel, onDone }) {
+function ThemeForm({ auth, theme, onCancel, onDone }) {
   const [name, setName] = useState(theme?.name ?? "");
   const [description, setDescription] = useState(theme?.description ?? "");
-  const [selected, setSelected] = useState(() => (theme?.categories ?? []).map(String));
+  // §F7 (#15): membership through the shared CategoryPicker; edit mode
+  // seeds its Map from the serializer's `category_details` ({id, name},
+  // ACTIVE members only). Side effect worth naming: saving a theme now
+  // normalizes membership to active categories — the old form re-sent
+  // soft-deleted member ids, which the serializer's active-only queryset
+  // REJECTED, 400ing every edit of a theme with a dead member. Dropping
+  // them matches what every active surface already displays.
+  const [picked, setPicked] = useState(
+    () => new Map((theme?.category_details ?? []).map((c) => [c.id, { id: c.id, name: c.name }])),
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
 
@@ -1245,7 +1342,7 @@ function ThemeForm({ auth, theme, categories, onCancel, onDone }) {
     const body = {
       name: name.trim(),
       description: description.trim(),
-      categories: selected.map(Number),
+      categories: [...picked.keys()],
     };
     try {
       if (theme) await api.updateTheme(auth.token, theme.id, body);
@@ -1268,29 +1365,7 @@ function ThemeForm({ auth, theme, categories, onCancel, onDone }) {
         Description <span className="field__hint">(optional)</span>
         <input value={description} onChange={(e) => setDescription(e.target.value)} maxLength={300} />
       </label>
-      <fieldset className="field catpick">
-        <legend>Categories in this theme</legend>
-        <div className="catpick__list">
-          {categories.map((c) => {
-            const on = selected.includes(String(c.id));
-            return (
-              <label key={c.id} className={`catpick__item ${on ? "catpick__item--on" : ""}`}>
-                <input
-                  type="checkbox"
-                  checked={on}
-                  onChange={() =>
-                    setSelected((sel) =>
-                      on ? sel.filter((x) => x !== String(c.id)) : [...sel, String(c.id)],
-                    )
-                  }
-                />
-                {c.name}
-                {c.owner === null ? " (official)" : ""}
-              </label>
-            );
-          })}
-        </div>
-      </fieldset>
+      <CategoryPicker auth={auth} value={picked} onChange={setPicked} legend="Categories in this theme" />
       {error && <p className="formerror">{error}</p>}
       <div className="modcard__actions">
         <button className="btn btn--primary btn--sm" disabled={busy || !name.trim()}>

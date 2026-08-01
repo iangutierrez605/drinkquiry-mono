@@ -32,6 +32,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import Category, ModerationStatus, Theme, Visibility
+from .views import search_param
 
 PUBLIC_APPROVED = Q(visibility=Visibility.PUBLIC, moderation_status=ModerationStatus.APPROVED)
 
@@ -45,13 +46,24 @@ def visible_categories_for(user):
 
 
 class ThemeListView(APIView):
-    """The host create screen's theme strip data."""
+    """The host create screen's theme strip data.
+
+    §F1 (Handoff #15): `?search=` — icontains on name OR description
+    (shared search_param semantics). ADDITIVE: the unfiltered response and
+    its per-theme key set are pinned by the smoke — a BARE ARRAY, no page
+    envelope, because themes are staff-curated (dozens, not thousands).
+    Pagination trigger: if staff curation ever grows this list past a few
+    hundred (≈ when the strip's search stops being enough and the payload's
+    per-user category counts start to hurt), page it like the library —
+    until then the array stays flat and the frontend renders/slices it."""
 
     permission_classes = (permissions.IsAuthenticated,)
 
     def get(self, request):
         visible_ids = set(visible_categories_for(request.user).values_list("id", flat=True))
         themes = Theme.objects.filter(deleted_at__isnull=True).prefetch_related("categories").order_by("name", "id")
+        if search := search_param(request):
+            themes = themes.filter(Q(name__icontains=search) | Q(description__icontains=search))
         payload = []
         for theme in themes:
             categories = [
@@ -80,16 +92,29 @@ class ModerationThemeSerializer(serializers.ModelSerializer):
         many=True, required=False, queryset=Category.objects.filter(deleted_at__isnull=True)
     )
     category_names = serializers.SerializerMethodField()
+    # §F7 (Handoff #15): {id, name} pairs for the ACTIVE members — the edit
+    # form's searchable picker needs id→name seeds for its chips, and the
+    # two existing arrays can't be zipped (`categories` ids include deleted
+    # rows and follow M2M order; `category_names` is active-only and
+    # name-sorted). Read-only, additive; writes still use `categories` ids.
+    category_details = serializers.SerializerMethodField()
 
     class Meta:
         model = Theme
-        fields = ("id", "name", "description", "categories", "category_names", "created_at", "deleted_at")
+        fields = ("id", "name", "description", "categories", "category_names", "category_details", "created_at", "deleted_at")
         read_only_fields = ("created_at", "deleted_at")
 
     def get_category_names(self, obj):
         # §F5: a category deleted after being grouped stays in the M2M row
         # but is hidden everywhere active — the staff list hides it too.
         return sorted(c.name for c in obj.categories.all() if c.deleted_at is None)
+
+    def get_category_details(self, obj):
+        # Same active-only membership as category_names, same name sort.
+        return sorted(
+            ({"id": c.id, "name": c.name} for c in obj.categories.all() if c.deleted_at is None),
+            key=lambda c: c["name"],
+        )
 
     def validate_name(self, value):
         value = value.strip()
@@ -113,12 +138,22 @@ class ModerationThemeViewSet(
 ):
     permission_classes = (IsAdminUser,)
     serializer_class = ModerationThemeSerializer
-    pagination_class = None  # staff-curated scale; the tab renders the lot
+    # Staff-curated scale; the tab renders the lot as a BARE ARRAY (no page
+    # envelope — the frontend must not run this through a page helper).
+    # §F1 (#15) pagination trigger: page it like the library the day staff
+    # curation outgrows one screen (a few hundred themes); until then
+    # ?search= below is the scale valve.
+    pagination_class = None
 
     def get_queryset(self):
         qs = Theme.objects.prefetch_related("categories").order_by("name", "id")
         if self.action == "list":
-            return qs.filter(deleted_at__isnull=True)
+            qs = qs.filter(deleted_at__isnull=True)
+            # §F1 (#15): list-only ?search= — icontains on name OR
+            # description, shared search_param semantics (strip, cap 100).
+            if search := search_param(self.request):
+                qs = qs.filter(Q(name__icontains=search) | Q(description__icontains=search))
+            return qs
         # Detail/actions see deleted themes so a double-delete race gets the
         # house 409, not a 404.
         return qs

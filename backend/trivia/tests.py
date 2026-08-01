@@ -2221,3 +2221,353 @@ class PublicCategoryBrowseTests(BaseCase):
         # left in a browser (authentication_classes is empty on purpose).
         res = self.client.get(self.URL, HTTP_AUTHORIZATION="Token deadbeef")
         self.assertEqual(res.status_code, 200, res.content)
+
+
+# ---------------------------------------------------------------------------
+# Handoff #15 §F1 — server-side search + ?mine= (categories, questions, themes)
+# ---------------------------------------------------------------------------
+
+class CategorySearchTests(BaseCase):
+    """`?search=` on both category lists: icontains over name OR description,
+    stripped, silently capped at 100 chars, ADDITIVE (the unfiltered public
+    call stays byte-identical — its shape/order/openness are pinned)."""
+
+    PUBLIC = "/api/categories/public/"
+
+    def setUp(self):
+        super().setUp()
+        self.movies = Category.objects.create(
+            owner=None, name="Movies", description="From silents to sequels.",
+            visibility=Visibility.PUBLIC, moderation_status=ModerationStatus.APPROVED,
+        )
+        self.beer = Category.objects.create(
+            owner=None, name="Beer", description="Hops, malts and the cinema of brewing.",
+            visibility=Visibility.PUBLIC, moderation_status=ModerationStatus.APPROVED,
+        )
+
+    def names(self, res):
+        return [c["name"] for c in res.json()["results"]]
+
+    def test_public_search_matches_name_or_description_case_insensitive(self):
+        # Name match, case-insensitive.
+        self.assertEqual(self.names(self.client.get(self.PUBLIC, {"search": "mOvIeS"})), ["Movies"])
+        # Description match ("cinema" only appears in Beer's description).
+        self.assertEqual(self.names(self.client.get(self.PUBLIC, {"search": "cinema"})), ["Beer"])
+        # No match → empty page (200, count 0), never an error.
+        res = self.client.get(self.PUBLIC, {"search": "zzz-nothing-here"})
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["count"], 0)
+        # Whitespace-only search = no filter (strip → empty → default listing).
+        self.assertIn("Movies", self.names(self.client.get(self.PUBLIC, {"search": "   "})))
+
+    def test_public_search_is_silently_capped_at_100_chars(self):
+        # A 100-char name; searching with 100 matching chars + garbage past
+        # the cap still matches, proving the tail is silently dropped (no 400).
+        long_name = "Z" * 100
+        Category.objects.create(
+            owner=None, name=long_name, visibility=Visibility.PUBLIC,
+            moderation_status=ModerationStatus.APPROVED,
+        )
+        res = self.client.get(self.PUBLIC, {"search": long_name + "GARBAGE-PAST-THE-CAP"})
+        self.assertEqual(res.status_code, 200, res.content)
+        self.assertEqual(self.names(res), [long_name])
+
+    def test_public_search_pages_deterministically(self):
+        # 60 matches → page 1 carries 50 (DRF PAGE_SIZE) with next, page 2
+        # the other 10; name-A→Z with id tiebreak keeps pages stable.
+        for i in range(60):
+            Category.objects.create(
+                owner=None, name=f"PageProbe {i:02d}", visibility=Visibility.PUBLIC,
+                moderation_status=ModerationStatus.APPROVED,
+            )
+        one = self.client.get(self.PUBLIC, {"search": "pageprobe"}).json()
+        self.assertEqual((one["count"], len(one["results"])), (60, 50))
+        self.assertIsNotNone(one["next"])
+        two = self.client.get(self.PUBLIC, {"search": "pageprobe", "page": 2}).json()
+        self.assertEqual(len(two["results"]), 10)
+        self.assertIsNone(two["next"])
+        got = [c["name"] for c in one["results"] + two["results"]]
+        self.assertEqual(got, sorted(got))
+
+    def test_public_unfiltered_call_is_untouched(self):
+        # §B5: adding ?search= must not change the default response — the
+        # bare call and an EMPTY search are byte-identical, rows keep the
+        # exact five keys, ordering stays name-A→Z.
+        bare = self.client.get(self.PUBLIC)
+        empty = self.client.get(self.PUBLIC, {"search": ""})
+        self.assertEqual(bare.content, empty.content)
+        rows = bare.json()["results"]
+        for row in rows:
+            self.assertEqual(set(row), {"id", "name", "description", "photo", "question_count"}, row)
+        names = [c["name"] for c in rows]
+        self.assertEqual(names, sorted(names))
+
+    def test_authed_search_respects_visibility_scoping(self):
+        # `other`'s PRIVATE category matches the term but must stay invisible
+        # to `creator` — the search filter narrows the scoped queryset, never
+        # widens it.
+        make_category(self.other, "ScopedSecret Movies")
+        self.auth(self.creator)
+        names = [c["name"] for c in self.client.get("/api/categories/", {"search": "movies"}).json()["results"]]
+        self.assertEqual(names, ["Movies"])
+        self.auth(self.other)
+        names = [c["name"] for c in self.client.get("/api/categories/", {"search": "movies"}).json()["results"]]
+        self.assertEqual(names, ["Movies", "ScopedSecret Movies"])
+
+    def test_authed_list_orders_name_then_id(self):
+        # #15 changed the authed list order from plain id to ("name", "id") —
+        # a paged picker reads alphabetically like the public browse.
+        make_category(self.creator, "Aardvarks")
+        self.auth(self.creator)
+        names = [c["name"] for c in self.client.get("/api/categories/").json()["results"]]
+        self.assertEqual(names, sorted(names))
+        self.assertEqual(names[0], "Aardvarks")
+
+    def test_mine_filters_to_own_rows_only(self):
+        mine_cat = make_category(self.creator, "My Private Pile")
+        make_category(self.other, "Other Private")
+        self.auth(self.creator)
+        data = self.client.get("/api/categories/", {"mine": "1"}).json()
+        self.assertEqual([c["name"] for c in data["results"]], [mine_cat.name])
+        self.assertEqual(data["count"], 1)  # the /create meters read this
+        # Anonymous callers own nothing: empty page, not an error.
+        self.client.force_authenticate(user=None)
+        anon = self.client.get("/api/categories/", {"mine": "1"})
+        self.assertEqual(anon.status_code, 200, anon.content)
+        self.assertEqual(anon.json()["count"], 0)
+
+
+class QuestionSearchTests(BaseCase):
+    def setUp(self):
+        super().setUp()
+        self.cat = make_category(None, "Movies", public_approved=True)
+        self.joker = Question.objects.create(
+            owner=None, question_text="Who played the Joker?", answer="Heath Ledger",
+            difficulty=2, visibility=Visibility.PUBLIC, moderation_status=ModerationStatus.APPROVED,
+        )
+        self.joker.categories.add(self.cat)
+        self.talkie = Question.objects.create(
+            owner=None, question_text="First talkie premiere year?", answer="1927",
+            difficulty=3, visibility=Visibility.PUBLIC, moderation_status=ModerationStatus.APPROVED,
+        )
+        self.talkie.categories.add(self.cat)
+
+    def texts(self, res):
+        return [q["question_text"] for q in res.json()["results"]]
+
+    def test_search_matches_text_or_answer_case_insensitive(self):
+        self.auth(self.creator)
+        self.assertEqual(self.texts(self.client.get("/api/questions/", {"search": "jOkEr"})), ["Who played the Joker?"])
+        # Answer-side match: "ledger" lives only in the answer.
+        self.assertEqual(self.texts(self.client.get("/api/questions/", {"search": "ledger"})), ["Who played the Joker?"])
+        self.assertEqual(self.client.get("/api/questions/", {"search": "zzz-none"}).json()["count"], 0)
+
+    def test_search_respects_scoping_and_combines_with_category(self):
+        secret = make_question(self.other, self.cat, "Secret Joker question?")  # other's PRIVATE
+        self.auth(self.creator)
+        ids = [q["id"] for q in self.client.get("/api/questions/", {"search": "joker"}).json()["results"]]
+        self.assertEqual(ids, [self.joker.id])  # never other's private
+        other_cat = make_category(None, "Music", public_approved=True)
+        self.joker.categories.add(other_cat)
+        # search + ?category= stack: joker matches "joker" but not in Music-only rows.
+        ids = [
+            q["id"]
+            for q in self.client.get(
+                "/api/questions/", {"search": "joker", "category": other_cat.id}
+            ).json()["results"]
+        ]
+        self.assertEqual(ids, [self.joker.id])
+        ids = [
+            q["id"]
+            for q in self.client.get(
+                "/api/questions/", {"search": "talkie", "category": other_cat.id}
+            ).json()["results"]
+        ]
+        self.assertEqual(ids, [])
+        del secret  # only here to prove absence above
+
+    def test_mine_filters_to_own_rows_with_true_count(self):
+        mine = make_question(self.creator, self.cat, "My private question?")
+        self.auth(self.creator)
+        data = self.client.get("/api/questions/", {"mine": "1"}).json()
+        self.assertEqual([q["id"] for q in data["results"]], [mine.id])
+        self.assertEqual(data["count"], 1)
+
+    def test_detail_requests_ignore_stray_search_params(self):
+        # get_object routes through get_queryset — a query param on a detail
+        # URL must never turn into a 404 (list-only filters, §F1).
+        mine = make_question(self.creator, self.cat, "My private question?")
+        self.auth(self.creator)
+        res = self.client.get(f"/api/questions/{mine.id}/", {"search": "zzz-no-match", "mine": "1"})
+        self.assertEqual(res.status_code, 200, res.content)
+
+
+class ThemeSearchTests(BaseCase):
+    def setUp(self):
+        super().setUp()
+        from .models import Theme
+
+        self.movies = make_category(None, "Movies", public_approved=True)
+        self.eighties = Theme.objects.create(name="80s Night", description="Neon and synths.")
+        self.eighties.categories.add(self.movies)
+        self.pub = Theme.objects.create(name="Pub Classics", description="The staples.")
+
+    def test_host_theme_search_filters_and_keeps_the_pinned_shape(self):
+        self.auth(self.free)
+        rows = self.client.get("/api/themes/", {"search": "nEoN"}).json()
+        self.assertEqual([t["name"] for t in rows], ["80s Night"])  # description match, case-insensitive
+        for t in rows:
+            self.assertEqual(set(t), {"id", "name", "description", "categories"}, t)
+        self.assertEqual(self.client.get("/api/themes/", {"search": "zzz"}).json(), [])
+        # Bare array in and out — a search must not grow a page envelope.
+        self.assertIsInstance(self.client.get("/api/themes/").json(), list)
+
+    def test_moderation_theme_search(self):
+        self.auth(self.staff)
+        rows = self.client.get("/api/moderation/themes/", {"search": "pub"}).json()
+        self.assertEqual([t["name"] for t in rows], ["Pub Classics"])
+        self.assertIsInstance(rows, list)  # bare array here too
+
+    def test_moderation_theme_rows_carry_active_category_details(self):
+        # §F7: {id, name} seeds for the edit picker — active members only,
+        # name-sorted, and consistent with category_names.
+        from django.utils import timezone as _tz
+
+        dead = make_category(None, "Dead Cat", public_approved=True)
+        self.eighties.categories.add(dead)
+        dead.deleted_at = _tz.now()
+        dead.save()
+        self.auth(self.staff)
+        row = next(t for t in self.client.get("/api/moderation/themes/").json() if t["id"] == self.eighties.id)
+        self.assertEqual(row["category_details"], [{"id": self.movies.id, "name": "Movies"}])
+        self.assertEqual(row["category_names"], ["Movies"])
+
+
+# ---------------------------------------------------------------------------
+# Handoff #15 §F2 — batch similar (the review aid without the herd)
+# ---------------------------------------------------------------------------
+
+class SimilarBatchTests(BaseCase):
+    URL = "/api/moderation/questions/similar/batch/"
+
+    def setUp(self):
+        super().setUp()
+        self.movies = make_category(None, "Movies", public_approved=True)
+        self.music = make_category(None, "Music", public_approved=True)
+        # A healthy Movies pool (>= MIN_CATEGORY_POOL approved siblings)…
+        self.approved = []
+        for i, text in enumerate(
+            [
+                "Which actor played the Joker in The Dark Knight?",
+                "Which actor played Batman in The Dark Knight?",
+                "What year did The Dark Knight premiere in cinemas?",
+                "Who directed The Dark Knight trilogy of films?",
+                "Which city stands in for Gotham in The Dark Knight?",
+            ]
+        ):
+            q = Question.objects.create(
+                owner=None, question_text=text, answer=f"A{i}", difficulty=2,
+                visibility=Visibility.PUBLIC, moderation_status=ModerationStatus.APPROVED,
+            )
+            q.categories.add(self.movies)
+            self.approved.append(q)
+        # …and a thin Music pool (1 approved) so one target exercises the
+        # global fallback path.
+        self.music_only = Question.objects.create(
+            owner=None, question_text="Which band scored Flash Gordon?", answer="Queen",
+            difficulty=2, visibility=Visibility.PUBLIC, moderation_status=ModerationStatus.APPROVED,
+        )
+        self.music_only.categories.add(self.music)
+        self.pending_movies = make_question(
+            self.creator, self.movies, "Who played the Joker in The Dark Knight?",
+            status=ModerationStatus.PENDING, visibility=Visibility.PUBLIC,
+        )
+        self.pending_music = make_question(
+            self.creator, self.music, "Which band scored the film Flash Gordon?",
+            status=ModerationStatus.PENDING, visibility=Visibility.PUBLIC,
+        )
+
+    def test_batch_output_equals_single_endpoint_for_every_target(self):
+        # The parity contract, over a healthy-pool target, a thin-pool
+        # (global fallback) target, an APPROVED target and a soft-deleted
+        # one — same rows, same order, same shape, keyed by string id.
+        from django.utils import timezone as _tz
+
+        deleted = make_question(
+            self.creator, self.movies, "Who was the Joker actor in The Dark Knight?",
+            status=ModerationStatus.PENDING, visibility=Visibility.PUBLIC,
+        )
+        deleted.deleted_at = _tz.now()
+        deleted.save()
+        targets = [self.pending_movies, self.pending_music, self.approved[0], deleted]
+        self.auth(self.staff)
+        singles = {
+            t.id: self.client.get(f"/api/moderation/questions/{t.id}/similar/").json()["similar"]
+            for t in targets
+        }
+        res = self.client.post(self.URL, {"ids": [t.id for t in targets]}, format="json")
+        self.assertEqual(res.status_code, 200, res.content)
+        batch = res.json()
+        self.assertEqual(set(batch), {str(t.id) for t in targets})
+        for t in targets:
+            self.assertEqual(batch[str(t.id)], singles[t.id], f"parity broke for target {t.id}")
+        # Sanity on the fixtures: the healthy target found its planted dupe,
+        # the thin target actually crossed categories via the global fallback.
+        self.assertEqual(batch[str(self.pending_movies.id)][0]["id"], self.approved[0].id)
+        self.assertIn(self.music_only.id, [r["id"] for r in batch[str(self.pending_music.id)]])
+
+    def test_batch_validation(self):
+        self.auth(self.staff)
+        for bad in ({}, {"ids": []}, {"ids": "nope"}, {"ids": [1] * 51}, {"ids": ["x"]}):
+            res = self.client.post(self.URL, bad, format="json")
+            self.assertEqual(res.status_code, 400, (bad, res.content))
+        # Exactly 50 is fine (the cap is inclusive).
+        res = self.client.post(self.URL, {"ids": [self.pending_movies.id] * 50}, format="json")
+        self.assertEqual(res.status_code, 200, res.content)
+
+    def test_batch_is_staff_only(self):
+        self.auth(self.creator)
+        res = self.client.post(self.URL, {"ids": [self.pending_movies.id]}, format="json")
+        self.assertEqual(res.status_code, 403)
+
+    def test_unknown_ids_are_omitted_not_fatal(self):
+        self.auth(self.staff)
+        res = self.client.post(self.URL, {"ids": [self.pending_movies.id, 999999]}, format="json")
+        self.assertEqual(res.status_code, 200, res.content)
+        self.assertEqual(set(res.json()), {str(self.pending_movies.id)})
+
+
+class QuestionCategoryNamesTests(BaseCase):
+    """§F1 (#15): QuestionSerializer rows carry `category_names` (ACTIVE
+    names, sorted) so /create can label rows without a category fetch-all;
+    the staff ModerationQuestionSerializer keeps its deliberate divergence
+    (ALL names, deleted included — the graveyard views need them)."""
+
+    def setUp(self):
+        super().setUp()
+        self.movies = make_category(None, "Movies", public_approved=True)
+        self.beer = make_category(None, "Beer", public_approved=True)
+        self.q = make_question(self.creator, [self.movies, self.beer], "Two-home question?")
+
+    def test_rows_carry_active_names_sorted(self):
+        from django.utils import timezone as _tz
+
+        self.auth(self.creator)
+        row = next(r for r in self.client.get("/api/questions/", {"mine": "1"}).json()["results"] if r["id"] == self.q.id)
+        self.assertEqual(row["category_names"], ["Beer", "Movies"])
+        # Soft-delete one home: it drops from the OWNER-facing names…
+        self.beer.deleted_at = _tz.now()
+        self.beer.save()
+        row = next(r for r in self.client.get("/api/questions/", {"mine": "1"}).json()["results"] if r["id"] == self.q.id)
+        self.assertEqual(row["category_names"], ["Movies"])
+
+    def test_moderation_rows_keep_deleted_names(self):
+        from django.utils import timezone as _tz
+
+        self.beer.deleted_at = _tz.now()
+        self.beer.save()
+        self.auth(self.staff)
+        rows = self.client.get("/api/moderation/questions/?status=all").json()["results"]
+        row = next(r for r in rows if r["id"] == self.q.id)
+        # …but the staff library still names the dead home (divergence pinned).
+        self.assertEqual(row["category_names"], ["Beer", "Movies"])

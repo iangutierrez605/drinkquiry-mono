@@ -110,7 +110,26 @@ async function request(path, { method = "GET", body, authToken, formData } = {})
   return data;
 }
 
-/** Follow DRF pagination `next` links until exhausted; returns one flat array. */
+/** Build a query string from a params object; empty/null values are dropped.
+ *  URLSearchParams does the encoding — emoji, quotes and & in a search term
+ *  arrive server-side intact (§G, Handoff #15). */
+function qs(params = {}) {
+  const s = new URLSearchParams(
+    Object.entries(params).filter(([, v]) => v !== "" && v != null),
+  ).toString();
+  return s ? `?${s}` : "";
+}
+
+/** Follow DRF pagination `next` links until exhausted; returns one flat array.
+ *
+ * ⚠️ C21 (Handoff #15): this helper is a SCALE LANDMINE — every call site is
+ * a future outage (at 2,000 categories it means 40 sequential requests and a
+ * 2,000-row render; at 500 pending items it detonated #14c). It survives for
+ * exactly TWO owner-bounded lists — `tournaments` and `gameHistory`, both
+ * capped by one host's own activity — and nothing else. New list consumers
+ * use the paged `*Page` methods below (server `?search=` + page envelope);
+ * wiring a NEW call site through here needs a written justification of why
+ * the list is and stays bounded. */
 async function allPages(path, authToken) {
   const items = [];
   let url = `${API_BASE}${path}`;
@@ -159,13 +178,23 @@ export const api = {
       body: { current_password: currentPassword, new_password: newPassword },
     }),
 
-  // ---- Content ----
+  // ---- Content (server-paged since Handoff #15 — C21: never allPages) ----
+  // All *Page methods return the DRF page envelope {results, count, next,
+  // previous} AS-IS; `search` rides the server's `?search=` (icontains,
+  // capped at 100 chars server-side), `page` is 1-based.
   // §G (Handoff #12): the anonymous shop window — no token, deliberately
-  // unthrottled server-side. {id, name, description, photo, question_count}.
-  publicCategories: () => allPages("/api/categories/public/"),
-  categories: (token) => allPages("/api/categories/", token),
-  questions: (categoryId, token) =>
-    allPages(categoryId ? `/api/questions/?category=${categoryId}` : "/api/questions/", token),
+  // unthrottled server-side. Rows: {id, name, description, photo,
+  // question_count} (pinned).
+  publicCategoriesPage: ({ search, page } = {}) =>
+    request(`/api/categories/public/${qs({ search, page })}`),
+  // Authed visible categories. `mine: 1` = the caller's OWN rows only (any
+  // visibility/status) — the /create "My content" pager; `count` is then the
+  // true owned total (feeds the usage meters).
+  categoriesPage: (token, { search, page, mine } = {}) =>
+    request(`/api/categories/${qs({ search, page, mine })}`, { authToken: token }),
+  // Visible questions; `category` filters by id, `mine: 1` as above.
+  questionsPage: (token, { category, search, page, mine } = {}) =>
+    request(`/api/questions/${qs({ category, search, page, mine })}`, { authToken: token }),
   createCategory: (token, formData) =>
     request("/api/categories/", { method: "POST", authToken: token, formData }),
   createQuestion: (token, formData) =>
@@ -191,21 +220,30 @@ export const api = {
 
   // ---- Moderation (staff only; Handoff #4 §F, extended by #8 §K) ----
   moderationCounts: (token) => request("/api/moderation/counts/", { authToken: token }),
-  moderationList: (token, kind, status = "pending") =>
-    allPages(`/api/moderation/${kind}/?status=${status}`, token), // kind: "categories" | "questions"
+  // #15: ONE page of a review queue — {results, count, next, previous}.
+  // kind: "categories" | "questions"; status defaults to pending server-side.
+  // The queues page at the server's sizes (questions 25, categories 50);
+  // never run this through allPages (that fetch-all is what #14c punished).
+  moderationPage: (kind, token, { status, page } = {}) =>
+    request(`/api/moderation/${kind}/${qs({ status, page })}`, { authToken: token }),
   moderationApprove: (token, kind, id) =>
     request(`/api/moderation/${kind}/${id}/approve/`, { method: "POST", authToken: token }),
   moderationReject: (token, kind, id, note) =>
     request(`/api/moderation/${kind}/${id}/reject/`, { method: "POST", authToken: token, body: { note } }),
-  // §K1: near-duplicate review aid — fetched per card so the queue stays snappy.
-  moderationSimilar: (token, id) =>
-    request(`/api/moderation/questions/${id}/similar/`, { authToken: token }),
+  // §K1 via §F2 (#15): the near-duplicate review aid for a WHOLE page of
+  // cards in ONE request — {"<id>": [match, ...]}, ids capped at 50 per call
+  // (chunk bigger lists). Replaces the per-card fetches (and their #14c
+  // gate) entirely; the single GET …/<id>/similar/ endpoint still exists
+  // server-side but no longer has a client method — nothing should per-card
+  // it again (C20).
+  moderationSimilarBatch: (token, ids) =>
+    request("/api/moderation/questions/similar/batch/", { method: "POST", authToken: token, body: { ids } }),
 
   // ---- §I (Handoff #9): the staff question library ----
   // REAL pagination — returns {results, count, next, previous} as-is; never
   // run this through allPages (the library is the "thousands of questions"
-  // surface; the pending-queue tabs keep allPages for their small worklists).
-  // `params` is a plain object; empty values are dropped.
+  // surface — and since #15 the pending-queue tabs page the same way via
+  // moderationPage above). `params` is a plain object; empty values dropped.
   moderationLibrary: (token, params = {}) => {
     const qs = new URLSearchParams(
       Object.entries(params).filter(([, v]) => v !== "" && v != null),
@@ -251,8 +289,10 @@ export const api = {
 
   // ---- §G (Handoff #10): themes ----
   // Host-facing discovery list (active themes, per-user visible categories
-  // with per-user usable counts). Unpaginated, staff-curated scale.
-  themes: (token) => request("/api/themes/", { authToken: token }),
+  // with per-user usable counts). A BARE ARRAY — staff-curated scale, no
+  // page envelope (do NOT wrap in a page helper); #15 adds server-side
+  // `?search=` for the strip's search box.
+  themes: (token, search) => request(`/api/themes/${qs({ search })}`, { authToken: token }),
   // Staff CRUD (IsAdminUser server-side; the tab's is_staff gate is
   // cosmetic). Unpaginated list — plain array.
   moderationThemes: (token) => request("/api/moderation/themes/", { authToken: token }),

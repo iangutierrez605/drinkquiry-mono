@@ -1197,3 +1197,89 @@ code { font-family: var(--font-mono); color: var(--accent); font-size: 0.9em; }
 .tournamentbanner { border-color: var(--accent); display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
 .tournamentbanner__line { margin: 0; font-size: 16px; }
 .tgamecard__host { margin: 4px 0 8px; width: 100%; }
+
+/* ---------- Handoff #15 ---------- */
+/* Scale & search: the browse grid, host create grid, /create pickers and
+   the moderation queues all became search-and-page shaped. Everything here
+   rides the Night Market tokens (invariant 9 — zero raw colors). */
+
+/* Standalone search input above a paged list (browse grid, host catgrid). */
+.listsearch {
+  display: block; width: 100%; max-width: 460px;
+  background: var(--ink-4);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--paper);
+  padding: 10px 12px;
+  font: inherit;
+  margin: 0 0 12px;
+}
+.listsearch:focus { outline: none; border-color: var(--accent); }
+
+/* "Showing X of Y" + Load more, centered under a paged list. */
+.loadmore { display: flex; align-items: center; justify-content: center; gap: 14px; margin: 12px 0 4px; }
+.loadmore--tight { justify-content: flex-start; margin: 8px 0 0; }
+.listmeta { color: var(--dim); font-size: 13px; }
+
+/* §F6 pinned selections — the "On your board (n)" row and every chosen-
+   category chip (host grid, CategoryPicker, library filter). */
+.pinnedrow {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  border: 1px dashed var(--accent);
+  border-radius: 12px;
+  background: rgba(var(--accent-rgb), 0.06);
+  padding: 8px 10px; margin: 0 0 12px;
+}
+.pinnedrow__label {
+  color: var(--accent); font-size: 12px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.08em;
+}
+.pinnedchip {
+  font-family: var(--font-body); font-size: 0.88rem; font-weight: 600;
+  border: 1px solid var(--accent); border-radius: 999px;
+  background: rgba(var(--accent-rgb), 0.14); color: var(--paper);
+  padding: 5px 12px; cursor: pointer;
+}
+.pinnedchip:hover { background: rgba(var(--accent-rgb), 0.26); }
+.pinnedchip--short { border-color: var(--warn); background: rgba(var(--warn-rgb), 0.12); }
+
+/* Theme strip additions: the server-side theme search + "+N more" hint. */
+.themestrip__search {
+  flex: 0 1 180px;
+  background: var(--ink-4); border: 1px solid var(--line); border-radius: 999px;
+  color: var(--paper); padding: 6px 12px; font: inherit; font-size: 0.88rem;
+}
+.themestrip__search:focus { outline: none; border-color: var(--accent); }
+.themestrip__more { color: var(--dim); font-size: 0.82rem; font-style: italic; }
+
+/* CategoryPicker (§F7): chips of the chosen + its search box; the result
+   rows reuse the #10 .catpick__item styles unchanged. */
+.catpicker__chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 10px; }
+.catpicker__search {
+  display: block; width: 100%; max-width: 320px;
+  background: var(--ink-4); border: 1px solid var(--line); border-radius: 10px;
+  color: var(--paper); padding: 8px 12px; font: inherit;
+  margin: 0 0 10px;
+}
+.catpicker__search:focus { outline: none; border-color: var(--accent); }
+
+/* §F8 library filter: type-to-search single category pick. */
+.filterpick { position: relative; display: inline-flex; flex-direction: column; }
+.filterpick input {
+  background: var(--ink-4); border: 1px solid var(--line); border-radius: 10px;
+  color: var(--paper); padding: 8px 10px; font: inherit; min-width: 170px;
+}
+.filterpick input:focus { outline: none; border-color: var(--accent); }
+.filterpick__results {
+  position: absolute; top: calc(100% + 4px); left: 0; z-index: 30;
+  display: flex; flex-direction: column; min-width: 220px; max-height: 260px; overflow-y: auto;
+  background: var(--ink-3); border: 1px solid var(--line); border-radius: 10px;
+  box-shadow: 0 14px 30px rgba(0, 0, 0, 0.4);
+}
+.filterpick__opt {
+  text-align: left; background: transparent; border: 0; color: var(--paper);
+  padding: 8px 12px; font: inherit; font-size: 0.9rem; cursor: pointer;
+  text-transform: none; letter-spacing: normal;
+}
+.filterpick__opt:hover { background: rgba(var(--accent-rgb), 0.12); color: var(--accent); }
+.filterpick__none { color: var(--dim); font-size: 0.85rem; padding: 8px 12px; text-transform: none; letter-spacing: normal; }

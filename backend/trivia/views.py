@@ -26,6 +26,16 @@ def _incoming_file_bytes(request) -> int:
     return sum(f.size for f in request.FILES.values())
 
 
+def search_param(request) -> str:
+    """§F1 (Handoff #15): the ONE reading of `?search=` — stripped and
+    SILENTLY capped at 100 chars (a pasted paragraph just searches on its
+    first 100 chars instead of 400ing; nothing meaningful is that long).
+    Empty string means "no filter" — the default listing, never an empty
+    result set. Shared by every search-capable list in trivia (categories
+    public + authed, questions, both theme surfaces)."""
+    return request.query_params.get("search", "").strip()[:100]
+
+
 class PublicCategoryListView(generics.ListAPIView):
     """§G1 (Handoff #12): `GET /api/categories/public/` — the logged-out
     marketing funnel. AllowAny, list-only, and DELIBERATELY UNTHROTTLED
@@ -37,10 +47,20 @@ class PublicCategoryListView(generics.ListAPIView):
     absence pinned). `question_count` counts ACTIVE questions that are
     themselves official or public-approved, annotated in one query (do NOT
     reuse the per-user usable_question_count machinery — it takes a user;
-    this surface has none). Ordering name A→Z; DRF's default pagination
-    (50) is fine at current scale. Registered BEFORE trivia's router
+    this surface has none). Ordering name A→Z with an id tiebreak
+    (deterministic pages, §G house rule). Registered BEFORE trivia's router
     include (static-before-parameterized, house rule) so the CategoryViewSet
     detail route can't swallow /public/ as a pk.
+
+    §F1 (Handoff #15): `?search=` — icontains on name OR description
+    (shared search_param semantics: stripped, silently capped at 100).
+    ADDITIVE ONLY: the unfiltered call's shape, ordering, AllowAny and
+    unthrottled status are all pinned (smoke + tests). Staying unthrottled
+    with an anon-reachable icontains is a MEASURED call, not an oversight:
+    at the current thousands-scale a seq scan over ~100-char names +
+    short descriptions is single-digit ms; if the corpus grows another
+    order of magnitude, the §M escape hatch is a pg_trgm GIN index — never
+    a throttle on this pinned-unthrottled surface.
     """
 
     serializer_class = PublicCategorySerializer
@@ -55,12 +75,14 @@ class PublicCategoryListView(generics.ListAPIView):
                 questions__moderation_status=ModerationStatus.APPROVED,
             )
         )
-        return (
+        qs = (
             Category.objects.filter(deleted_at__isnull=True)
             .filter(Q(owner__isnull=True) | PUBLIC_APPROVED)
             .annotate(question_count=Count("questions", filter=browsable_question, distinct=True))
-            .order_by("name")
         )
+        if search := search_param(self.request):
+            qs = qs.filter(Q(name__icontains=search) | Q(description__icontains=search))
+        return qs.order_by("name", "id")
 
 
 class CategoryViewSet(viewsets.ModelViewSet):
@@ -101,16 +123,32 @@ class CategoryViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        # order_by("id"): deterministic pagination (fixes the compose run's
-        # UnorderedObjectListWarning) — applied here in the list queryset, not
-        # as Meta.ordering, so no other Category caller changes behavior.
+        # Ordering ("name", "id"): #15 changed the LIST order from plain id
+        # to name-A→Z so a paged create-grid/picker reads alphabetically like
+        # the public browse; the id tiebreak keeps pages deterministic (the
+        # compose run's UnorderedObjectListWarning stays fixed). Applied here
+        # in the queryset, not as Meta.ordering, so no other Category caller
+        # changes behavior. Nothing consumed the old id-order semantically —
+        # every list consumer was rewritten around server pages this session.
         # §F5: deleted categories are invisible here for everyone —
         # get_object routes through this too, so a deleted category 404s on
         # retrieve/PATCH/DELETE.
         qs = Category.objects.filter(deleted_at__isnull=True)
         if user.is_authenticated:
-            return qs.filter(PUBLIC_APPROVED | Q(owner=user) | Q(owner__isnull=True)).distinct().order_by("id")
-        return qs.filter(PUBLIC_APPROVED | Q(owner__isnull=True)).order_by("id")
+            qs = qs.filter(PUBLIC_APPROVED | Q(owner=user) | Q(owner__isnull=True)).distinct()
+        else:
+            qs = qs.filter(PUBLIC_APPROVED | Q(owner__isnull=True))
+        # §F1 (#15): list-only filters — a detail request (get_object routes
+        # through here) must never 404 because of a stray query param.
+        if self.action == "list":
+            if search := search_param(self.request):
+                qs = qs.filter(Q(name__icontains=search) | Q(description__icontains=search))
+            # ?mine= — the /create "My content" pager: the caller's OWN rows
+            # only (any visibility/status). Anonymous callers own nothing, so
+            # mine on an anon list is an empty page, not an error.
+            if self.request.query_params.get("mine"):
+                qs = qs.filter(owner=user) if user.is_authenticated else qs.none()
+        return qs.order_by("name", "id")
 
 
 class QuestionViewSet(viewsets.ModelViewSet):
@@ -299,6 +337,14 @@ class QuestionViewSet(viewsets.ModelViewSet):
         qs = Question.objects.prefetch_related("categories").filter(deleted_at__isnull=True)
         if category_id := self.request.query_params.get("category"):
             qs = qs.filter(categories__id=category_id)
+        # §F1 (#15): list-only filters — get_object routes through here, and
+        # a detail request must never 404 on a stray query param.
+        if self.action == "list":
+            if search := search_param(self.request):
+                qs = qs.filter(Q(question_text__icontains=search) | Q(answer__icontains=search))
+            # ?mine= — the /create "My content" pager (see CategoryViewSet).
+            if self.request.query_params.get("mine"):
+                qs = qs.filter(owner=user) if user.is_authenticated else qs.none()
         if user.is_authenticated:
             return qs.filter(PUBLIC_APPROVED | Q(owner=user) | Q(owner__isnull=True)).distinct().order_by("id")
         return qs.filter(PUBLIC_APPROVED | Q(owner__isnull=True)).distinct().order_by("id")

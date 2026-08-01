@@ -8,6 +8,11 @@ Endpoints (all `IsAdminUser` — the frontend's is_staff gate is cosmetic):
   POST /api/moderation/{kind}/{id}/reject/    PENDING only; requires {"note": "..."}
   GET  /api/moderation/questions/{id}/similar/  §K1: top near-duplicates among
                                               approved questions (review aid)
+  POST /api/moderation/questions/similar/batch/ §F2 (#15): the same aid for a
+                                              whole queue page — body
+                                              {"ids": [...]} (≤ 50), response
+                                              {"<id>": [match, ...]}, rows
+                                              byte-identical to the single
   GET  /api/moderation/counts/                {"categories": n, "questions": n} pending
                                               (shape pinned pre-#8; the Flagged
                                               tab counts from its own list)
@@ -73,7 +78,12 @@ from .serializers import (
     ModerationCategorySerializer,
     ModerationQuestionSerializer,
 )
-from .similarity import similar_questions
+from .similarity import similar_questions, similar_questions_batch
+
+# §F2 (Handoff #15): hard ceiling on one batch-similar request. The queue
+# pages at 25 (LibraryPagination) and the flagged worklist chunks, so real
+# callers sit well under it; anything bigger is a client bug, not a need.
+SIMILAR_BATCH_MAX = 50
 
 VALID_STATUSES = {choice.value for choice in ModerationStatus}
 
@@ -220,6 +230,41 @@ class ModerationQuestionViewSet(_ModerationViewSet):
         AID, not auto-rejection; works for any status so the Flagged tab can
         reuse it on approved questions."""
         return Response({"similar": similar_questions(self.get_object())})
+
+    @action(detail=False, methods=["post"], url_path="similar/batch")
+    def similar_batch(self, request):
+        """§F2 (Handoff #15): `POST /api/moderation/questions/similar/batch/`
+        — the §K1 review aid for a WHOLE queue page in one request, replacing
+        the per-card fan-out that detonated #14c (50 concurrent /similar
+        calls, each re-scanning the corpus).
+
+        Body: {"ids": [int, ...]} — 1 to SIMILAR_BATCH_MAX ids, else 400.
+        Response: {"<id>": [match, ...]} where each match row is EXACTLY the
+        single endpoint's shape (shared _match_row; parity is tested). Like
+        the single endpoint it works for ANY status and for soft-deleted
+        rows (the flagged tab scores approved questions; a mid-review
+        deletion must not 404 the whole page). Ids that don't exist at all
+        are simply OMITTED from the response — the queue only sends ids it
+        just listed, and a row vanishing in a race shouldn't fail the other
+        24. Keeping GET …/<id>/similar/ costs nothing and spares any other
+        caller; new list-scale consumers must use THIS endpoint (C20)."""
+        ids = request.data.get("ids")
+        if not isinstance(ids, list) or not ids:
+            return Response(
+                {"ids": ["Send a non-empty list of question ids."]}, status=status.HTTP_400_BAD_REQUEST
+            )
+        if len(ids) > SIMILAR_BATCH_MAX:
+            return Response(
+                {"ids": [f"At most {SIMILAR_BATCH_MAX} ids per batch — page or chunk the request."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            wanted = [int(i) for i in ids]
+        except (TypeError, ValueError):
+            return Response({"ids": ["Ids must be integers."]}, status=status.HTTP_400_BAD_REQUEST)
+        targets = Question.objects.filter(pk__in=wanted).prefetch_related("categories")
+        matches = similar_questions_batch(targets)
+        return Response({str(pk): rows for pk, rows in matches.items()})
 
     @action(detail=True, methods=["post"], url_path="delete")
     def soft_delete(self, request, pk=None):

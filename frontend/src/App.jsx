@@ -25,14 +25,17 @@ function Landing() {
   // §G2 (Handoff #12): a light category teaser — same public endpoint as
   // /categories, sliced client-side. Fetch failure/empty just hides the
   // strip (the landing's existing structure stays).
+  // §F (Handoff #15): ONE page, sliced to 4 — this used to allPages the
+  // whole corpus (40+ requests at 2,000 categories) for a four-card strip
+  // on the LANDING page (C21).
   const [teaser, setTeaser] = useState([]);
   const navigate = useNavigate();
   const valid = /^[A-Z0-9]{6}$/.test(code);
   useEffect(() => {
     let alive = true;
     api
-      .publicCategories()
-      .then((cats) => alive && setTeaser(cats.slice(0, 4)))
+      .publicCategoriesPage({})
+      .then((d) => alive && setTeaser(d.results.slice(0, 4)))
       .catch(() => {});
     return () => {
       alive = false;
