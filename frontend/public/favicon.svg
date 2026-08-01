@@ -1,5 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <!-- §J1 (Handoff #12): a chalk "D" on the chalkboard green (#232b26). -->
-  <rect width="64" height="64" rx="12" fill="#232b26"/>
-  <text x="32" y="47" text-anchor="middle" font-family="'Bebas Neue', 'Arial Narrow', sans-serif" font-size="44" fill="#f4f1e6" letter-spacing="1">D</text>
+  <!-- §J1 (Handoff #12), restyled #14: the Night Market mark — lowercase
+       serif "d" in the theme demo's mark style, dark ink on neon mint. -->
+  <rect width="64" height="64" rx="16" fill="#4de2b1"/>
+  <text x="32" y="47" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-weight="900" font-size="46" fill="#071b15">d</text>
 </svg>

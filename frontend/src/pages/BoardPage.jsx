@@ -231,7 +231,7 @@ export default function BoardPage() {
               size={172}
               marginSize={2}
               bgColor="#ffffff"
-              fgColor="#1e2621"
+              fgColor="#0d1622"
             />
             <span className="tv__qrhint">scan to grab a buzzer</span>
           </div>
