@@ -22,8 +22,27 @@ import { useDebounced } from "../lib/hooks";
  *
  * Props: auth; value: Map(id → {id, name}); onChange(nextMap);
  * legend: fieldset label; hint: optional muted suffix.
+ *
+ * §F (Handoff #16), for the lobby column swap — both optional, defaults
+ * preserve every existing call site byte-for-byte:
+ * - single: picking a row REPLACES the selection (a Map of ≤1); the inputs
+ *   stay checkboxes so tapping the checked row still deselects (a checked
+ *   radio fires no change event — the deselect would silently die).
+ * - disabledIds (+ disabledNote): ids rendered unpickable with a muted
+ *   note instead of HIDDEN — a host searching for "Movies" should see WHY
+ *   it isn't offered ("on this board"), not an inexplicable hole. Cosmetic
+ *   as ever: the server 409s a duplicate pick regardless (rule 4).
  */
-export default function CategoryPicker({ auth, value, onChange, legend, hint }) {
+export default function CategoryPicker({
+  auth,
+  value,
+  onChange,
+  legend,
+  hint,
+  single = false,
+  disabledIds,
+  disabledNote,
+}) {
   const [search, setSearch] = useState("");
   const debounced = useDebounced(search);
   const [params, setParams] = useState({ search: "", page: 1 }); // atomic: search change resets page
@@ -59,6 +78,11 @@ export default function CategoryPicker({ auth, value, onChange, legend, hint }) 
   }, [auth.token, params]);
 
   const toggle = (cat) => {
+    if (single) {
+      // Replace-not-accumulate: the swap picker holds at most one choice.
+      onChange(value.has(cat.id) ? new Map() : new Map([[cat.id, { id: cat.id, name: cat.name }]]));
+      return;
+    }
     const next = new Map(value);
     if (next.has(cat.id)) next.delete(cat.id);
     else next.set(cat.id, { id: cat.id, name: cat.name });
@@ -93,11 +117,13 @@ export default function CategoryPicker({ auth, value, onChange, legend, hint }) 
       <div className="catpick__list">
         {rows?.map((c) => {
           const on = value.has(c.id);
+          const off = !on && !!disabledIds?.has(c.id);
           return (
-            <label key={c.id} className={`catpick__item ${on ? "catpick__item--on" : ""}`}>
-              <input type="checkbox" checked={on} onChange={() => toggle(c)} />
+            <label key={c.id} className={`catpick__item ${on ? "catpick__item--on" : ""} ${off ? "catpick__item--off" : ""}`}>
+              <input type="checkbox" checked={on} disabled={off} onChange={() => toggle(c)} />
               {c.name}
               {c.owner === null ? " (official)" : ""}
+              {off && disabledNote ? <span className="catpick__offnote"> · {disabledNote}</span> : null}
             </label>
           );
         })}

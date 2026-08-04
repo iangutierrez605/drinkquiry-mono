@@ -7,6 +7,10 @@ import CreatePage from "./pages/CreatePage";
 import BoardPage from "./pages/BoardPage";
 import BuzzerPage from "./pages/BuzzerPage";
 import ModeratePage from "./pages/ModeratePage";
+import ManageUsersPage from "./pages/ManageUsersPage";
+import ManageLibraryPage from "./pages/ManageLibraryPage";
+import ManageThemesPage from "./pages/ManageThemesPage";
+import HowToPlayPage from "./pages/HowToPlayPage";
 import ProfilePage from "./pages/ProfilePage";
 import TournamentsPage from "./pages/TournamentsPage";
 import TournamentDetailPage from "./pages/TournamentDetailPage";
@@ -205,7 +209,18 @@ export default function App() {
           <Route path="/reset-password" element={<ResetPasswordPage />} />
           <Route path="/host" element={<HostPage />} />
           <Route path="/create" element={<CreatePage />} />
+          {/* §F3 (Handoff #16): the six-tab moderate page split into four
+              single-purpose destinations — the review queues keep /moderate;
+              users/library/themes get their own /manage/* routes. Each page
+              re-checks staff itself (components/StaffGate), so a non-staff
+              deep link never renders admin UI; the endpoints stay
+              IsAdminUser regardless (rule 4). */}
           <Route path="/moderate" element={<ModeratePage />} />
+          <Route path="/manage/users" element={<ManageUsersPage />} />
+          <Route path="/manage/library" element={<ManageLibraryPage />} />
+          <Route path="/manage/themes" element={<ManageThemesPage />} />
+          {/* §F4 (Handoff #16): public ways-to-play explainer. */}
+          <Route path="/how-to-play" element={<HowToPlayPage />} />
           <Route path="/profile" element={<ProfilePage />} />
           {/* §I (Handoff #13): tournaments — inside ChromeLayout (SiteNav),
               auth-funneled by the pages themselves like /host. */}

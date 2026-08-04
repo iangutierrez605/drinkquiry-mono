@@ -69,6 +69,40 @@ def _preference_ordered(qs, host):
     )
 
 
+def _cell_value(mode: str, row: int) -> int:
+    """Row → value scaling, the ONE place it lives (Handoff #16 §F): drinks
+    count 1..n down the column, points 100..n*100. create_game and the
+    column swap both call this so a swapped column can never scale
+    differently from a created one."""
+    return (row + 1) if mode == GameMode.DRINKS else (row + 1) * 100
+
+
+def _draw_for_category(*, category, host, questions_per_category: int, exclude_ids):
+    """The ONE per-column draw body (Handoff #16 §F: factored out of
+    create_game so the column swap can't drift from creation behavior).
+
+    §J2: difficulty is the primary key; within a difficulty the host's
+    unused questions come first, then least-used, then random — over a 3x
+    fetch window, with a stable easiest→hardest re-sort so value scales
+    with row. `exclude_ids` is the never-twice-on-one-board set (§F3).
+
+    Returns (chosen, pool_size): `chosen` is the ordered pick, or None when
+    the post-exclusion pool can't fill the column (`pool_size` then feeds
+    the caller's shortage message — create_game's format, shared)."""
+    qs = list(
+        _preference_ordered(usable_questions(category, host), host)
+        .exclude(id__in=exclude_ids)  # §F3: never twice on one board
+        .order_by("difficulty", "host_uses", "global_uses", "?")[: questions_per_category * 3]
+    )
+    if len(qs) < questions_per_category:
+        return None, len(qs)
+    # Sort chosen subset easiest->hardest so value scales with row.
+    # Python's sort is stable, so the §J2 preference order within each
+    # difficulty survives the re-sort.
+    chosen = sorted(qs, key=lambda q: q.difficulty)[:questions_per_category]
+    return chosen, len(qs)
+
+
 @transaction.atomic
 def create_game(
     *,
@@ -144,23 +178,19 @@ def create_game(
     used_question_ids: set[int] = set()
     for category_id in category_ids:
         category = by_id[category_id]
-        # §J2: difficulty stays the primary key (same difficulty-slot behavior
-        # as before), and WITHIN a difficulty the host's unused questions come
-        # first, then least-used, then random. The 3x fetch window and the
-        # stable easiest->hardest sort below are unchanged, so the shortage
-        # contract and row/value placement behave exactly as they did.
-        qs = list(
-            _preference_ordered(usable_questions(category, host), host)
-            .exclude(id__in=used_question_ids)  # §F3: never twice on one board
-            .order_by("difficulty", "host_uses", "global_uses", "?")[: questions_per_category * 3]
+        # §J2 preference + 3x window + stable easiest->hardest re-sort all
+        # live in _draw_for_category now (§F #16: shared with the column
+        # swap so the two can't drift). The shortage contract and row/value
+        # placement behave exactly as they did.
+        chosen, pool_size = _draw_for_category(
+            category=category,
+            host=host,
+            questions_per_category=questions_per_category,
+            exclude_ids=used_question_ids,
         )
-        if len(qs) < questions_per_category:
-            shortages[category.name] = len(qs)
+        if chosen is None:
+            shortages[category.name] = pool_size
         else:
-            # Sort chosen subset easiest->hardest so value scales with row.
-            # Python's sort is stable, so the §J2 preference order within each
-            # difficulty survives the re-sort.
-            chosen = sorted(qs, key=lambda q: q.difficulty)[:questions_per_category]
             picked[category.id] = chosen
             used_question_ids.update(q.id for q in chosen)
     if shortages:
@@ -186,8 +216,9 @@ def create_game(
     for position, category_id in enumerate(category_ids):
         column = BoardColumn.objects.create(game=game, category=ordered[category_id], position=position)
         for row, question in enumerate(picked[category_id]):
-            value = (row + 1) if mode == GameMode.DRINKS else (row + 1) * 100
-            BoardCell.objects.create(game=game, column=column, question=question, row=row, value=value)
+            BoardCell.objects.create(
+                game=game, column=column, question=question, row=row, value=_cell_value(mode, row)
+            )
     return game
 
 
@@ -218,6 +249,73 @@ def replace_cell_question(*, code: str, cell_id, host) -> BoardCell:
     cell.question = candidate
     cell.save(update_fields=["question"])
     return cell
+
+
+@transaction.atomic
+def replace_column_category(*, code: str, column_id, new_category_id, host) -> BoardColumn:
+    """§F (Handoff #16): lobby-only swap of ONE column's category — the
+    board-edit precedent (replace_cell_question, directly above) extended to
+    a whole column. Draws `questions_per_category` fresh questions from the
+    incoming category via the SAME body creation uses (_draw_for_category:
+    §J2 preference, 3x window, easiest→hardest), tears the old cells down
+    and rebuilds with the same row/value scaling (_cell_value).
+
+    LOBBY-ONLY, deliberately (the v1 line cell-replace already drew): a
+    played column carries answered cells, buzz history and awarded scores —
+    swapping it mid-game is a correctness swamp, punted (§M; the safe
+    mid-game scope would be "all cells still HIDDEN", a separate piece).
+
+    The never-twice-on-one-board exclusion is judged against the POST-SWAP
+    board: everything on the board EXCEPT this column's own cells (they're
+    torn down in this same transaction, so their questions return to the
+    pool). Deliberately NOT the literal whole-board set — with categories
+    M2M, a question shared by the outgoing and incoming categories is a
+    legitimate pick for the rebuilt column, and excluding it would
+    manufacture spurious shortages for zero invariant gain (pinned by
+    test_swap_may_reuse_a_question_shared_with_the_outgoing_column).
+
+    Raises ActionError with messages the view maps to structured 409s; host
+    auth is the VIEW's job (this runs under Knox, not a participant token).
+    """
+    game = Game.objects.select_for_update().get(code=code)
+    if game.status != GameStatus.LOBBY:
+        raise ActionError("The game has started — categories can only be swapped in the lobby.")
+    column = game.columns.filter(pk=column_id).first()
+    if column is None:
+        raise ActionError("No such column in this game.")
+    # §F5 house rule: a soft-deleted category is invisible to board edits,
+    # exactly as it is to create_game ("Unknown category ids").
+    new_category = Category.objects.filter(pk=new_category_id, deleted_at__isnull=True).first()
+    if new_category is None:
+        raise ActionError("Unknown category.")
+    # unique(game, category) would reject the duplicate anyway — check first
+    # for the friendly message. The column's OWN category counts too: a
+    # same-category "swap" is just this 409, not a hidden full-redraw verb.
+    if game.columns.filter(category=new_category).exists():
+        raise ActionError("That category is already on the board.")
+    keep_ids = set(game.cells.exclude(column=column).values_list("question_id", flat=True))
+    chosen, pool_size = _draw_for_category(
+        category=new_category,
+        host=host,
+        questions_per_category=game.questions_per_category,
+        exclude_ids=keep_ids,
+    )
+    if chosen is None:
+        # create_game's shortage message format, shared on purpose.
+        raise ActionError(
+            f"'{new_category.name}' only has {pool_size} usable question(s); "
+            f"{game.questions_per_category} required."
+        )
+    # Cells CASCADE off the column, but the column survives — delete
+    # explicitly. (Questions are PROTECT'd; only cells die here.)
+    column.cells.all().delete()
+    column.category = new_category
+    column.save(update_fields=["category"])
+    for row, question in enumerate(chosen):
+        BoardCell.objects.create(
+            game=game, column=column, question=question, row=row, value=_cell_value(game.mode, row)
+        )
+    return column
 
 
 # --- Live mutations (Handoff #6 §F/§G, extended by Handoff #8 §F/§G) --------

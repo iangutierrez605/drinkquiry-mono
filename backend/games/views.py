@@ -12,7 +12,9 @@ from rest_framework.views import APIView
 from .models import Game, GameStatus, Participant, ParticipantRole, Tournament
 from .serializers import (
     BoardDetailCellSerializer,
+    BoardDetailColumnSerializer,
     BoardDetailSerializer,
+    ColumnCategoryReplaceSerializer,
     CreateGameSerializer,
     GameHistorySerializer,
     GameReportSerializer,
@@ -23,7 +25,14 @@ from .serializers import (
     TournamentDetailSerializer,
     TournamentSerializer,
 )
-from .services import ActionError, StructuredActionError, advance_round, create_game, replace_cell_question
+from .services import (
+    ActionError,
+    StructuredActionError,
+    advance_round,
+    create_game,
+    replace_cell_question,
+    replace_column_category,
+)
 
 # §I (Handoff #13): the pinned tournament_finished payload — the SAME exact
 # shape from both places it can fire (attach at game creation, advance).
@@ -288,6 +297,38 @@ class CellReplaceView(APIView):
         except ActionError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
         return Response(BoardDetailCellSerializer(cell).data)
+
+
+class ColumnCategoryReplaceView(APIView):
+    """POST /api/games/<code>/columns/<column_id>/replace/ {category_id} —
+    lobby-only swap of one column's CATEGORY (Handoff #16 §F): tear the
+    column's cells down and rebuild them from the incoming category via the
+    same draw + value scaling creation uses. Host-only over Knox; the
+    service's lobby/duplicate/deleted/shortage rejections map to structured
+    409s (the cell-replace pattern, directly above). Returns the updated
+    column in the board-detail shape so the lobby preview patches ONE
+    column in place. The body is category-ID based on purpose — board
+    building and board edits both stay theme-unaware (§G #10).
+    """
+
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def post(self, request, code, column_id):
+        game = get_object_or_404(Game, code=code.upper())
+        if game.host_id != request.user.id:
+            return Response({"detail": "Only this game's host can swap categories."}, status=status.HTTP_403_FORBIDDEN)
+        serializer = ColumnCategoryReplaceSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            column = replace_column_category(
+                code=game.code,
+                column_id=column_id,
+                new_category_id=serializer.validated_data["category_id"],
+                host=request.user,
+            )
+        except ActionError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        return Response(BoardDetailColumnSerializer(column).data)
 
 
 class GameHistoryView(generics.ListAPIView):

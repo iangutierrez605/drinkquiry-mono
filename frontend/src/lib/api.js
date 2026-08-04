@@ -346,6 +346,17 @@ export const api = {
   gameBoard: (token, code) => request(`/api/games/${code.toUpperCase()}/board/`, { authToken: token }),
   replaceCell: (token, code, cellId) =>
     request(`/api/games/${code.toUpperCase()}/cells/${cellId}/replace/`, { method: "POST", authToken: token }),
+  // §F (Handoff #16): lobby-only whole-COLUMN category swap. Body is a bare
+  // integer category id (theme-unaware like creation, §G #10); the response
+  // is ONE column in the board-detail shape, patched in place by the lobby
+  // preview. 409s: game started / category already on the board / deleted /
+  // too thin (creation's shortage message).
+  replaceColumnCategory: (token, code, columnId, categoryId) =>
+    request(`/api/games/${code.toUpperCase()}/columns/${columnId}/replace/`, {
+      method: "POST",
+      authToken: token,
+      body: { category_id: categoryId },
+    }),
   joinGame: (code, name, participantToken) =>
     request(`/api/games/${code.toUpperCase()}/join/`, {
       method: "POST",

@@ -916,6 +916,193 @@ class BoardDetailAndReplaceTests(GameTestBase):
 
 
 # ---------------------------------------------------------------------------
+# Handoff #16 §F — lobby-only whole-column category swap
+# ---------------------------------------------------------------------------
+class ColumnCategorySwapTests(GameTestBase):
+    """POST /api/games/<code>/columns/<column_id>/replace/ {category_id} —
+    the cell-replace contract (lobby-only 409, host-only 403, ActionError →
+    structured 409) extended to a whole column, plus the swap-specific
+    rules: no duplicate category on the board, deleted categories are
+    invisible, creation's shortage message format, dupe-free rebuild with
+    creation's value scaling, and the post-swap exclusion semantics."""
+
+    def setUp(self):
+        # A 2-column board (3 rows) so cross-column exclusions are real.
+        self.cat_a = seed_category("Alpha", n_questions=3)
+        self.cat_b = seed_category("Bravo", n_questions=3)
+        self.game = create_game(
+            host=self.host, mode="drinks", category_ids=[self.cat_a.id, self.cat_b.id], questions_per_category=3
+        )
+        self.column_b = self.game.columns.get(category=self.cat_b)
+
+    def swap(self, column_id, category_id, code=None):
+        return self.client.post(
+            f"/api/games/{code or self.game.code}/columns/{column_id}/replace/",
+            {"category_id": category_id},
+            format="json",
+        )
+
+    def board_question_ids(self):
+        return list(self.game.cells.values_list("question_id", flat=True))
+
+    def test_swap_rebuilds_the_column_from_the_new_category(self):
+        fresh = seed_category("Charlie", n_questions=4)
+        before_other = set(
+            self.game.cells.filter(column__category=self.cat_a).values_list("question_id", flat=True)
+        )
+        self.as_host()
+        res = self.swap(self.column_b.id, fresh.id)
+        self.assertEqual(res.status_code, 200, res.data)
+        body = res.json()
+        # Board-detail column shape, patchable in place: same column id/
+        # position, new category, full cells with questions AND answers.
+        self.assertEqual(body["id"], self.column_b.id)
+        self.assertEqual(body["position"], self.column_b.position)
+        self.assertEqual(body["category_id"], fresh.id)
+        self.assertEqual(body["category_name"], "Charlie")
+        self.assertEqual(len(body["cells"]), 3)
+        for cell in body["cells"]:
+            self.assertTrue(cell["question_text"])
+            self.assertIn("SECRET-Charlie-", cell["answer"])
+        self.column_b.refresh_from_db()
+        self.assertEqual(self.column_b.category_id, fresh.id)
+        # Every rebuilt cell draws from Charlie; the Alpha column is untouched.
+        new_ids = set(
+            self.game.cells.filter(column=self.column_b).values_list("question_id", flat=True)
+        )
+        charlie_ids = set(fresh.questions.values_list("id", flat=True))
+        self.assertTrue(new_ids <= charlie_ids)
+        after_other = set(
+            self.game.cells.filter(column__category=self.cat_a).values_list("question_id", flat=True)
+        )
+        self.assertEqual(before_other, after_other)
+        # Dupe-free board, full size.
+        ids = self.board_question_ids()
+        self.assertEqual(len(ids), 6)
+        self.assertEqual(len(set(ids)), 6)
+
+    def test_swap_scales_values_by_row_like_creation(self):
+        # Drinks mode: 1..n down the column (creation's _cell_value).
+        fresh = seed_category("Delta", n_questions=3)
+        self.as_host()
+        self.assertEqual(self.swap(self.column_b.id, fresh.id).status_code, 200)
+        rows = list(
+            self.game.cells.filter(column=self.column_b).order_by("row").values_list("row", "value")
+        )
+        self.assertEqual(rows, [(0, 1), (1, 2), (2, 3)])
+        # And easiest→hardest down the column, exactly like creation.
+        difficulties = [
+            c.question.difficulty
+            for c in self.game.cells.filter(column=self.column_b).order_by("row").select_related("question")
+        ]
+        self.assertEqual(difficulties, sorted(difficulties))
+
+    def test_swap_excludes_questions_kept_by_other_columns(self):
+        # A question shared with the SURVIVING column must not be drawn twice:
+        # give Charlie 3 own questions + 1 that also lives in Alpha (already
+        # on the board). A 3-row rebuild must dodge the shared one.
+        fresh = seed_category("Charlie", n_questions=3)
+        shared = self.game.cells.filter(column__category=self.cat_a).first().question
+        shared.categories.add(fresh)
+        self.as_host()
+        res = self.swap(self.column_b.id, fresh.id)
+        self.assertEqual(res.status_code, 200, res.data)
+        ids = self.board_question_ids()
+        self.assertEqual(len(ids), 6)
+        self.assertEqual(len(set(ids)), 6, "a question landed on the board twice")
+
+    def test_swap_may_reuse_a_question_shared_with_the_outgoing_column(self):
+        # The exclusion set is the POST-SWAP board: a question shared by the
+        # OUTGOING category and the incoming one is a legitimate pick — the
+        # old copy dies in the same transaction. Charlie has exactly 3
+        # usable questions and one of them currently sits in the Bravo
+        # column being replaced; the literal whole-board exclusion would
+        # 409 a perfectly fillable swap.
+        fresh = seed_category("Charlie", n_questions=2)
+        shared = self.game.cells.filter(column=self.column_b).first().question
+        shared.categories.add(fresh)
+        self.as_host()
+        res = self.swap(self.column_b.id, fresh.id)
+        self.assertEqual(res.status_code, 200, res.data)
+        ids = self.board_question_ids()
+        self.assertEqual(len(ids), 6)
+        self.assertEqual(len(set(ids)), 6)
+        self.assertIn(
+            shared.id,
+            self.game.cells.filter(column=self.column_b).values_list("question_id", flat=True),
+        )
+
+    def test_swap_to_category_already_on_the_board_409(self):
+        self.as_host()
+        before = self.board_question_ids()
+        res = self.swap(self.column_b.id, self.cat_a.id)
+        self.assertEqual(res.status_code, 409)
+        self.assertIn("already on the board", res.json()["detail"])
+        # The column's OWN category counts as "already on the board" too.
+        self.assertEqual(self.swap(self.column_b.id, self.cat_b.id).status_code, 409)
+        self.assertEqual(self.board_question_ids(), before)  # board unchanged
+
+    def test_swap_to_deleted_category_409(self):
+        gone = seed_category("Gone", n_questions=3)
+        gone.deleted_at = timezone.now()
+        gone.save(update_fields=["deleted_at"])
+        self.as_host()
+        res = self.swap(self.column_b.id, gone.id)
+        self.assertEqual(res.status_code, 409)
+        self.assertIn("Unknown category", res.json()["detail"])
+
+    def test_swap_to_thin_category_409_with_creations_message_format(self):
+        thin = seed_category("Thin", n_questions=1)  # needs 3
+        self.as_host()
+        before = self.board_question_ids()
+        res = self.swap(self.column_b.id, thin.id)
+        self.assertEqual(res.status_code, 409)
+        self.assertEqual(
+            res.json()["detail"], "'Thin' only has 1 usable question(s); 3 required."
+        )
+        self.assertEqual(self.board_question_ids(), before)  # nothing half-torn
+
+    def test_swap_409_after_start(self):
+        fresh = seed_category("Late", n_questions=3)
+        Game.objects.filter(pk=self.game.pk).update(status=GameStatus.ACTIVE)
+        self.as_host()
+        before = self.board_question_ids()
+        res = self.swap(self.column_b.id, fresh.id)
+        self.assertEqual(res.status_code, 409)
+        self.assertIn("started", res.json()["detail"])
+        self.assertEqual(self.board_question_ids(), before)
+
+    def test_swap_unknown_column_409(self):
+        fresh = seed_category("Echo", n_questions=3)
+        self.as_host()
+        res = self.swap(999999, fresh.id)
+        self.assertEqual(res.status_code, 409)
+        self.assertIn("No such column", res.json()["detail"])
+
+    def test_swap_is_host_private(self):
+        fresh = seed_category("Foxtrot", n_questions=3)
+        self.as_rival()
+        res = self.swap(self.column_b.id, fresh.id)
+        self.assertEqual(res.status_code, 403)
+        self.assertNotIn("SECRET-", json.dumps(res.json()))
+        self.client.force_authenticate(None)
+        self.assertEqual(self.swap(self.column_b.id, fresh.id).status_code, 401)
+
+    def test_swap_body_validation_400(self):
+        self.as_host()
+        for bad in ({}, {"category_id": "nope"}, {"category_id": 0}):
+            res = self.client.post(
+                f"/api/games/{self.game.code}/columns/{self.column_b.id}/replace/", bad, format="json"
+            )
+            self.assertEqual(res.status_code, 400, bad)
+
+    def test_swap_unknown_code_404(self):
+        fresh = seed_category("Golf", n_questions=3)
+        self.as_host()
+        self.assertEqual(self.swap(self.column_b.id, fresh.id, code="ZZZZ99").status_code, 404)
+
+
+# ---------------------------------------------------------------------------
 # Handoff #10 §F3 — multi-category boards: no duplicates, honest shortages
 # ---------------------------------------------------------------------------
 

@@ -15,6 +15,7 @@ import {
 import { useGameSocket } from "../lib/useGameSocket";
 import { ensureAudio, playBuzz } from "../lib/sounds";
 import AuthScreen from "../components/AuthScreen";
+import CategoryPicker from "../components/CategoryPicker";
 import {
   BoardGrid,
   BuzzList,
@@ -1016,12 +1017,25 @@ export function FlagButton({ token, questionId, onToast, small = true }) {
  * redraws the one cell server-side (same category, closest difficulty,
  * prefer-unused, excluding what's already on the board) and is refused with
  * a 409 once the game has started.
+ *
+ * §F (Handoff #16): each column header also grows a "swap category"
+ * affordance — the shared CategoryPicker in single-select mode, categories
+ * already on the board offered-but-disabled ("on this board"), and an
+ * explicit confirm so a stray tap can't torch a column. The server rebuilds
+ * the whole column (same draw + value scaling as creation) and returns it
+ * in the board-detail shape; we patch that ONE column in place, with the
+ * same stale-guard style the rest of the preview uses (busy flags gate the
+ * buttons; responses land into setBoard functionally). Lobby-only like the
+ * cell replace — the button is cosmetic, the endpoint is the gate (rule 4).
  */
 function LobbyPreview({ auth, code, onToast }) {
   const [board, setBoard] = useState(null);
   const [error, setError] = useState(null);
   const [openCols, setOpenCols] = useState({}); // column id -> bool
   const [busyCell, setBusyCell] = useState(null);
+  const [swapCol, setSwapCol] = useState(null); // column id with the picker open
+  const [swapPick, setSwapPick] = useState(() => new Map()); // CategoryPicker value (≤1 entry)
+  const [swapBusy, setSwapBusy] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -1052,28 +1066,106 @@ function LobbyPreview({ auth, code, onToast }) {
     }
   };
 
+  const openSwap = (columnId) => {
+    // One picker at a time; reopening always starts with a clean pick.
+    setSwapPick(new Map());
+    setSwapCol((cur) => (cur === columnId ? null : columnId));
+  };
+
+  const swapCategory = async (columnId) => {
+    const picked = [...swapPick.values()][0];
+    if (!picked) return;
+    setSwapBusy(true);
+    try {
+      const updated = await api.replaceColumnCategory(auth.token, code, columnId, picked.id);
+      // Patch the ONE returned column in place — new category, fresh cells.
+      setBoard((b) => ({
+        ...b,
+        columns: b.columns.map((col) => (col.id === updated.id ? updated : col)),
+      }));
+      setSwapCol(null);
+      setSwapPick(new Map());
+      setOpenCols((o) => ({ ...o, [columnId]: true })); // show the fresh draw
+      onToast?.(`Column swapped to ${picked.name}.`);
+    } catch (err) {
+      // 409: started / already on the board / deleted / too thin — the
+      // server's message says which; the board state is untouched.
+      onToast?.(errorText(err));
+    } finally {
+      setSwapBusy(false);
+    }
+  };
+
   if (error) return <section className="panel"><p className="footnote">Couldn't load the board preview: {error}</p></section>;
   if (!board) return <section className="panel"><p className="footnote">Loading your board…</p></section>;
+
+  // §F: categories already on the board are offered-but-disabled in the
+  // picker (cosmetic — the endpoint 409s duplicates regardless).
+  const onBoardIds = new Set(board.columns.map((col) => col.category_id));
 
   return (
     <section className="panel preview">
       <h2 className="h2">Your board — peek &amp; swap before you start</h2>
       <p className="footnote">
         Only you can see this. Don't like a question? Replace redraws that slot from the same
-        category (favoring ones you haven't played before). Locked once the game starts.
+        category (favoring ones you haven't played before). Want a different category entirely?
+        Swap the whole column. Locked once the game starts.
       </p>
       {board.columns.map((col) => {
         const open = !!openCols[col.id];
+        const swapping = swapCol === col.id;
         return (
           <div key={col.id} className="preview__col">
-            <button
-              type="button"
-              className={`previewcat ${open ? "previewcat--on" : ""}`}
-              onClick={() => setOpenCols((o) => ({ ...o, [col.id]: !open }))}
-            >
-              <span>{col.category_name}</span>
-              <span className="previewcat__chev">{open ? "▾" : "▸"}</span>
-            </button>
+            <div className="preview__colhead">
+              <button
+                type="button"
+                className={`previewcat ${open ? "previewcat--on" : ""}`}
+                onClick={() => setOpenCols((o) => ({ ...o, [col.id]: !open }))}
+              >
+                <span>{col.category_name}</span>
+                <span className="previewcat__chev">{open ? "▾" : "▸"}</span>
+              </button>
+              <button
+                type="button"
+                className={`btn btn--ghost btn--sm previewswap__toggle ${swapping ? "previewswap__toggle--on" : ""}`}
+                title={`Swap ${col.category_name} for a different category`}
+                onClick={() => openSwap(col.id)}
+              >
+                {swapping ? "✕ keep it" : "⇄ category"}
+              </button>
+            </div>
+            {swapping && (
+              <div className="previewswap">
+                <CategoryPicker
+                  auth={auth}
+                  value={swapPick}
+                  onChange={setSwapPick}
+                  single
+                  disabledIds={onBoardIds}
+                  disabledNote="on this board"
+                  legend={`Swap “${col.category_name}” for…`}
+                  hint="the whole column redraws from the new category"
+                />
+                <div className="previewswap__actions">
+                  <button
+                    type="button"
+                    className="btn btn--primary btn--sm"
+                    disabled={swapBusy || swapPick.size === 0}
+                    onClick={() => swapCategory(col.id)}
+                  >
+                    {swapBusy ? "Swapping…" : "Swap column"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn--ghost btn--sm"
+                    disabled={swapBusy}
+                    onClick={() => openSwap(col.id)}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
             {open && (
               <ul className="preview__list">
                 {col.cells.map((cell) => (

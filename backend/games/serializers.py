@@ -417,12 +417,24 @@ class BoardDetailCellSerializer(serializers.ModelSerializer):
 
 
 class BoardDetailColumnSerializer(serializers.ModelSerializer):
+    # §F (Handoff #16): category_id joins the host-private board detail so
+    # the lobby preview can seed the swap picker's "already on the board"
+    # exclusions. Additive; this shape is host-only (never a snapshot).
+    category_id = serializers.IntegerField(read_only=True)
     category_name = serializers.CharField(source="category.name", read_only=True)
     cells = BoardDetailCellSerializer(many=True, read_only=True)
 
     class Meta:
         model = BoardColumn
-        fields = ("id", "position", "category_name", "cells")
+        fields = ("id", "position", "category_id", "category_name", "cells")
+
+
+class ColumnCategoryReplaceSerializer(serializers.Serializer):
+    """§F (Handoff #16): the column-swap body — one category id. Deliberately
+    id-based and theme-unaware, like game creation (§G #10 stands for board
+    edits too)."""
+
+    category_id = serializers.IntegerField(min_value=1)
 
 
 class BoardDetailSerializer(serializers.ModelSerializer):
