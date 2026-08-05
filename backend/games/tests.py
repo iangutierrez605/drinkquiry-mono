@@ -1781,8 +1781,26 @@ class TournamentAttachTests(TournamentTestBase):
             res.json()["game"]["tournament"],
             # location "" falls back server-side (→ brand_name → display
             # name) — the full chain is pinned in SnapshotTournamentTests.
-            {"name": "Attach Cup", "location": "Host", "round_number": 1},
+            # §F4b (#17): the block gained `id` (additive amendment — the
+            # console's back-to-bracket link needs it).
+            {"id": self.t.pk, "name": "Attach Cup", "location": "Host", "round_number": 1},
         )
+
+    def test_created_game_appears_in_detail(self):
+        # §F4a (#17): the loop's server truth — the game the create call
+        # just made is ALREADY in the bracket payload the frontend reloads
+        # into. (The redirect itself is frontend-only; this pins what it
+        # relies on: no eventual-consistency window, correct round, lobby
+        # status, null standings.)
+        res = self.api_create_game(tournament=self.t.pk, round_number=1)
+        self.assertEqual(res.status_code, 201, res.data)
+        code = res.json()["game"]["code"]
+        detail = self.client.get(f"/api/tournaments/{self.t.pk}/").json()
+        by_code = {g["code"]: g for g in detail["games"]}
+        self.assertIn(code, by_code)
+        self.assertEqual(by_code[code]["round_number"], 1)
+        self.assertEqual(by_code[code]["status"], "lobby")
+        self.assertIsNone(by_code[code]["standings"])
 
     def test_someone_elses_tournament_404_no_leak(self):
         other = self.make_tournament(owner=self.rival, name="Rival Cup")
@@ -2026,9 +2044,10 @@ class SnapshotTournamentTests(TournamentTestBase):
         t = self.make_tournament(name="Snap Cup", location="Ian's Bar Venue")
         game = self.attached_game(t, round_number=2)
         snap = self.client.get(f"/api/games/{game.code}/").json()
+        # §F4b (#17): `id` joined the pinned block (additive amendment).
         self.assertEqual(
             snap["tournament"],
-            {"name": "Snap Cup", "location": "Ian's Bar Venue", "round_number": 2},
+            {"id": t.pk, "name": "Snap Cup", "location": "Ian's Bar Venue", "round_number": 2},
         )
 
     def test_location_falls_back_to_brand_then_display_name(self):
@@ -2054,3 +2073,20 @@ class SnapshotTournamentTests(TournamentTestBase):
         res = self.client.post(f"/api/games/{game.code}/join/", {"name": "Team A"}, format="json")
         self.assertEqual(res.status_code, 201)
         self.assertEqual(res.json()["game"]["tournament"]["name"], "Join Cup")
+        # §F4b (#17): the id rides the player-facing surface too — pinned
+        # where it's born; its inertness is the test below.
+        self.assertEqual(res.json()["game"]["tournament"]["id"], t.pk)
+
+    def test_snapshot_tournament_id_is_inert_without_owner_token(self):
+        # §F4b (#17): the safety claim behind shipping the id to player
+        # surfaces, pinned — the id is meaningless without the OWNER's Knox
+        # token. Anonymous → 401; a different signed-in host → the same 404
+        # a nonexistent id gets (no existence leak).
+        t = self.make_tournament(name="Inert Cup")
+        game = self.attached_game(t)
+        snap_id = self.client.get(f"/api/games/{game.code}/").json()["tournament"]["id"]
+        self.assertEqual(snap_id, t.pk)
+        self.client.force_authenticate(user=None)
+        self.assertEqual(self.client.get(f"/api/tournaments/{snap_id}/").status_code, 401)
+        self.as_rival()
+        self.assertEqual(self.client.get(f"/api/tournaments/{snap_id}/").status_code, 404)

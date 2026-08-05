@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { api, errorText, quotaError } from "../lib/api";
 import { displayUrl } from "../lib/displayUrl";
 import { useDebounced } from "../lib/hooks";
@@ -73,14 +73,31 @@ export default function HostPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const tournamentCreate = searchParams.has("tournament");
   const clearParams = () => setSearchParams({}, { replace: true });
+  const navigate = useNavigate();
 
   if (!auth) return <AuthScreen onAuthed={setAuth} />;
   if (!active || tournamentCreate)
     return (
       <CreateScreen
         auth={auth}
-        onCreated={(code, token, participantId) => {
+        onCreated={(code, token, participantId, tournamentId) => {
+          // The seat is ALWAYS saved — the create response already issued
+          // it, and the bracket's "Host console" resumes from it.
           saveSeat(code, { token, participantId, role: "host" });
+          if (tournamentId) {
+            // §F4a (Handoff #17): a tournament create returns you to the
+            // BRACKET, not this game's console — the page reloads on mount
+            // and the fresh card appears "in the lobby" with its Host
+            // console button. This closes the owner's "never shows
+            // anything" loop: the populated bracket is what you see after
+            // every create. NOT saveHostGame/setActive: the console is one
+            // resumeHostGame away, and a plain game the host had active
+            // stays their active game. clearParams first so back-button
+            // lands on a clean /host, not a re-armed ?tournament= create.
+            clearParams();
+            navigate(`/tournaments/${tournamentId}`);
+            return;
+          }
           saveHostGame(code);
           clearParams();
           setActive({ code, token });
@@ -257,6 +274,22 @@ function CreateScreen({ auth, onCreated, onResumed }) {
     setPicked(new Map(picks.map((c) => [c.id, capture(c)])));
   };
 
+  // §F2 (Handoff #17): "Use every question" — a host who wrote exactly 8
+  // questions shouldn't have to count them and drag a slider. The button
+  // sets the stepper to the SMALLEST picked category's usable count,
+  // clamped to the server's 1–10 (rule 1: the serializer's validator and
+  // the shortage 409 stay the real gates if counts move between page-load
+  // and create). Counts come from the picked Map's captured
+  // usable_question_count (§F6 #15 pinning), so this follows searches,
+  // themes and pages for free. The `short` flags and auto-suggest filter
+  // already key off perCategory — they follow the new value untouched.
+  const pickedMinUsable =
+    picked.size > 0 ? Math.min(...[...picked.values()].map((c) => c.usable_question_count ?? 0)) : null;
+  const useEveryQuestion = () => {
+    if (pickedMinUsable == null) return;
+    setPerCategory(Math.min(10, Math.max(1, pickedMinUsable)));
+  };
+
   // Filtering is a VIEW, not a reset: switching themes never touches the
   // picked Map — categories chosen under another filter stay chosen (and
   // render in the pinned row even when the current view hides them).
@@ -284,7 +317,10 @@ function CreateScreen({ auth, onCreated, onResumed }) {
       });
       const code = res.game.code;
       const hostParticipant = res.game.participants.find((p) => p.role === "host");
-      onCreated(code, res.participant_token, hostParticipant?.id);
+      // §F4a: the 4th argument tells the wrapper this create carried a
+      // tournament attach — the wrapper owns the where-to-go decision
+      // (console vs bracket); this screen stays dumb about navigation.
+      onCreated(code, res.participant_token, hostParticipant?.id, tournamentId);
     } catch (err) {
       const q = quotaError(err);
       setError(
@@ -386,7 +422,26 @@ function CreateScreen({ auth, onCreated, onResumed }) {
             onChange={(e) => setPerCategory(Number(e.target.value))}
           />
           <span className="stepper__value">{perCategory}</span>
+          <button
+            type="button"
+            className="btn btn--ghost btn--sm stepper__all"
+            disabled={pickedMinUsable == null}
+            title={
+              pickedMinUsable == null
+                ? "Pick your categories first — this matches the smallest one"
+                : "Set the board to the smallest picked category's question count"
+            }
+            onClick={useEveryQuestion}
+          >
+            Use every question
+          </button>
         </div>
+        {pickedMinUsable != null && (
+          <p className="footnote">
+            Smallest picked category has {pickedMinUsable} usable question{pickedMinUsable === 1 ? "" : "s"}.
+            {pickedMinUsable > 10 && " Boards cap at 10 — the TV board gets cramped past that."}
+          </p>
+        )}
       </section>
 
       {/* §H (#13): the buzz sound is now a HOST choice — one sound for the
@@ -670,6 +725,26 @@ function HostGame({ code, token, auth, onLeave }) {
 
   return (
     <div className="page page--wide">
+      {/* §F4b (Handoff #17): the console finally knows its tournament — the
+          other half of closing the loop (§F4a returns you to the bracket
+          after create; this gets you back from a resumed console). The
+          snapshot's tournament block gained `id` for exactly this link
+          (pinned-shape amendment, additive — see games/serializers.py).
+          The id guard is deploy-order insurance (C9): a WS snapshot from a
+          not-yet-restarted backend renders the line, just link-less. */}
+      {game.tournament && (
+        <div className="tourneyline">
+          🏆 <strong>{game.tournament.name}</strong> — Round {game.tournament.round_number}
+          {game.tournament.id != null && (
+            <>
+              {" · "}
+              <Link className="tourneyline__link" to={`/tournaments/${game.tournament.id}`}>
+                back to the bracket
+              </Link>
+            </>
+          )}
+        </div>
+      )}
       <header className="pagehead">
         {/* §F: wordmark lives in the SiteNav now; this bar keeps the
             game-specific chrome (code, connection, board link, finish). */}

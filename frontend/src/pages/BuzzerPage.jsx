@@ -298,7 +298,11 @@ function BuzzerLive({ code, seat, onBadSeat }) {
               : `You gave ${self.drinks_given} 🍺 and took ${self.drinks_taken} 🍻`}
           </p>
         )}
-        <p className="footnote buzzover__foot">Thanks for playing — hand the phone back. 🍻</p>
+        {/* §F3 (Handoff #17): "hand the phone back" assumed a handed-out
+            device; the model is one phone per team, everyone holding their
+            own. The element stays (an abrupt standings-then-nothing ending
+            reads broken) — only the words changed. Taste call, flagged. */}
+        <p className="footnote buzzover__foot">Thanks for playing! 🍻</p>
         <Toast message={lastError} onDone={clearError} />
       </div>
     );

@@ -1390,3 +1390,35 @@ code { font-family: var(--font-mono); color: var(--accent); font-size: 0.9em; }
 .howplay__cta { margin-top: auto; padding-top: 6px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .howplay__foot { margin-top: 22px; }
 .howplay__browse { color: var(--accent); }
+
+/* ---------- Handoff #17 ---------- */
+
+/* §F2: the "Use every question" button rides the stepper row; the range
+   input already flexes, so the button just needs to hold its width. */
+.stepper__all { flex-shrink: 0; white-space: nowrap; }
+
+/* §F4b: the console's tournament line — slim context bar above the
+   pagehead, quiet until you need the way back. */
+.tourneyline {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  color: var(--dim); font-size: 14px;
+  border: 1px solid var(--line); border-radius: 10px;
+  background: var(--ink-3); padding: 8px 12px; margin-bottom: 10px;
+}
+.tourneyline strong { color: var(--paper); }
+.tourneyline__link { color: var(--accent); font-weight: 600; }
+
+/* §F6: the legal pages — plain reading surfaces (rule 7's deliberate
+   exception), readable measure, panels as section cards. */
+.legalpage { max-width: 760px; }
+.legalpage__section { margin-bottom: 12px; }
+.legalpage__section p { margin: 0; line-height: 1.6; color: var(--paper); }
+.legalpage__section .h2 { margin-bottom: 8px; }
+.legalpage a { color: var(--accent); }
+
+/* §F6: landing footer legal links + the register consent footnote. */
+.landingfoot__legal { color: var(--dim); font-size: 12px; }
+.landingfoot__legal a { color: var(--dim); text-decoration: underline; }
+.landingfoot__legal a:hover { color: var(--paper); }
+.authform__consent { margin: 0; }
+.authform__consent a { color: var(--accent); }

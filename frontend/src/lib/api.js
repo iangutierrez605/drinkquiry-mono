@@ -323,11 +323,26 @@ export const api = {
   // ---- Games ----
   // §H (#13): buzz_sound (1–4) is the host's per-game sound choice; the
   // server defaults to 1 when omitted, so older callers keep working.
-  createGame: (token, { mode, categories, questions_per_category, buzz_sound }) =>
+  // §F4 ROOT CAUSE (#17): this destructure is a WHITELIST — it rebuilt the
+  // body from four named fields and silently dropped `tournament` +
+  // `round_number`, which the create screen had been dutifully sending
+  // since #13. Result: the 🏆 banner showed, the server 201'd a PLAIN
+  // game, and no bracket ever populated — the owner's original bug, and
+  // invisible to every automated check because the suite and the smoke
+  // exercise the API with their own (correct) bodies. The pairing spread
+  // mirrors the call site and the server's both-or-neither rule. If you
+  // add a create field, add it HERE too — this seam has no test harness.
+  createGame: (token, { mode, categories, questions_per_category, buzz_sound, tournament, round_number }) =>
     request("/api/games/", {
       method: "POST",
       authToken: token,
-      body: { mode, categories, questions_per_category, ...(buzz_sound ? { buzz_sound } : {}) },
+      body: {
+        mode,
+        categories,
+        questions_per_category,
+        ...(buzz_sound ? { buzz_sound } : {}),
+        ...(tournament ? { tournament, round_number } : {}),
+      },
     }),
   gameSnapshot: (code) => request(`/api/games/${code.toUpperCase()}/`),
   // Host-private answer for the open cell (Handoff #6 §F1). Knox-authed and

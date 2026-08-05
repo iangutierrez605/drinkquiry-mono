@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { api, errorText, SUPPORT_EMAIL } from "../lib/api";
 import { displayUrl } from "../lib/displayUrl";
 import { saveAuth } from "../lib/storage";
@@ -222,6 +223,17 @@ export default function AuthScreen({ onAuthed }) {
           <div ref={turnstileRef} className="turnstile-slot" />
         )}
         {error && <p className="formerror">{error}</p>}
+        {mode === "register" && (
+          /* §F6 (Handoff #17): the consent footnote. AuthScreen renders on
+             /login and inline on /host, /profile and the tournament pages —
+             all under ChromeLayout — so router Links are safe everywhere it
+             mounts. The pages open in this tab; nothing typed is lost on
+             the way back (browser back restores the form). */
+          <p className="footnote authform__consent">
+            By creating an account you agree to the <Link to="/terms">Terms</Link> and{" "}
+            <Link to="/privacy">Privacy Policy</Link>.
+          </p>
+        )}
         <button className="btn btn--primary" disabled={busy}>
           {busy ? "…" : mode === "login" ? "Log in" : "Create account & log in"}
         </button>

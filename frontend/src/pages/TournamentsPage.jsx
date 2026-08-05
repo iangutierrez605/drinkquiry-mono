@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, errorText, quotaError } from "../lib/api";
+import { api, errorText, quotaError, SUPPORT_EMAIL } from "../lib/api";
 import { loadAuth, onAuthChange } from "../lib/storage";
 import AuthScreen from "../components/AuthScreen";
 
@@ -99,9 +99,19 @@ function TournamentsBody({ auth }) {
         <section className="panel panel--center upsell">
           <span className="upsell__emoji">🏆</span>
           <h2 className="h2">Tournaments are a creator feature</h2>
+          {/* §F5 (Handoff #17): launch copy — the old "Coming soon. For
+              now, an admin can enable creator access" was demo-speak.
+              There is NO billing (Manage Users IS the payment override),
+              so the honest shape is invite/contact. WORDING + the contact
+              route are DRAFTS pending the owner's approval (flagged in
+              CHANGES); the route rides the product's one existing contact
+              channel, support@ — a one-line swap either way. */}
           <p className="footnote">
-            Coming soon. For now, an admin can enable creator access on your account — everything else about
-            hosting single games works without it.
+            Creator accounts are set up by us while billing is in the works —{" "}
+            <a className="supportlink" href={`mailto:${SUPPORT_EMAIL}`}>
+              get in touch
+            </a>{" "}
+            and we'll switch you on. Hosting single games needs no plan at all.
           </p>
           <Link className="btn btn--ghost" to="/host">
             Back to hosting

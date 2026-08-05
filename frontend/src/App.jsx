@@ -15,6 +15,8 @@ import ProfilePage from "./pages/ProfilePage";
 import TournamentsPage from "./pages/TournamentsPage";
 import TournamentDetailPage from "./pages/TournamentDetailPage";
 import ResetPasswordPage from "./pages/ResetPasswordPage";
+import TermsPage from "./pages/TermsPage";
+import PrivacyPage from "./pages/PrivacyPage";
 import AuthScreen from "./components/AuthScreen";
 import SiteNav from "./components/SiteNav";
 import AgeGate from "./components/AgeGate";
@@ -49,7 +51,7 @@ function Landing() {
     <div className="landingpage">
       <section className="landinghero">
         <div className="wordmark wordmark--hero">DRINKQUIRY</div>
-        <p className="tagline">The most edudcational pre-game</p>
+        <p className="tagline">The most educational pre-game</p>
         <form
           className="panel landing"
           onSubmit={(e) => {
@@ -129,6 +131,12 @@ function Landing() {
         {/* §F3: the footer's Host/Make questions/Profile links moved to the
             SiteNav above — keeping both would be the same list twice. */}
         <span className="landingfoot__note">Please drink responsibly — it's a quiz, not a contest. 🍻</span>
+        {/* §F6 (Handoff #17): the legal links live here (and on the
+            register form) — the sitefoot stays support-only for now, a
+            one-liner later if wanted. */}
+        <span className="landingfoot__legal">
+          <Link to="/terms">Terms</Link> · <Link to="/privacy">Privacy</Link>
+        </span>
       </footer>
     </div>
   );
@@ -137,12 +145,24 @@ function Landing() {
 /**
  * §F3 (Handoff #9): /login — the SiteNav's auth corner lands here. Renders
  * the shared AuthScreen; after auth, honor ?next= (e.g. a deep link that
- * bounced someone here), else the classic destination: /host.
+ * bounced someone here, or the SiteNav preserving your place — §F1 #17).
+ *
+ * §F1 (Handoff #17): the fallback destination is /profile now, not /host —
+ * identity, plan meters, resumable games and history already live there,
+ * so it's the zero-new-surface "home" (a dedicated dashboard stays a
+ * one-line retarget later). Register lands the same place: AuthScreen
+ * calls this same onAuthed for both modes, and a fresh account seeing its
+ * own meters + "make your first category" energy is the right first view.
+ *
+ * Open-redirect hygiene: only ?next= values that are a single-slash local
+ * path are honored — "//evil.example", "/\evil" and anything carrying a
+ * scheme fall back to /profile. Cheap insurance on a public login URL.
  */
 function LoginPage() {
   const navigate = useNavigate();
-  const next = new URLSearchParams(useLocation().search).get("next");
-  return <AuthScreen onAuthed={() => navigate(next || "/host")} />;
+  const rawNext = new URLSearchParams(useLocation().search).get("next");
+  const next = rawNext && /^\/(?![/\\])/.test(rawNext) ? rawNext : null;
+  return <AuthScreen onAuthed={() => navigate(next || "/profile")} />;
 }
 
 /**
@@ -221,6 +241,11 @@ export default function App() {
           <Route path="/manage/themes" element={<ManageThemesPage />} />
           {/* §F4 (Handoff #16): public ways-to-play explainer. */}
           <Route path="/how-to-play" element={<HowToPlayPage />} />
+          {/* §F6 (Handoff #17): the launch-essential legal pages — public,
+              static, PLACEHOLDER copy pending counsel (flagged in both
+              files and in CHANGES). */}
+          <Route path="/terms" element={<TermsPage />} />
+          <Route path="/privacy" element={<PrivacyPage />} />
           <Route path="/profile" element={<ProfilePage />} />
           {/* §I (Handoff #13): tournaments — inside ChromeLayout (SiteNav),
               auth-funneled by the pages themselves like /host. */}

@@ -550,9 +550,9 @@ def tournament_story(knox, fknox):
     assert r.status_code == 201, r.text
     d = r.json()
     tcode, ttok = d["game"]["code"], d["participant_token"]
-    assert d["game"]["tournament"] == {"name": tname, "location": "Ian's Bar Venue",
+    assert d["game"]["tournament"] == {"id": tid, "name": tname, "location": "Ian's Bar Venue",
                                        "round_number": 1}, d["game"]["tournament"]
-    ok(f"round-1 game {tcode} attached; snapshot tournament block exact {{name, location, round_number}} (§I3)")
+    ok(f"round-1 game {tcode} attached; snapshot tournament block exact {{id, name, location, round_number}} (§I3, amended §F4b #17)")
 
     # One team, so advancement has someone to advance.
     r = requests.post(f"{BASE}/api/games/{tcode}/join/", json={"name": "Cup Team"})

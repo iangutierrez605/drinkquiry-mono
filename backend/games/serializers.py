@@ -213,7 +213,16 @@ class GameStateSerializer(serializers.ModelSerializer):
             return None
         host = game.host  # select_related on every snapshot caller already
         location = t.location or host.brand_name or host.display_name or None
-        return {"name": t.name, "location": location, "round_number": game.round_number}
+        # §F4b (Handoff #17): pinned-shape AMENDMENT, additive — the block
+        # gains `id` so the host console can link back to its bracket
+        # (/tournaments/<id>). Safe on player surfaces: the id is inert
+        # without the owner's Knox token (the detail endpoint is
+        # owner-scoped 404 — pinned in SnapshotTournamentTests), and rule 5
+        # (no question content on tournament surfaces) is untouched. Every
+        # exact-dict assertion moved in this same session: games/tests.py
+        # (TournamentAttachTests + SnapshotTournamentTests) and
+        # backend_smoke_test.py's tournament story.
+        return {"id": t.id, "name": t.name, "location": location, "round_number": game.round_number}
 
     def get_cells_remaining(self, game):
         # Counted from the SAME prefetched columns/cells `columns` serializes

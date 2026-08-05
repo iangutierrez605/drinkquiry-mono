@@ -36,6 +36,14 @@ export default function HowToPlayPage() {
           <p className="footnote">
             Great for trivia nights that keep a crowd coming back week after week.
           </p>
+          {/* §F5 (Handoff #17): one discoverability sentence, matching the
+              /tournaments upsell copy (both change together if the owner
+              rewrites it). Deliberately NO lock icon on the nav — the page
+              explains itself, and free hosts should still window-shop. */}
+          <p className="footnote">
+            Tournaments are a creator feature — creator accounts are set up by us while billing is in the
+            works. Hosting single games needs no plan at all.
+          </p>
           <div className="howplay__cta">
             <Link className="btn btn--gold" to="/tournaments">
               Set up a tournament

@@ -163,6 +163,13 @@ function TournamentDetailBody({ auth }) {
         <section className="panel panel--center">
           <h2 className="h2">No games yet</h2>
           <p className="footnote">Start round 1 — each game is an ordinary game with its own code and board.</p>
+          {/* §F4c (Handoff #17): the one honest sentence that kills the
+              unattached-by-accident mystery. The plain create screen stays
+              nag-free on purpose — this is the page that cares. */}
+          <p className="footnote">
+            Games join this tournament only when you create them from these buttons — a game made from the
+            plain Host screen stays a plain game.
+          </p>
           <Link className="btn btn--gold" to={`/host?tournament=${t.id}&round=1`}>
             New game in round 1
           </Link>

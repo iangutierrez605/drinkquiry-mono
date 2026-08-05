@@ -33,6 +33,15 @@ export default function SiteNav() {
   const [auth, setAuth] = useState(loadAuth());
   const [isStaff, setIsStaff] = useState(auth ? staffCache.get(auth.token) === true : false);
   const navigate = useNavigate();
+  // §F1 (Handoff #17): the Log in button carries the user's place, so a
+  // browser on /categories comes BACK to /categories after auth (LoginPage
+  // honors ?next=, guarded there against off-site values). On /login and
+  // /reset-password there's no place worth preserving — plain /login. The
+  // two chrome-less game surfaces have no nav, so a next=/board/... can't
+  // occur by construction.
+  const { pathname, search } = useLocation();
+  const onAuthRoute = pathname === "/login" || pathname === "/reset-password";
+  const loginTo = onAuthRoute ? "/login" : `/login?next=${encodeURIComponent(pathname + search)}`;
 
   useEffect(() => onAuthChange(() => setAuth(loadAuth())), []);
 
@@ -101,7 +110,7 @@ export default function SiteNav() {
         {auth ? (
           <UserMenu auth={auth} isStaff={isStaff} onLogout={logout} />
         ) : (
-          <Link className="btn btn--ghost btn--sm" to="/login">
+          <Link className="btn btn--ghost btn--sm" to={loginTo}>
             Log in
           </Link>
         )}
