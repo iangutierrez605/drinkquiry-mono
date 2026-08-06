@@ -212,6 +212,33 @@ export const api = {
       : request(`/api/questions/${id}/`, { method: "PATCH", authToken: token, body: changes }),
   deleteQuestion: (token, id) =>
     request(`/api/questions/${id}/`, { method: "DELETE", authToken: token }),
+  // §F6 (#18): the venue shelf — archive frees an ACTIVE slot (the row
+  // stays listed with a chip), unarchive is the quota choke point (403
+  // quota_active_questions at 100).
+  archiveQuestion: (token, id) =>
+    request(`/api/questions/${id}/archive/`, { method: "POST", authToken: token }),
+  unarchiveQuestion: (token, id) =>
+    request(`/api/questions/${id}/unarchive/`, { method: "POST", authToken: token }),
+
+  // ---- Billing (Handoff #18 §F2/§F3) ----
+  // Public display catalog: bare array of {key, name, price, interval,
+  // blurb, coming_soon} — display strings only, never Stripe price ids.
+  billingProducts: () => request("/api/billing/products/"),
+  // The account's billing truth; ?session= adds the success page's polling
+  // block ({product_key, status, paid}) for the caller's OWN session only.
+  billingStatus: (token, sessionId) =>
+    request(`/api/billing/status/${qs({ session: sessionId })}`, { authToken: token }),
+  // Server-side price resolution: the browser sends a product KEY, gets a
+  // Stripe-hosted URL back. `entitlement` only for reactivation keys.
+  checkout: (token, product, entitlement) =>
+    request("/api/billing/checkout/", {
+      method: "POST",
+      authToken: token,
+      body: { product, ...(entitlement ? { entitlement } : {}) },
+    }),
+  // Stripe's customer portal (manage card / invoices / cancel) → {url}.
+  billingPortal: (token) =>
+    request("/api/billing/portal/", { method: "POST", authToken: token }),
 
   // ---- Bulk question upload (CSV; Handoff #4 §G) ----
   // formData: file (required), dry_run, skip_duplicates, official (staff only).
@@ -332,7 +359,10 @@ export const api = {
   // exercise the API with their own (correct) bodies. The pairing spread
   // mirrors the call site and the server's both-or-neither rule. If you
   // add a create field, add it HERE too — this seam has no test harness.
-  createGame: (token, { mode, categories, questions_per_category, buzz_sound, tournament, round_number }) =>
+  // §F5 (#18): hand_picked = {categoryId: [orderedQuestionIds]} — the
+  // paid picker's payload. BOTH ends wired (destructure + body), per the
+  // #17 lesson above.
+  createGame: (token, { mode, categories, questions_per_category, buzz_sound, tournament, round_number, hand_picked }) =>
     request("/api/games/", {
       method: "POST",
       authToken: token,
@@ -342,6 +372,7 @@ export const api = {
         questions_per_category,
         ...(buzz_sound ? { buzz_sound } : {}),
         ...(tournament ? { tournament, round_number } : {}),
+        ...(hand_picked && Object.keys(hand_picked).length ? { hand_picked } : {}),
       },
     }),
   gameSnapshot: (code) => request(`/api/games/${code.toUpperCase()}/`),

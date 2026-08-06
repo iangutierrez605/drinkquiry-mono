@@ -179,6 +179,14 @@ function CreateScreen({ auth, onCreated, onResumed }) {
   // drives the moderation link. Server enforces both either way.
   const [profile, setProfile] = useState(null);
   const gamesUsage = profile?.usage?.games_this_month ?? null;
+  // §F5 (#18): hand-picked columns — Map(categoryId → ordered question
+  // objects). Cosmetic availability: manual paid plan OR any ACTIVE
+  // entitlement (the server's hand_pick_locked 403 is the real gate).
+  const [handPicks, setHandPicks] = useState(new Map());
+  const canHandPick =
+    !!profile &&
+    (profile.plan !== "free" ||
+      (profile.usage?.entitlements || []).some((e) => e.is_active));
 
   useEffect(() => {
     api
@@ -305,6 +313,24 @@ function CreateScreen({ auth, onCreated, onResumed }) {
   const create = async () => {
     setBusy(true);
     setError(null);
+    // §F5 (#18): assemble hand-picked columns — only categories still on
+    // the board with EXACTLY perCategory picks ride along; a partial
+    // selection blocks with a plain hint instead of silently auto-filling
+    // (the host clearly started choosing — don't guess the rest).
+    const handPicked = {};
+    const partials = [];
+    for (const [cid, arr] of handPicks) {
+      if (!picked.has(cid) || arr.length === 0) continue;
+      if (arr.length === perCategory) handPicked[cid] = arr.map((q) => q.id);
+      else partials.push(picked.get(cid)?.name || cid);
+    }
+    if (partials.length) {
+      setBusy(false);
+      setError(
+        `Finish (or clear) your question picks for ${partials.join(", ")} — exactly ${perCategory} each, or leave the whole column to the auto-draw.`,
+      );
+      return;
+    }
     try {
       const res = await api.createGame(auth.token, {
         mode,
@@ -314,6 +340,8 @@ function CreateScreen({ auth, onCreated, onResumed }) {
         // §I4: attach when arriving from a tournament (both or neither —
         // the server enforces the pairing and re-checks ownership).
         ...(tournamentId ? { tournament: tournamentId, round_number: roundNumber } : {}),
+        // §F5 (#18): the seam's fifth passenger — see api.js's warning.
+        ...(Object.keys(handPicked).length ? { hand_picked: handPicked } : {}),
       });
       const code = res.game.code;
       const hostParticipant = res.game.participants.find((p) => p.role === "host");
@@ -634,6 +662,36 @@ function CreateScreen({ auth, onCreated, onResumed }) {
 
       {error && <p className="formerror formerror--block">{error}</p>}
 
+      {/* §F5 (#18): the paid "choose your questions" panel — one expander
+          per picked category; untouched columns keep the automatic draw. */}
+      {canHandPick && picked.size > 0 && (
+        <section className="panel handpick">
+          <h2 className="h2">Choose your questions <span className="badge">optional</span></h2>
+          <p className="footnote">
+            Pick exactly {perCategory} per category, in the order you want them on
+            the board — your first pick is the top ({mode === "drinks" ? "1-drink" : "100-point"}) row.
+            Skip a category and we'll draw it for you like always.
+          </p>
+          {[...picked.values()].map((cat) => (
+            <HandPickPanel
+              key={cat.id}
+              token={auth.token}
+              category={cat}
+              perCategory={perCategory}
+              picks={handPicks.get(cat.id) || []}
+              onChange={(next) =>
+                setHandPicks((prev) => {
+                  const copy = new Map(prev);
+                  if (next.length === 0) copy.delete(cat.id);
+                  else copy.set(cat.id, next);
+                  return copy;
+                })
+              }
+            />
+          ))}
+        </section>
+      )}
+
       {gamesUsage?.limit != null && (
         <p className="footnote">
           {Math.max(0, gamesUsage.limit - gamesUsage.used)} of {gamesUsage.limit} games left on your plan this month.
@@ -648,6 +706,153 @@ function CreateScreen({ auth, onCreated, onResumed }) {
 }
 
 /* ---------------- Live host panel ---------------- */
+
+/* ---------------- §F5 (Handoff #18): hand-pick panel ---------------- */
+
+/**
+ * One picked category's question chooser. Collapsed by default ("Auto
+ * draw"); expanding loads the caller-visible questions of THIS category,
+ * one server page at a time with a debounced search (the category grid's
+ * exact fetch pattern, seq guard included). Tapping a row appends it to the
+ * ordered picks (chips above, tap ✕ to remove); the server re-validates
+ * everything at create (§F5's board-shaped 400 lists offenders).
+ */
+function HandPickPanel({ token, category, perCategory, picks, onChange }) {
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const debounced = useDebounced(search);
+  const [params, setParams] = useState({ search: "", page: 1 });
+  const [rows, setRows] = useState(null);
+  const [count, setCount] = useState(0);
+  const [hasNext, setHasNext] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [fetchError, setFetchError] = useState(null);
+  const seq = useRef(0);
+
+  useEffect(() => {
+    setParams((p) => (p.search === debounced ? p : { search: debounced, page: 1 }));
+  }, [debounced]);
+
+  useEffect(() => {
+    if (!open) return;
+    const mySeq = ++seq.current;
+    setLoading(true);
+    api
+      .questionsPage(token, { category: category.id, search: params.search, page: params.page })
+      .then((d) => {
+        if (seq.current !== mySeq) return;
+        setRows((prev) => (params.page === 1 ? d.results : [...(prev ?? []), ...d.results]));
+        setCount(d.count);
+        setHasNext(!!d.next);
+        setLoading(false);
+        setFetchError(null);
+      })
+      .catch((err) => {
+        if (seq.current !== mySeq) return;
+        setLoading(false);
+        setFetchError(errorText(err));
+      });
+  }, [token, category.id, params, open]);
+
+  const pickedIds = new Set(picks.map((q) => q.id));
+  const full = picks.length >= perCategory;
+
+  return (
+    <div className="handpick__cat">
+      <div className="handpick__head">
+        <strong>{category.name}</strong>
+        <span className="footnote">
+          {picks.length === 0
+            ? "Auto draw"
+            : `${picks.length} / ${perCategory} chosen${picks.length === perCategory ? " ✓" : ""}`}
+        </span>
+        <button type="button" className="btn btn--ghost btn--sm" onClick={() => setOpen((o) => !o)}>
+          {open ? "Done" : picks.length ? "Edit picks" : "Choose questions"}
+        </button>
+        {picks.length > 0 && (
+          <button type="button" className="btn btn--ghost btn--sm" onClick={() => onChange([])}>
+            Clear
+          </button>
+        )}
+      </div>
+      {picks.length > 0 && (
+        <ol className="handpick__picks">
+          {picks.map((q, i) => (
+            <li key={q.id}>
+              <button
+                type="button"
+                className="pinnedchip"
+                title="Tap to remove"
+                onClick={() => onChange(picks.filter((p) => p.id !== q.id))}
+              >
+                {i + 1}. {q.question_text.length > 60 ? `${q.question_text.slice(0, 60)}…` : q.question_text} ✕
+              </button>
+            </li>
+          ))}
+        </ol>
+      )}
+      {open && (
+        <div className="handpick__browser">
+          <input
+            className="input"
+            placeholder={`Search ${category.name}…`}
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            aria-label={`Search questions in ${category.name}`}
+          />
+          {fetchError && <p className="formerror">{fetchError}</p>}
+          {rows == null && !fetchError && <p className="footnote">Loading questions…</p>}
+          <ul className="handpick__rows">
+            {rows?.map((q) => {
+              const taken = pickedIds.has(q.id);
+              const blocked = q.is_archived || taken || (full && !taken);
+              return (
+                <li key={q.id}>
+                  <button
+                    type="button"
+                    className={`handpick__row ${taken ? "handpick__row--taken" : ""}`}
+                    disabled={blocked}
+                    title={
+                      q.is_archived
+                        ? "Archived questions can't go on new boards"
+                        : taken
+                          ? "Already picked"
+                          : full
+                            ? `You've picked ${perCategory} — remove one first`
+                            : "Add to this column"
+                    }
+                    onClick={() => onChange([...picks, q])}
+                  >
+                    <span>{q.question_text}</span>
+                    <span className="footnote">
+                      {"★".repeat(q.difficulty)}{q.is_archived ? " · archived" : ""}
+                    </span>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+          {rows != null && (
+            <div className="loadmore">
+              <span className="listmeta">Showing {rows.length} of {count}</span>
+              {hasNext && (
+                <button
+                  type="button"
+                  className="btn btn--ghost btn--sm"
+                  disabled={loading}
+                  onClick={() => setParams((p) => ({ ...p, page: p.page + 1 }))}
+                >
+                  {loading ? "Loading…" : "Load more"}
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 
 function HostGame({ code, token, auth, onLeave }) {
   const { game, connected, authFailed, lastError, revealedAnswer, clearError, send } = useGameSocket(code, token);

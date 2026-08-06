@@ -21,3 +21,10 @@ django-anymail>=13
 # because we now import it FIRST-PARTY; depending on a transitive dep by
 # accident is how builds break later (§D).
 requests>=2.31
+# Handoff #18 §F2: the ONE approved new backend dep this session — Stripe
+# Checkout billing. Pinned exact: billing/services.py reads billing-period
+# fields from their pinned-version locations (SubscriptionItem, not
+# Subscription — see billing/catalog.configure_stripe's version note); a
+# blind major bump can silently move them. api_version is pinned in code to
+# 2026-07-29.dahlia; bump both together.
+stripe==15.4.0

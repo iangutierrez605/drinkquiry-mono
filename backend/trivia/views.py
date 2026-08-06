@@ -2,13 +2,23 @@ from django.db import IntegrityError, transaction
 from django.db.models import Count, Q
 from rest_framework import generics, permissions, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 
 from accounts.quotas import (
     batch_quota_denial,
+    batch_question_creation_denial,
     batch_storage_quota_denial,
+    question_creation_denial,
+    question_unarchive_denial,
     quota_denial,
     storage_quota_denial,
+)
+from billing.access import (
+    PACK_INACTIVE,
+    pack_category_denial,
+    pack_question_denial,
+    pack_storage_denial,
 )
 
 from .bulk_upload import create_new_categories, create_rows, parse_bulk_upload
@@ -68,7 +78,12 @@ class PublicCategoryListView(generics.ListAPIView):
     authentication_classes = ()  # anonymous surface: a stale Knox header must never 401 it
 
     def get_queryset(self):
-        browsable_question = Q(questions__deleted_at__isnull=True) & (
+        # §F2 (#18): archived questions (the venue shelf) leave the public
+        # count too — question_count is a usability promise, and archived
+        # rows aren't drawable. The pinned-count semantics tests extend.
+        browsable_question = Q(
+            questions__deleted_at__isnull=True, questions__is_archived=False
+        ) & (
             Q(questions__owner__isnull=True)
             | Q(
                 questions__visibility=Visibility.PUBLIC,
@@ -90,6 +105,35 @@ class CategoryViewSet(viewsets.ModelViewSet):
     permission_classes = (IsCreator, IsOwnerOrReadOnlyPublic)
 
     def create(self, request, *args, **kwargs):
+        # §F4 (#18): optional pack binding — `entitlement: <id>` in the
+        # body creates an ADDITIONAL bound category for that pack (the
+        # starter one comes from the webhook). Server-side truth: must be
+        # the caller's, a bound-content kind, ACTIVE, and under the pack's
+        # small category cap. Bound categories skip the account quotas
+        # (their pack owns them); photo bytes draw on pack storage.
+        ent_id = request.data.get("entitlement")
+        if ent_id not in (None, ""):
+            from billing.models import BOUND_KINDS, Entitlement
+
+            entitlement = (
+                Entitlement.objects.filter(pk=ent_id, user=request.user, kind__in=BOUND_KINDS)
+                .select_related("source_subscription")
+                .first()
+            )
+            if entitlement is None:
+                return Response(
+                    {"entitlement": ["No such pack."]}, status=status.HTTP_400_BAD_REQUEST
+                )
+            if not entitlement.is_active:
+                return Response(dict(PACK_INACTIVE), status=status.HTTP_403_FORBIDDEN)
+            if denial := pack_category_denial(entitlement):
+                return Response(denial, status=status.HTTP_403_FORBIDDEN)
+            if denial := pack_storage_denial(entitlement, _incoming_file_bytes(request)):
+                return Response(denial, status=status.HTTP_403_FORBIDDEN)
+            serializer = self.get_serializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            serializer.save(entitlement=entitlement)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
         # Quota gate before validation/uploads. Free plans have a limit of 0,
         # so this is also what blocks non-creators (structured 403, D2).
         if denial := quota_denial(request.user, "categories"):
@@ -99,12 +143,38 @@ class CategoryViewSet(viewsets.ModelViewSet):
             return Response(denial, status=status.HTTP_403_FORBIDDEN)
         return super().create(request, *args, **kwargs)
 
+    def _pack_gate(self, instance, user=None):
+        """§F4: writes on a BOUND category require its pack ACTIVE. For an
+        UNBOUND one, a lapsed-buyer caller re-denies here (see the question
+        twin)."""
+        if instance.entitlement_id is None:
+            from billing.access import can_paid_write
+
+            if user is not None and not can_paid_write(user):
+                raise PermissionDenied
+            return None
+        if instance.entitlement.is_active:
+            return None
+        return dict(PACK_INACTIVE)
+
     def update(self, request, *args, **kwargs):
+        instance = self.get_object()
+        if denial := self._pack_gate(instance, request.user):
+            return Response(denial, status=status.HTTP_403_FORBIDDEN)
         # §F3 on PATCH-with-file too. Conservative: the replaced file's old
         # bytes still count until the row saves — never under-enforces.
-        if denial := storage_quota_denial(request.user, _incoming_file_bytes(request)):
+        # Bound categories draw on their pack's storage instead (#18).
+        if instance.entitlement_id is not None:
+            if denial := pack_storage_denial(instance.entitlement, _incoming_file_bytes(request)):
+                return Response(denial, status=status.HTTP_403_FORBIDDEN)
+        elif denial := storage_quota_denial(request.user, _incoming_file_bytes(request)):
             return Response(denial, status=status.HTTP_403_FORBIDDEN)
         return super().update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        if denial := self._pack_gate(self.get_object(), request.user):
+            return Response(denial, status=status.HTTP_403_FORBIDDEN)
+        return super().destroy(request, *args, **kwargs)
 
     def perform_destroy(self, instance):
         """§F5 (Handoff #10): category delete is a SOFT delete — set
@@ -193,18 +263,136 @@ class QuestionViewSet(viewsets.ModelViewSet):
         )
 
     def create(self, request, *args, **kwargs):
-        if denial := quota_denial(request.user, "questions"):
+        # §F4 (#18): scope decides the lane. Bound target (any pack
+        # category) → the PACK's budget/storage/activity govern and the
+        # account quotas stand down; unbound → the account's two-lane check
+        # (plain plan/overrides ∪ the venue 100-ACTIVE gate). The serializer
+        # re-validates the scope shape; this pre-read only picks the lane —
+        # a mixed-scope body falls through to its 400 there.
+        bound = self._bound_entitlement_from_request(request)
+        if bound is not None:
+            entitlement, denial = bound
+            if denial is not None:
+                return Response(denial, status=status.HTTP_403_FORBIDDEN)
+            if denial := pack_question_denial(entitlement):
+                return Response(denial, status=status.HTTP_403_FORBIDDEN)
+            if denial := pack_storage_denial(entitlement, _incoming_file_bytes(request)):
+                return Response(denial, status=status.HTTP_403_FORBIDDEN)
+            return super().create(request, *args, **kwargs)
+        if denial := question_creation_denial(request.user):
             return Response(denial, status=status.HTTP_403_FORBIDDEN)
         # §F3: storage quota on incoming media, through the shared helper.
         if denial := storage_quota_denial(request.user, _incoming_file_bytes(request)):
             return Response(denial, status=status.HTTP_403_FORBIDDEN)
         return super().create(request, *args, **kwargs)
 
+    def _bound_entitlement_from_request(self, request):
+        """Resolve the create body's target pack, if any.
+
+        Returns None (unbound / unresolvable — the serializer will speak),
+        or (entitlement, denial) where denial is the PACK_INACTIVE payload
+        when the pack lapsed (403), else None."""
+        # Form-encoded bodies (multipart uploads) carry repeated `categories`
+        # keys — QueryDict.get would return only the LAST one and silently
+        # misroute a mixed-scope body into the wrong lane. getlist first.
+        if hasattr(request.data, "getlist"):
+            raw = request.data.getlist("categories")
+        else:
+            raw = request.data.get("categories")
+        if isinstance(raw, (str, int)):
+            raw = [raw]
+        if not isinstance(raw, list):
+            return None
+        try:
+            ids = [int(v) for v in raw]
+        except (TypeError, ValueError):
+            return None
+        bound = list(
+            Category.objects.filter(
+                id__in=ids, deleted_at__isnull=True, entitlement__isnull=False
+            ).select_related("entitlement__source_subscription")
+        )
+        if not bound:
+            return None
+        entitlement = bound[0].entitlement
+        if entitlement.user_id != request.user.id:
+            return None  # not theirs — accepts_questions_from will 400 it
+        if not entitlement.is_active:
+            return entitlement, dict(PACK_INACTIVE)
+        return entitlement, None
+
+    def _instance_pack_gate(self, instance, user=None):
+        """§F4: writes on BOUND content require the pack ACTIVE — expired
+        packs are read-only (content preserved, never deleted). For UNBOUND
+        content, a caller who only passed the permission layer as a lapsed
+        buyer re-denies here (the lapsed-creator read-only precedent)."""
+        bound = [c for c in instance.categories.all() if c.entitlement_id is not None]
+        if not bound:
+            from billing.access import can_paid_write
+
+            if user is not None and not can_paid_write(user):
+                raise PermissionDenied
+            return None
+        entitlement = bound[0].entitlement
+        if entitlement.is_active:
+            return None
+        return dict(PACK_INACTIVE)
+
     def update(self, request, *args, **kwargs):
-        # §F3 on PATCH-with-file (see CategoryViewSet.update).
-        if denial := storage_quota_denial(request.user, _incoming_file_bytes(request)):
+        instance = self.get_object()
+        if denial := self._instance_pack_gate(instance, request.user):
+            return Response(denial, status=status.HTTP_403_FORBIDDEN)
+        # §F3 on PATCH-with-file (see CategoryViewSet.update). Bound media
+        # answers to the pack's storage; unbound to the account's.
+        bound = [c for c in instance.categories.all() if c.entitlement_id is not None]
+        if bound:
+            if denial := pack_storage_denial(bound[0].entitlement, _incoming_file_bytes(request)):
+                return Response(denial, status=status.HTTP_403_FORBIDDEN)
+        elif denial := storage_quota_denial(request.user, _incoming_file_bytes(request)):
             return Response(denial, status=status.HTTP_403_FORBIDDEN)
         return super().update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        if denial := self._instance_pack_gate(self.get_object(), request.user):
+            return Response(denial, status=status.HTTP_403_FORBIDDEN)
+        return super().destroy(request, *args, **kwargs)
+
+    @action(detail=True, methods=["post"], url_path="archive")
+    def archive(self, request, pk=None):
+        """§F6 (#18): shelf a question — it leaves every draw/usable surface
+        but stays listed to its owner (reversible; NOT a delete). Owner-only
+        via the object permission; idempotent."""
+        question = self.get_object()
+        if question.owner_id != request.user.id:
+            return Response(
+                {"detail": "Only the owner can archive a question."}, status=status.HTTP_403_FORBIDDEN
+            )
+        if denial := self._instance_pack_gate(question, request.user):
+            return Response(denial, status=status.HTTP_403_FORBIDDEN)
+        if not question.is_archived:
+            question.is_archived = True
+            question.save(update_fields=["is_archived", "updated_at"])
+        return Response(self.get_serializer(question).data)
+
+    @action(detail=True, methods=["post"], url_path="unarchive")
+    def unarchive(self, request, pk=None):
+        """§F6: THE venue choke point — 100 active already → the structured
+        quota_active_questions 403 (house shape)."""
+        question = self.get_object()
+        if question.owner_id != request.user.id:
+            return Response(
+                {"detail": "Only the owner can unarchive a question."}, status=status.HTTP_403_FORBIDDEN
+            )
+        if denial := self._instance_pack_gate(question, request.user):
+            return Response(denial, status=status.HTTP_403_FORBIDDEN)
+        if question.is_archived:
+            bound = any(c.entitlement_id is not None for c in question.categories.all())
+            if not bound:
+                if denial := question_unarchive_denial(request.user):
+                    return Response(denial, status=status.HTTP_403_FORBIDDEN)
+            question.is_archived = False
+            question.save(update_fields=["is_archived", "updated_at"])
+        return Response(self.get_serializer(question).data)
 
     @action(detail=False, methods=["post"], url_path="bulk")
     def bulk(self, request):
@@ -249,6 +437,98 @@ class QuestionViewSet(viewsets.ModelViewSet):
 
             category_names = parsed.category_names
 
+            # §F4 (#18): partition rows by SCOPE before the batch checks. A
+            # row targeting a pack-bound category must be single-scope (all
+            # its categories bound to ONE pack, no brand-new categories,
+            # private only) — violations join parsed-style row errors. Bound
+            # rows answer to their pack's budget/storage and leave the
+            # account math; unbound rows keep the account checks (questions
+            # via the §F6 two-lane union).
+            scope_errors: list[dict] = []
+            per_entitlement: dict[int, dict] = {}
+            unbound_rows = 0
+            unbound_media_bytes = 0
+            if not official:
+                for index, row in enumerate(parsed.rows):
+                    row_num = index + 2  # 1-based incl. header, parser convention
+                    cats = row["categories"]
+                    ents = {
+                        c.entitlement_id
+                        for c in cats
+                        if not isinstance(c, tuple) and c.entitlement_id is not None
+                    }
+                    has_unbound = any(
+                        isinstance(c, tuple) or c.entitlement_id is None for c in cats
+                    )
+                    row_bytes = 0
+                    if row["media_type"] != "none" and parsed.archive is not None:
+                        info = None
+                        try:
+                            info = parsed.archive.getinfo(row["media_file"])
+                        except KeyError:
+                            pass
+                        if info is not None:
+                            row_bytes = info.file_size
+                    if not ents:
+                        unbound_rows += 1
+                        unbound_media_bytes += row_bytes
+                        continue
+                    if has_unbound or len(ents) > 1:
+                        scope_errors.append(
+                            {
+                                "row": row_num,
+                                "field": "category",
+                                "message": "A row can't mix pack categories with other categories.",
+                            }
+                        )
+                        continue
+                    if row["visibility"] != Visibility.PRIVATE:
+                        scope_errors.append(
+                            {
+                                "row": row_num,
+                                "field": "visibility",
+                                "message": "Pack questions stay private — use visibility blank or private.",
+                            }
+                        )
+                        continue
+                    ent_id = next(iter(ents))
+                    bucket = per_entitlement.setdefault(ent_id, {"rows": 0, "bytes": 0})
+                    bucket["rows"] += 1
+                    bucket["bytes"] += row_bytes
+                if scope_errors:
+                    return Response(
+                        {"created": 0, "errors": scope_errors, "skipped": parsed.skipped},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if per_entitlement:
+                    from billing.models import Entitlement
+
+                    entitlements = {
+                        e.pk: e
+                        for e in Entitlement.objects.filter(
+                            pk__in=per_entitlement
+                        ).select_related("source_subscription")
+                    }
+                    for ent_id, bucket in per_entitlement.items():
+                        entitlement = entitlements.get(ent_id)
+                        if entitlement is None or entitlement.user_id != request.user.id:
+                            # accepts_questions_from should have blocked a
+                            # foreign bound category (bound = private); stay
+                            # server-honest anyway.
+                            return Response(
+                                {"detail": "That pack isn't yours."},
+                                status=status.HTTP_403_FORBIDDEN,
+                            )
+                        if not entitlement.is_active:
+                            return Response(
+                                dict(PACK_INACTIVE), status=status.HTTP_403_FORBIDDEN
+                            )
+                        if denial := pack_question_denial(entitlement, bucket["rows"]):
+                            denial["requested"] = bucket["rows"]
+                            return Response(denial, status=status.HTTP_403_FORBIDDEN)
+                        if denial := pack_storage_denial(entitlement, bucket["bytes"]):
+                            return Response(denial, status=status.HTTP_403_FORBIDDEN)
+
             # Whole-batch quota checks (official content is quota-exempt:
             # owner-less rows never count against anyone). Categories first,
             # then questions — the first denial wins, each with its own code
@@ -258,15 +538,17 @@ class QuestionViewSet(viewsets.ModelViewSet):
                 if parsed.new_categories:
                     if denial := batch_quota_denial(request.user, "categories", len(parsed.new_categories)):
                         return Response(denial, status=status.HTTP_403_FORBIDDEN)
-                if parsed.rows:
-                    if denial := batch_quota_denial(request.user, "questions", len(parsed.rows)):
+                if unbound_rows:
+                    # §F6 two-lane union for the account-scoped slice only.
+                    if denial := batch_question_creation_denial(request.user, unbound_rows):
                         return Response(denial, status=status.HTTP_403_FORBIDDEN)
                 # §F3: whole-batch storage check — `requested` is the total
                 # uncompressed bytes of the media this file would store
                 # (counted per row, matching what create_rows stores; a file
-                # referenced by several rows is stored once per row).
-                if parsed.media_bytes_total:
-                    if denial := batch_storage_quota_denial(request.user, parsed.media_bytes_total):
+                # referenced by several rows is stored once per row). Bound
+                # rows' bytes were checked against their pack above (#18).
+                if unbound_media_bytes:
+                    if denial := batch_storage_quota_denial(request.user, unbound_media_bytes):
                         return Response(denial, status=status.HTTP_403_FORBIDDEN)
 
             if dry_run:

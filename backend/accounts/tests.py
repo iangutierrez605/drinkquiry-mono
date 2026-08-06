@@ -291,7 +291,7 @@ class AdminUserApiTests(QuotaTestBase):
             "brand_name", "brand_logo",
         }
         self.assertEqual(set(row), expected_keys)
-        self.assertEqual(set(row["usage"]), {"games_this_month", "categories", "questions", "storage", "tournaments"})
+        self.assertEqual(set(row["usage"]), {"games_this_month", "categories", "questions", "storage", "tournaments", "entitlements"})
         # search by email fragment and by display name
         res = self.client.get("/api/moderation/users/?search=paid@")
         self.assertEqual([r["email"] for r in res.data["results"]], ["paid@test.com"])

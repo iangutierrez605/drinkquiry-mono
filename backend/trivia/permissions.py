@@ -33,4 +33,15 @@ class IsCreator(permissions.BasePermission):
             # `bulk` also covers staff official uploads, which are quota-exempt
             # and must not require a paid plan.
             return True
-        return request.user.is_creator
+        # §F4 (#18): pack buyers and venue subscribers are NOT plan
+        # "creator" (never rendered as such — brief rule) but must edit,
+        # archive and delete their own content. The permission layer lets
+        # ANY entitlement-owner through — active OR lapsed — so the views
+        # can answer object-aware: bound content under a lapsed pack gets
+        # the informative pack_inactive 403 (naming reactivation) instead
+        # of a generic denial, while UNBOUND writes without an ACTIVE lane
+        # re-deny in the view (can_paid_write — the lapsed-creator
+        # read-only precedent, kept).
+        from billing.access import can_paid_write, owns_any_entitlement
+
+        return can_paid_write(request.user) or owns_any_entitlement(request.user)

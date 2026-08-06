@@ -2090,3 +2090,362 @@ class SnapshotTournamentTests(TournamentTestBase):
         self.assertEqual(self.client.get(f"/api/tournaments/{snap_id}/").status_code, 401)
         self.as_rival()
         self.assertEqual(self.client.get(f"/api/tournaments/{snap_id}/").status_code, 404)
+
+
+# --- Handoff #18: §F5 hand-picked boards + §F4/§F7/§F8 hosting gates --------
+
+
+from datetime import timedelta as _td18
+
+from billing.models import Entitlement as _Ent18, EntitlementKind as _Kind18, Purchase as _P18
+
+
+def _pack(user, kind=None, *, question_limit=50, game_limit=None, active=True, session="cs_hp"):
+    """A hand-made paid entitlement (the webhook's product, minus Stripe)."""
+    purchase = _P18.objects.create(
+        user=user, product_key="party_game_50", stripe_checkout_session_id=session
+    )
+    until = timezone.now() + (_td18(days=30) if active else -_td18(days=1))
+    return _Ent18.objects.create(
+        user=user,
+        kind=kind or _Kind18.PARTY_PACK,
+        source_purchase=purchase,
+        question_limit=question_limit,
+        game_limit=game_limit,
+        active_from=timezone.now() - _td18(days=31 if not active else 0),
+        active_until=until,
+    )
+
+
+class HandPickedBoardTests(APITestCase):
+    """§F5: validation, ordering ruling, gate, mixed boards."""
+
+    def setUp(self):
+        self.host = User.objects.create_user("hp@test.com", "sturdy-pass-123", plan="creator")
+        self.cat = seed_category("HandPick", 8)
+        self.other = seed_category("Drawn", 5)
+        self.client.force_authenticate(self.host)
+
+    def _qids(self, cat, n=None):
+        ids = list(
+            cat.questions.order_by("id").values_list("id", flat=True)
+        )
+        return ids if n is None else ids[:n]
+
+    def test_order_preserved_and_values_scale_by_row(self):
+        # Pick 3 in a deliberately non-difficulty order: hardest first.
+        ids = self._qids(self.cat)
+        chosen = [ids[7], ids[0], ids[3]]
+        game = create_game(
+            host=self.host,
+            mode="points",
+            category_ids=[self.cat.id],
+            questions_per_category=3,
+            hand_picked={str(self.cat.id): chosen},
+        )
+        cells = list(game.cells.order_by("row"))
+        self.assertEqual([c.question_id for c in cells], chosen)  # the host's climb
+        self.assertEqual([c.value for c in cells], [100, 200, 300])  # scaling unchanged
+
+    def test_mixed_picked_and_drawn_board_no_duplicates(self):
+        ids = self._qids(self.cat, 5)
+        game = create_game(
+            host=self.host,
+            mode="drinks",
+            category_ids=[self.cat.id, self.other.id],
+            questions_per_category=5,
+            hand_picked={self.cat.id: ids},
+        )
+        self.assertEqual(game.cells.count(), 10)
+        picked_col = game.columns.get(category=self.cat)
+        self.assertEqual(
+            [c.question_id for c in picked_col.cells.order_by("row")], ids
+        )
+        all_qids = list(game.cells.values_list("question_id", flat=True))
+        self.assertEqual(len(all_qids), len(set(all_qids)))
+
+    def test_length_dup_ownership_archived_offenders_listed(self):
+        ids = self._qids(self.cat)
+        # wrong length
+        with self.assertRaises(DRFValidationError) as ctx:
+            create_game(
+                host=self.host, mode="drinks", category_ids=[self.cat.id],
+                questions_per_category=3, hand_picked={self.cat.id: ids[:2]},
+            )
+        self.assertIn("exactly 3", str(ctx.exception))
+        # duplicate within the column
+        with self.assertRaises(DRFValidationError) as ctx:
+            create_game(
+                host=self.host, mode="drinks", category_ids=[self.cat.id],
+                questions_per_category=3, hand_picked={self.cat.id: [ids[0], ids[0], ids[1]]},
+            )
+        self.assertIn("repeated", str(ctx.exception))
+        # foreign question id (belongs to the OTHER category)
+        foreign = self._qids(self.other, 1)[0]
+        with self.assertRaises(DRFValidationError) as ctx:
+            create_game(
+                host=self.host, mode="drinks", category_ids=[self.cat.id],
+                questions_per_category=3, hand_picked={self.cat.id: [ids[0], ids[1], foreign]},
+            )
+        self.assertIn(str(foreign), str(ctx.exception))
+        # archived question is not usable
+        archived = Question.objects.get(pk=ids[2])
+        archived.is_archived = True
+        archived.save(update_fields=["is_archived"])
+        with self.assertRaises(DRFValidationError) as ctx:
+            create_game(
+                host=self.host, mode="drinks", category_ids=[self.cat.id],
+                questions_per_category=3, hand_picked={self.cat.id: [ids[0], ids[1], ids[2]]},
+            )
+        self.assertIn(str(ids[2]), str(ctx.exception))
+        # unknown hand_picked key (category not on the board)
+        with self.assertRaises(DRFValidationError):
+            create_game(
+                host=self.host, mode="drinks", category_ids=[self.cat.id],
+                questions_per_category=3, hand_picked={self.other.id: ids[:3]},
+            )
+
+    def test_gate_free_user_403_paid_or_entitled_pass(self):
+        free = User.objects.create_user("free-hp@test.com", "sturdy-pass-123")
+        self.client.force_authenticate(free)
+        ids = self._qids(self.cat, 3)
+        body = {
+            "mode": "drinks", "categories": [self.cat.id], "questions_per_category": 3,
+            "hand_picked": {str(self.cat.id): ids},
+        }
+        r = self.client.post("/api/games/", body, format="json")
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["code"], "hand_pick_locked")
+        # …but a pack buyer (active entitlement, NOT plan creator) may.
+        _pack(free)
+        r = self.client.post("/api/games/", body, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        col = Game.objects.get(code=r.json()["game"]["code"]).columns.first()
+        self.assertEqual([c.question_id for c in col.cells.order_by("row")], ids)
+        # And the plain create without hand_picked never trips the gate.
+        self.client.force_authenticate(User.objects.create_user("plain@test.com", "x-pass-123"))
+        r = self.client.post(
+            "/api/games/",
+            {"mode": "drinks", "categories": [self.cat.id], "questions_per_category": 3},
+            format="json",
+        )
+        self.assertEqual(r.status_code, 201)
+
+
+class HostingGateTests(APITestCase):
+    """§F4 pack hosting + §F7 plan_required: exact 403 shapes."""
+
+    def setUp(self):
+        self.buyer = User.objects.create_user("gates@test.com", "sturdy-pass-123")
+        self.client.force_authenticate(self.buyer)
+        self.library = seed_category("FreeLibrary", 5)
+
+    def _bound_category(self, entitlement, n=3):
+        cat = Category.objects.create(owner=self.buyer, name=f"Pack {entitlement.pk}", entitlement=entitlement)
+        for i in range(n):
+            q = Question.objects.create(
+                owner=self.buyer, question_text=f"pk{entitlement.pk} q{i}?", answer=f"a{i}",
+                difficulty=1,
+            )
+            q.categories.add(cat)
+        return cat
+
+    def test_active_pack_hosts_expired_pack_403_pack_inactive(self):
+        ent = _pack(self.buyer)
+        cat = self._bound_category(ent)
+        body = {"mode": "drinks", "categories": [cat.id], "questions_per_category": 3}
+        r = self.client.post("/api/games/", body, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        ent.active_until = timezone.now() - timedelta(minutes=1)
+        ent.save(update_fields=["active_until"])
+        r = self.client.post("/api/games/", body, format="json")
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(set(r.json()), {"detail", "code"})  # exact shape
+        self.assertEqual(r.json()["code"], "pack_inactive")
+        self.assertIn("Reactivate", r.json()["detail"])  # upsell names reactivation
+
+    def test_expired_buyer_keeps_free_library_hosting(self):
+        ent = _pack(self.buyer, active=False)
+        self._bound_category(ent)
+        r = self.client.post(
+            "/api/games/",
+            {"mode": "drinks", "categories": [self.library.id], "questions_per_category": 3},
+            format="json",
+        )
+        self.assertEqual(r.status_code, 201, r.content)
+
+    def test_own_unbound_needs_authoring_rights(self):
+        # A free user who somehow owns unbound content (lapsed plan) is
+        # gated with plan_required; a venue-active or creator host isn't.
+        own = Category.objects.create(owner=self.buyer, name="My old stuff")
+        for i in range(3):
+            q = Question.objects.create(
+                owner=self.buyer, question_text=f"own {i}?", answer="x", difficulty=1
+            )
+            q.categories.add(own)
+        body = {"mode": "drinks", "categories": [own.id], "questions_per_category": 3}
+        r = self.client.post("/api/games/", body, format="json")
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(set(r.json()), {"detail", "code"})
+        self.assertEqual(r.json()["code"], "plan_required")
+        self.buyer.plan = "creator"
+        self.buyer.save(update_fields=["plan"])
+        r = self.client.post("/api/games/", body, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+
+    def test_column_swap_mirrors_the_gates(self):
+        ent = _pack(self.buyer)
+        bound = self._bound_category(ent)
+        r = self.client.post(
+            "/api/games/",
+            {"mode": "drinks", "categories": [self.library.id], "questions_per_category": 3},
+            format="json",
+        )
+        code = r.json()["game"]["code"]
+        column_id = r.json()["game"]["columns"][0]["id"]
+        ent.active_until = timezone.now() - timedelta(minutes=1)
+        ent.save(update_fields=["active_until"])
+        r = self.client.post(
+            f"/api/games/{code}/columns/{column_id}/replace/",
+            {"category_id": bound.id},
+            format="json",
+        )
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("pack window has ended", r.json()["detail"])
+
+
+class TournamentPassTests(APITestCase):
+    """§F8 slice: consumption + attach limits."""
+
+    def setUp(self):
+        self.buyer = User.objects.create_user("pass@test.com", "sturdy-pass-123")
+        self.client.force_authenticate(self.buyer)
+        self.cat = seed_category("PassCat", 5)
+
+    def _pass(self, session="cs_pass1", active=True):
+        return _pack(
+            self.buyer, kind=_Kind18.TOURNAMENT_PASS,
+            question_limit=200, game_limit=2, active=active, session=session,
+        )
+
+    def test_pass_permits_one_create_and_is_consumed(self):
+        r = self.client.post("/api/tournaments/", {"name": "Cup", "location": ""}, format="json")
+        self.assertEqual(r.status_code, 403)  # free: quota_tournaments
+        ent = self._pass()
+        r = self.client.post("/api/tournaments/", {"name": "Cup", "location": ""}, format="json")
+        self.assertEqual(r.status_code, 201, r.content)
+        tid = r.json()["id"]
+        ent.refresh_from_db()
+        self.assertEqual(ent.tournament_id, tid)  # consumed
+        # Second create: the union quota itself denies (1 active pass = limit
+        # 1, 1 live tournament = used 1) — accurate numbers, generic message.
+        r = self.client.post("/api/tournaments/", {"name": "Cup 2", "location": ""}, format="json")
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["code"], "quota_tournaments")
+        self.assertEqual((r.json()["used"], r.json()["limit"]), (1, 1))
+        # The SPENT-PASS corner: soft-deleting the tournament frees the used
+        # count, but the pass stays bound (soft delete keeps the FK) — the
+        # union math says yes, consumption says no, and the specific message
+        # explains why.
+        self.client.delete(f"/api/tournaments/{tid}/")
+        r = self.client.post("/api/tournaments/", {"name": "Cup 3", "location": ""}, format="json")
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["code"], "quota_tournaments")
+        self.assertIn("already attached", r.json()["detail"])
+
+    def test_creator_plan_create_does_not_consume(self):
+        self.buyer.plan = "creator"
+        self.buyer.save(update_fields=["plan"])
+        ent = self._pass(session="cs_pass2")
+        r = self.client.post("/api/tournaments/", {"name": "Plain cup", "location": ""}, format="json")
+        self.assertEqual(r.status_code, 201)
+        ent.refresh_from_db()
+        self.assertIsNone(ent.tournament_id)  # the pass keeps for later
+
+    def test_game_limit_and_round_cap_at_attach(self):
+        ent = self._pass(session="cs_pass3")
+        r = self.client.post("/api/tournaments/", {"name": "Capped", "location": ""}, format="json")
+        tid = r.json()["id"]
+        body = {
+            "mode": "points", "categories": [self.cat.id], "questions_per_category": 2,
+            "tournament": tid, "round_number": 1,
+        }
+        self.assertEqual(self.client.post("/api/games/", body, format="json").status_code, 201)
+        self.assertEqual(self.client.post("/api/games/", body, format="json").status_code, 201)
+        r = self.client.post("/api/games/", body, format="json")
+        self.assertEqual(r.status_code, 403)
+        payload = r.json()
+        self.assertEqual(
+            payload,
+            {
+                "detail": payload["detail"],
+                "code": "quota_tournament_games",
+                "used": 2,
+                "limit": 2,
+            },
+        )
+        # Round cap: a fresh pass-funded tournament rejects round 4.
+        ent.game_limit = 6
+        ent.save(update_fields=["game_limit"])
+        body["round_number"] = 4
+        r = self.client.post("/api/games/", body, format="json")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("rounds 1–3", r.json()["round_number"][0].lower())
+
+    def test_expired_pass_gates_attach_but_reads_stay(self):
+        ent = self._pass(session="cs_pass4")
+        r = self.client.post("/api/tournaments/", {"name": "Windowed", "location": ""}, format="json")
+        tid = r.json()["id"]
+        ent.refresh_from_db()
+        ent.active_until = timezone.now() - timedelta(minutes=1)
+        ent.save(update_fields=["active_until"])
+        body = {
+            "mode": "points", "categories": [self.cat.id], "questions_per_category": 2,
+            "tournament": tid, "round_number": 1,
+        }
+        r = self.client.post("/api/games/", body, format="json")
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["code"], "pack_inactive")
+        # Detail stays readable forever.
+        r = self.client.get(f"/api/tournaments/{tid}/")
+        self.assertEqual(r.status_code, 200)
+
+
+class BoardEmailTests(APITestCase):
+    """§F1e (#18): the host's board-backup email — content, recipient, and
+    the never-break-the-action contract."""
+
+    def setUp(self):
+        self.host = User.objects.create_user("mailhost@test.com", "sturdy-pass-123", plan="creator")
+        self.cat = seed_category("Mailed", 3)
+        self.client.force_authenticate(self.host)
+
+    def _create(self):
+        return self.client.post(
+            "/api/games/",
+            {"mode": "drinks", "categories": [self.cat.id], "questions_per_category": 3},
+            format="json",
+        )
+
+    def test_email_carries_the_board_with_answers_to_the_host_only(self):
+        from django.core import mail
+
+        r = self._create()
+        self.assertEqual(r.status_code, 201, r.content)
+        code = r.json()["game"]["code"]
+        self.assertEqual(len(mail.outbox), 1)
+        message = mail.outbox[0]
+        self.assertEqual(message.to, ["mailhost@test.com"])
+        self.assertIn(code, message.subject)
+        self.assertIn("Mailed", message.body)          # category name
+        self.assertIn("SECRET-Mailed-0", message.body)  # ANSWERS ride along (host-only)
+        self.assertIn("Mailed question 0?", message.body)
+        self.assertIn("backup", message.body.lower())   # the v1 Game Backup footer
+
+    def test_send_failure_never_breaks_the_create(self):
+        from unittest import mock
+
+        with mock.patch("games.emails.send_mail", side_effect=RuntimeError("smtp down")):
+            r = self._create()
+        self.assertEqual(r.status_code, 201, r.content)  # warn-and-continue
+        self.assertEqual(Game.objects.count(), 1)

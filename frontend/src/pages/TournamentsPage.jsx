@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, errorText, quotaError, SUPPORT_EMAIL } from "../lib/api";
+import { api, errorText, quotaError } from "../lib/api";
 import { loadAuth, onAuthChange } from "../lib/storage";
 import AuthScreen from "../components/AuthScreen";
 
@@ -59,9 +59,14 @@ function TournamentsBody({ auth }) {
       reload();
     } catch (err) {
       const q = quotaError(err);
+      // §F8 (#18): the spent-pass corner returns code quota_tournaments
+      // with a specific, actionable detail ("already attached…") — show
+      // the server's own words for it instead of the generic count line.
       setFormError(
         q
-          ? `You've used all ${q.limit} tournaments on your plan (${q.used} live). Finish or delete one first.`
+          ? /pass/i.test(err?.data?.detail || "")
+            ? err.data.detail
+            : `You've used all ${q.limit} tournaments on your plan (${q.used} live). Finish or delete one first.`
           : errorText(err), // duplicate live name lands here as name: [...]
       );
     } finally {
@@ -98,24 +103,26 @@ function TournamentsBody({ auth }) {
       {gated ? (
         <section className="panel panel--center upsell">
           <span className="upsell__emoji">🏆</span>
-          <h2 className="h2">Tournaments are a creator feature</h2>
-          {/* §F5 (Handoff #17): launch copy — the old "Coming soon. For
-              now, an admin can enable creator access" was demo-speak.
-              There is NO billing (Manage Users IS the payment override),
-              so the honest shape is invite/contact. WORDING + the contact
-              route are DRAFTS pending the owner's approval (flagged in
-              CHANGES); the route rides the product's one existing contact
-              channel, support@ — a one-line swap either way. */}
+          <h2 className="h2">Run a real tournament</h2>
+          {/* §F7 (Handoff #18): billing EXISTS now — the #17 invite-only
+              copy retires. The Tournament Pass covers one full bracket
+              (up to 6 games, 200 of your own questions, 30 days); venues
+              running them weekly want the Venue tier. Both live on
+              /pricing; support@ stays for humans with questions. */}
           <p className="footnote">
-            Creator accounts are set up by us while billing is in the works —{" "}
-            <a className="supportlink" href={`mailto:${SUPPORT_EMAIL}`}>
-              get in touch
-            </a>{" "}
-            and we'll switch you on. Hosting single games needs no plan at all.
+            A <strong>Tournament Pass</strong> covers one full bracket — up to 6
+            games and 200 of your own questions, with 30 days to run it. Bars
+            running trivia every week want the Venue plan instead. Hosting
+            single games from the free library needs no plan at all.
           </p>
-          <Link className="btn btn--ghost" to="/host">
-            Back to hosting
-          </Link>
+          <div className="upsell__actions">
+            <Link className="btn btn--gold" to="/pricing">
+              See pricing
+            </Link>
+            <Link className="btn btn--ghost" to="/host">
+              Back to hosting
+            </Link>
+          </div>
         </section>
       ) : (
         <section className="panel">

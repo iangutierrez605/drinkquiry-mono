@@ -2571,3 +2571,287 @@ class QuestionCategoryNamesTests(BaseCase):
         row = next(r for r in rows if r["id"] == self.q.id)
         # …but the staff library still names the dead home (divergence pinned).
         self.assertEqual(row["category_names"], ["Beer", "Movies"])
+
+
+# --- Handoff #18: §F2 archived semantics + §F4 pack authoring ----------------
+
+
+from datetime import timedelta as _td18
+
+from django.utils import timezone as _tz18
+
+from billing.models import Entitlement as _Ent18, EntitlementKind as _Kind18, Purchase as _P18
+
+
+def _grant_pack(user, *, kind=None, question_limit=3, active=True, session=None):
+    purchase = _P18.objects.create(
+        user=user,
+        product_key="party_game_50",
+        stripe_checkout_session_id=session or f"cs_{user.pk}_{_P18.objects.count()}",
+    )
+    return _Ent18.objects.create(
+        user=user,
+        kind=kind or _Kind18.PARTY_PACK,
+        source_purchase=purchase,
+        question_limit=question_limit,
+        active_from=_tz18.now() - _td18(days=1),
+        active_until=_tz18.now() + (_td18(days=29) if active else -_td18(hours=1)),
+    )
+
+
+class ArchivedQuestionTests(BaseCase):
+    """§F2/§F6: archived leaves every usability surface, reversibly."""
+
+    def setUp(self):
+        super().setUp()
+        self.cat = Category.objects.create(
+            owner=None, name="Official 18",
+            visibility=Visibility.PUBLIC, moderation_status=ModerationStatus.APPROVED,
+        )
+        self.qs = []
+        for i in range(3):
+            # Real official content is stored public+approved (the seeds'
+            # convention) — usable_question_count's public clause needs it.
+            q = Question.objects.create(
+                owner=None, question_text=f"o18-{i}?", answer=f"a{i}", difficulty=1,
+                visibility=Visibility.PUBLIC, moderation_status=ModerationStatus.APPROVED,
+            )
+            q.categories.add(self.cat)
+            self.qs.append(q)
+
+    def test_usable_count_and_public_count_exclude_archived(self):
+        self.assertEqual(self.cat.usable_question_count(self.free), 3)
+        self.qs[0].is_archived = True
+        self.qs[0].save(update_fields=["is_archived"])
+        self.assertEqual(self.cat.usable_question_count(self.free), 2)
+        r = self.client.get("/api/categories/public/")
+        row = next(x for x in r.json()["results"] if x["id"] == self.cat.id)
+        self.assertEqual(row["question_count"], 2)  # pinned semantics, extended
+
+    def test_draws_exclude_archived(self):
+        from games.services import create_game
+
+        for q in self.qs[1:]:
+            q.is_archived = True
+            q.save(update_fields=["is_archived"])
+        with self.assertRaises(Exception) as ctx:
+            create_game(
+                host=self.creator, mode="drinks", category_ids=[self.cat.id],
+                questions_per_category=2,
+            )
+        self.assertIn("only has 1 usable", str(ctx.exception))
+
+    def test_archive_unarchive_endpoints_owner_only_and_reversible(self):
+        mine = make_category(self.creator, "Mine 18")
+        q = make_question(self.creator, mine, "mine?")
+        self.auth(self.other)
+        r = self.client.post(f"/api/questions/{q.id}/archive/")
+        self.assertEqual(r.status_code, 404)  # visibility-scoped get_object
+        self.auth(self.creator)
+        r = self.client.post(f"/api/questions/{q.id}/archive/")
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()["is_archived"])
+        # Idempotent; still listed to the owner.
+        self.assertEqual(self.client.post(f"/api/questions/{q.id}/archive/").status_code, 200)
+        listed = self.client.get("/api/questions/?mine=1").json()["results"]
+        self.assertIn(q.id, [row["id"] for row in listed])
+        r = self.client.post(f"/api/questions/{q.id}/unarchive/")
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.json()["is_archived"])
+
+    def test_venue_active_choke_at_create_and_unarchive(self):
+        # A venue-lane user (free plan + active venue entitlement) with the
+        # limit shrunk to 2 via a patched constant would need monkeypatching;
+        # instead: exercise the real 100 limit cheaply by pre-counting.
+        from billing.models import Subscription as _Sub18
+
+        sub = _Sub18.objects.create(
+            user=self.free, product_key="venue_monthly",
+            stripe_subscription_id="sub_t18", status="active",
+        )
+        _Ent18.objects.create(user=self.free, kind=_Kind18.VENUE, source_subscription=sub)
+        self.auth(self.free)
+        cat = Category.objects.create(owner=self.free, name="Venue cat 18")
+        # Bulk-create 99 active questions directly (HTTP x100 is slow).
+        rows = [
+            Question(owner=self.free, question_text=f"v18-{i}?", answer="a", difficulty=1)
+            for i in range(99)
+        ]
+        Question.objects.bulk_create(rows)
+        through = Question.categories.through
+        through.objects.bulk_create(
+            [through(question_id=q.id, category_id=cat.id) for q in rows]
+        )
+        body = {"categories": [cat.id], "question_text": "hundredth?", "answer": "a", "difficulty": 1}
+        r = self.client.post("/api/questions/", body)
+        self.assertEqual(r.status_code, 201, r.content)  # 100th active: fine
+        r = self.client.post("/api/questions/", {**body, "question_text": "101st?"})
+        self.assertEqual(r.status_code, 403)
+        payload = r.json()
+        self.assertEqual(
+            payload,
+            {"detail": payload["detail"], "code": "quota_active_questions", "used": 100, "limit": 100},
+        )
+        self.assertIn("Archive", payload["detail"])
+        # Archive one → the create fits; unarchiving it back at 100 → 403.
+        victim = Question.objects.filter(owner=self.free).first()
+        self.assertEqual(self.client.post(f"/api/questions/{victim.id}/archive/").status_code, 200)
+        r = self.client.post("/api/questions/", {**body, "question_text": "swap-in?"})
+        self.assertEqual(r.status_code, 201, r.content)
+        r = self.client.post(f"/api/questions/{victim.id}/unarchive/")
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["code"], "quota_active_questions")
+
+    def test_plain_creator_lane_ignores_active_gate(self):
+        # A manual creator's 500-total allowance authors freely regardless of
+        # archived state (union: most permissive lane wins; flagged ruling).
+        self.auth(self.creator)
+        cat = make_category(self.creator, "Creator lane")
+        body = {"categories": [cat.id], "question_text": "c-lane?", "answer": "a", "difficulty": 1}
+        self.assertEqual(self.client.post("/api/questions/", body).status_code, 201)
+
+
+class PackAuthoringTests(BaseCase):
+    """§F4: budgets, binding rules, scope moves, privacy, expiry read-only."""
+
+    def setUp(self):
+        super().setUp()
+        self.ent = _grant_pack(self.free, question_limit=3)
+        self.bound = Category.objects.create(
+            owner=self.free, name="Party Pack — starter", entitlement=self.ent
+        )
+        self.auth(self.free)
+
+    def _q(self, text, cat=None, **extra):
+        return self.client.post(
+            "/api/questions/",
+            {
+                "categories": [cat or self.bound.id],
+                "question_text": text, "answer": "a", "difficulty": 1, **extra,
+            },
+        )
+
+    def test_budget_enforced_exact_shape(self):
+        # 3-question pack: 2 → 3 → 403 (the 49→50→403 assertion, scaled).
+        self.assertEqual(self._q("one?").status_code, 201)
+        self.assertEqual(self._q("two?").status_code, 201)
+        self.assertEqual(self._q("three?").status_code, 201)
+        r = self._q("four?")
+        self.assertEqual(r.status_code, 403)
+        payload = r.json()
+        self.assertEqual(
+            payload,
+            {"detail": payload["detail"], "code": "quota_pack_questions", "used": 3, "limit": 3},
+        )
+
+    def test_free_account_quota_untouched_by_pack_authoring(self):
+        self.assertEqual(self._q("bound?").status_code, 201)
+        # The account-scope questions counter still reads 0 (bound content
+        # answers to the pack) — and unbound authoring stays denied for free.
+        from accounts.quotas import questions_used
+
+        self.assertEqual(questions_used(self.free), 0)
+        unbound = Category.objects.create(owner=self.free, name="Unbound 18")
+        r = self._q("unbound?", cat=unbound.id)
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["code"], "quota_questions")
+
+    def test_scope_mixing_and_moves_rejected(self):
+        unbound = Category.objects.create(owner=self.free, name="Mix 18")
+        r = self.client.post(
+            "/api/questions/",
+            {
+                "categories": [self.bound.id, unbound.id],
+                "question_text": "mix?", "answer": "a", "difficulty": 1,
+            },
+        )
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("mix", r.json()["categories"][0])
+        q = Question.objects.get(pk=self._q("stay?").json()["id"])
+        r = self.client.patch(f"/api/questions/{q.id}/", {"categories": [unbound.id]})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("move between", r.json()["categories"][0].lower())
+
+    def test_bound_stays_private(self):
+        r = self._q("pub?", visibility="public")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("private", r.json()["visibility"][0])
+        r = self.client.patch(f"/api/categories/{self.bound.id}/", {"visibility": "public"})
+        self.assertEqual(r.status_code, 400)
+
+    def test_additional_bound_category_cap_and_binding(self):
+        for i in range(4):  # starter + 4 = the cap of 5
+            r = self.client.post(
+                "/api/categories/", {"name": f"More {i}", "entitlement": self.ent.pk}
+            )
+            self.assertEqual(r.status_code, 201, r.content)
+            self.assertEqual(r.json()["entitlement"], self.ent.pk)
+        r = self.client.post("/api/categories/", {"name": "Sixth", "entitlement": self.ent.pk})
+        self.assertEqual(r.status_code, 403)
+        payload = r.json()
+        self.assertEqual(payload["code"], "quota_pack_categories")
+        self.assertEqual((payload["used"], payload["limit"]), (5, 5))
+        # Someone else's pack id → 400, no existence leak semantics needed.
+        self.auth(self.creator)
+        r = self.client.post("/api/categories/", {"name": "Steal", "entitlement": self.ent.pk})
+        self.assertEqual(r.status_code, 400)
+
+    def test_expiry_flips_editing_read_only_and_reactivation_restores(self):
+        q = Question.objects.get(pk=self._q("edit me?").json()["id"])
+        self.ent.active_until = _tz18.now() - _td18(minutes=1)
+        self.ent.save(update_fields=["active_until"])
+        r = self.client.patch(f"/api/questions/{q.id}/", {"answer": "b"})
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(set(r.json()), {"detail", "code"})
+        self.assertEqual(r.json()["code"], "pack_inactive")
+        r = self.client.patch(f"/api/categories/{self.bound.id}/", {"name": "Renamed"})
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["code"], "pack_inactive")
+        r = self.client.delete(f"/api/questions/{q.id}/")
+        self.assertEqual(r.status_code, 403)
+        # New bound content is off too.
+        self.assertEqual(self._q("late?").status_code, 403)
+        # Reactivation (the webhook's one-liner) restores editing.
+        self.ent.active_until = _tz18.now() + _td18(days=30)
+        self.ent.save(update_fields=["active_until"])
+        self.assertEqual(self.client.patch(f"/api/questions/{q.id}/", {"answer": "b"}).status_code, 200)
+
+    def test_bulk_into_bound_category_uses_pack_budget(self):
+        import io
+
+        csv = (
+            "category,question_text,answer,difficulty,visibility\n"
+            + "\n".join(
+                f"Party Pack — starter,bulk {i}?,a,1," for i in range(4)
+            )
+        )
+        upload = io.BytesIO(csv.encode())
+        upload.name = "pack.csv"
+        r = self.client.post("/api/questions/bulk/", {"file": upload}, format="multipart")
+        self.assertEqual(r.status_code, 403, r.content)
+        payload = r.json()
+        self.assertEqual(payload["code"], "quota_pack_questions")
+        self.assertEqual(payload["requested"], 4)
+        upload = io.BytesIO(
+            (
+                "category,question_text,answer,difficulty,visibility\n"
+                "Party Pack — starter,bulk a?,a,1,\n"
+                "Party Pack — starter,bulk b?,a,1,\n"
+            ).encode()
+        )
+        upload.name = "pack.csv"
+        r = self.client.post("/api/questions/bulk/", {"file": upload}, format="multipart")
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertEqual(r.json()["created"], 2)
+        # Mixed-scope row: bound + unbound name on one row → row error.
+        Category.objects.create(owner=self.free, name="Unbound bulk")
+        upload = io.BytesIO(
+            (
+                "category,question_text,answer,difficulty,visibility\n"
+                "Party Pack — starter|Unbound bulk,mixed?,a,1,\n"
+            ).encode()
+        )
+        upload.name = "pack.csv"
+        r = self.client.post("/api/questions/bulk/", {"file": upload}, format="multipart")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("mix", r.json()["errors"][0]["message"])

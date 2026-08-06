@@ -19,6 +19,9 @@ urlpatterns = [
     path("api/moderation/users/", include("accounts.admin_urls")),
     path("api/", include("trivia.urls")),
     path("api/", include("games.urls")),
+    # §F3 (Handoff #18): billing under its own static prefix — no free-string
+    # sibling to swallow anything.
+    path("api/billing/", include("billing.urls")),
 ]
 
 if settings.DEBUG:

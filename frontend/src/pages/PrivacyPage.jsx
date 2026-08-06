@@ -63,8 +63,21 @@ export default function PrivacyPage() {
         </p>
       </section>
 
+      {/* §F7 (Handoff #18): payments exist now — plain voice, PLACEHOLDER
+          until a lawyer reviews. */}
       <section className="panel legalpage__section">
-        <h2 className="h2">5. Retention and deletion</h2>
+        <h2 className="h2">5. Payments</h2>
+        <p>
+          If you buy something, the payment is handled by Stripe. Your card number never touches our
+          servers — we receive only what we need to run your account: which product you bought, the
+          amount, a payment reference, and the billing status Stripe reports (paid, refunded, and so
+          on). Stripe's own <a className="supportlink" href="https://stripe.com/privacy" target="_blank" rel="noreferrer">privacy policy</a>{" "}
+          covers what they collect as the payment processor.
+        </p>
+      </section>
+
+      <section className="panel legalpage__section">
+        <h2 className="h2">6. Retention and deletion</h2>
         <p>
           Account data and gameplay history stay while your account exists. Email{" "}
           <a className="supportlink" href={`mailto:${SUPPORT_EMAIL}`}>
@@ -75,7 +88,7 @@ export default function PrivacyPage() {
       </section>
 
       <section className="panel legalpage__section">
-        <h2 className="h2">6. Age</h2>
+        <h2 className="h2">7. Age</h2>
         <p>
           Drinkquiry is intended for adults of legal drinking age; the drinks mode is strictly for them. We
           don't knowingly collect personal information from children.
@@ -83,7 +96,7 @@ export default function PrivacyPage() {
       </section>
 
       <section className="panel legalpage__section">
-        <h2 className="h2">7. Changes and contact</h2>
+        <h2 className="h2">8. Changes and contact</h2>
         <p>
           If this policy changes, the date above changes with it. Questions or requests:{" "}
           <a className="supportlink" href={`mailto:${SUPPORT_EMAIL}`}>

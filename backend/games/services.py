@@ -49,11 +49,13 @@ PUBLIC_APPROVED = Q(visibility=Visibility.PUBLIC, moderation_status=ModerationSt
 def usable_questions(category: Category, user):
     """Questions this user is allowed to put on a board from this category.
     §I (Handoff #9): soft-deleted questions never enter new boards (nor the
-    §J3 replace pool) — cells already holding one keep it (history)."""
+    §J3 replace pool) — cells already holding one keep it (history).
+    §F2 (#18): archived questions (the venue shelf) never enter new boards
+    either, same cells-keep-history rule."""
     allowed = PUBLIC_APPROVED | Q(owner__isnull=True)
     if user and user.is_authenticated:
         allowed = allowed | Q(owner=user)
-    return category.questions.filter(allowed, deleted_at__isnull=True)
+    return category.questions.filter(allowed, deleted_at__isnull=True, is_archived=False)
 
 
 def _preference_ordered(qs, host):
@@ -113,6 +115,7 @@ def create_game(
     buzz_sound: int = 1,
     tournament=None,
     round_number: int | None = None,
+    hand_picked: dict | None = None,
 ) -> Game:
     """Build a game board from `category_ids`, in the order given.
 
@@ -127,6 +130,23 @@ def create_game(
     409 — the quota_denial placement pattern). Here we only enforce the
     pairing: a tournament game always knows its round, a plain game has
     neither.
+
+    §F5 (Handoff #18): `hand_picked` maps category id → an ORDERED list of
+    question ids for that column; any subset of the picked categories may
+    appear, and absent columns keep the automatic draw. The PAID gate is the
+    view's job (HTTP-shaped 403); everything content-shaped is enforced
+    here: each list's length must equal `questions_per_category`, every id
+    must be usable by this host from THAT category (own / official /
+    approved-public per C-3's default — the same usable_questions filter
+    the draw uses, so deleted and archived rows are out), and no id may
+    repeat anywhere on the board. Violations 400 with the offenders listed
+    (the shortage-409 honesty, in ValidationError form).
+
+    ORDERING RULING (§F5, deliberate divergence from _draw_for_category):
+    a hand-picked column's row order IS the given list order — the host's
+    climb — SKIPPING the automatic easiest→hardest re-sort. Value scaling
+    by row is unchanged (_cell_value), so the host's first pick is the
+    1-drink/100-point row regardless of its difficulty label.
 
     §G (Handoff #10), deliberate: this API is THEME-UNAWARE. Themes are a
     discovery/selection layer on the host create screen — they filter and
@@ -152,6 +172,27 @@ def create_game(
     if len(set(category_ids)) != len(category_ids):
         raise ValidationError({"categories": "Duplicate categories are not allowed."})
 
+    # §F5: normalize + type-check hand_picked here too (rule 4 — the suite
+    # calls this directly; JSON keys arrive as strings from the serializer).
+    picks_by_category: dict[int, list[int]] = {}
+    if hand_picked:
+        if not isinstance(hand_picked, dict):
+            raise ValidationError({"hand_picked": "Expected an object of category id → question ids."})
+        for raw_key, raw_list in hand_picked.items():
+            try:
+                key = int(raw_key)
+            except (TypeError, ValueError):
+                raise ValidationError({"hand_picked": f"'{raw_key}' isn't a category id."})
+            if not isinstance(raw_list, (list, tuple)) or not all(
+                isinstance(v, int) and not isinstance(v, bool) for v in raw_list
+            ):
+                raise ValidationError({"hand_picked": f"Category {key}: expected a list of question ids."})
+            if key not in category_ids:
+                raise ValidationError(
+                    {"hand_picked": f"Category {key} isn't one of the picked categories."}
+                )
+            picks_by_category[key] = list(raw_list)
+
     # §F5: a deleted category id reads as "Unknown category ids" — deleted
     # categories are invisible to new game builds, full stop.
     categories = list(Category.objects.filter(id__in=category_ids, deleted_at__isnull=True))
@@ -174,10 +215,46 @@ def create_game(
     # shape and message format are unchanged).
     by_id = {c.id: c for c in categories}
     shortages = {}
+    hp_errors: list[str] = []
     picked: dict[int, list[Question]] = {}
     used_question_ids: set[int] = set()
     for category_id in category_ids:
         category = by_id[category_id]
+        picked_ids = picks_by_category.get(category_id)
+        if picked_ids is not None:
+            # §F5: hand-picked column — validate, don't draw. All problems
+            # for all columns are collected, then 400ed together (the
+            # shortage-collection pattern below).
+            problems = []
+            if len(picked_ids) != questions_per_category:
+                problems.append(
+                    f"pick exactly {questions_per_category} questions ({len(picked_ids)} given)"
+                )
+            dups_in_column = {pid for pid in picked_ids if picked_ids.count(pid) > 1}
+            if dups_in_column:
+                problems.append(f"question ids repeated in the column: {sorted(dups_in_column)}")
+            usable = {
+                q.id: q for q in usable_questions(category, host).filter(id__in=picked_ids)
+            }
+            unusable = sorted({pid for pid in picked_ids if pid not in usable})
+            if unusable:
+                problems.append(
+                    f"question ids not usable from this category: {unusable}"
+                )
+            on_board_already = sorted(
+                {pid for pid in picked_ids if pid in used_question_ids}
+            )
+            if on_board_already:
+                problems.append(
+                    f"question ids already on the board: {on_board_already}"
+                )
+            if problems:
+                hp_errors.append(f"'{category.name}': " + "; ".join(problems) + ".")
+                continue
+            chosen = [usable[pid] for pid in picked_ids]  # the host's order, kept
+            picked[category.id] = chosen
+            used_question_ids.update(picked_ids)
+            continue
         # §J2 preference + 3x window + stable easiest->hardest re-sort all
         # live in _draw_for_category now (§F #16: shared with the column
         # swap so the two can't drift). The shortage contract and row/value
@@ -193,6 +270,8 @@ def create_game(
         else:
             picked[category.id] = chosen
             used_question_ids.update(q.id for q in chosen)
+    if hp_errors:
+        raise ValidationError({"hand_picked": hp_errors})
     if shortages:
         raise ValidationError(
             {
@@ -288,6 +367,22 @@ def replace_column_category(*, code: str, column_id, new_category_id, host) -> B
     new_category = Category.objects.filter(pk=new_category_id, deleted_at__isnull=True).first()
     if new_category is None:
         raise ActionError("Unknown category.")
+    # §F4/§F7 (#18): the swap-in mirrors creation's hosting gates, in this
+    # path's ActionError→409 dialect. A host's own bound category needs its
+    # pack ACTIVE; a host's own UNBOUND custom category needs authoring
+    # rights (plan/overrides/venue — billing/access.can_host_own_custom).
+    # Foreign/public categories pass untouched (library play stays free).
+    from billing.access import can_host_own_custom
+
+    if new_category.entitlement_id is not None and new_category.owner_id == host.id:
+        if not new_category.entitlement.is_active:
+            raise ActionError(
+                "That category's pack window has ended — reactivate the pack to host it."
+            )
+    elif new_category.owner_id == host.id and not can_host_own_custom(host):
+        raise ActionError(
+            "Hosting your own custom categories needs an active plan or pack."
+        )
     # unique(game, category) would reject the duplicate anyway — check first
     # for the friendly message. The column's OWN category counts too: a
     # same-category "swap" is just this 409, not a hidden full-redraw verb.

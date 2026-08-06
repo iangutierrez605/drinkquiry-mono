@@ -36,13 +36,12 @@ export default function HowToPlayPage() {
           <p className="footnote">
             Great for trivia nights that keep a crowd coming back week after week.
           </p>
-          {/* §F5 (Handoff #17): one discoverability sentence, matching the
-              /tournaments upsell copy (both change together if the owner
-              rewrites it). Deliberately NO lock icon on the nav — the page
-              explains itself, and free hosts should still window-shop. */}
+          {/* §F7 (Handoff #18): matches the /tournaments upsell (both
+              change together, per the #17 note). Billing exists now. */}
           <p className="footnote">
-            Tournaments are a creator feature — creator accounts are set up by us while billing is in the
-            works. Hosting single games needs no plan at all.
+            Tournaments run on a <Link to="/pricing">Tournament Pass</Link> (one
+            bracket, your own questions) or the Venue plan for weekly nights.
+            Hosting single games from the free library needs no plan at all.
           </p>
           <div className="howplay__cta">
             <Link className="btn btn--gold" to="/tournaments">
@@ -97,7 +96,7 @@ export default function HowToPlayPage() {
 
       <p className="howplay__foot footnote">
         Not sure what to put on a board? <Link className="howplay__browse" to="/categories">Browse the ready-made categories</Link> —
-        and please drink responsibly. It's a quiz, not a contest. 🍻
+        and please drink responsibly. 🍻
       </p>
     </div>
   );

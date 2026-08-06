@@ -4,11 +4,21 @@ from django.db.models import Count, Prefetch, Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 
-from accounts.quotas import quota_denial
+from accounts.quotas import base_limits_for, quota_denial, tournaments_used
+from billing.access import (
+    PACK_INACTIVE,
+    PLAN_REQUIRED,
+    can_host_own_custom,
+    can_paid_write,
+    unconsumed_active_passes,
+)
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from trivia.models import Category as TriviaCategory
+
+from .emails import send_board_email
 from .models import Game, GameStatus, Participant, ParticipantRole, Tournament
 from .serializers import (
     BoardDetailCellSerializer,
@@ -74,6 +84,66 @@ class GameCreateView(APIView):
                 return Response({"detail": "No such tournament."}, status=status.HTTP_404_NOT_FOUND)
             if tournament.finished_at is not None:
                 return Response(TOURNAMENT_FINISHED, status=status.HTTP_409_CONFLICT)
+            # §F8 slice (#18): a PASS-funded tournament carries its pass's
+            # limits into every game attach — the pass must be inside its
+            # prep window, the game count under game_limit (house-shaped
+            # quota_tournament_games), and rounds capped at 3 (C-2 default:
+            # LIMITS, not the 3-2-1 shape — a 4-game pub night still works).
+            entitlement = getattr(tournament, "entitlement", None)
+            if entitlement is not None:
+                if not entitlement.is_active:
+                    return Response(dict(PACK_INACTIVE), status=status.HTTP_403_FORBIDDEN)
+                round_number = serializer.validated_data.get("round_number")
+                if round_number is not None and round_number > 3:
+                    return Response(
+                        {"round_number": ["Tournament passes cover rounds 1–3."]},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if entitlement.game_limit is not None:
+                    used = tournament.games.count()
+                    if used >= entitlement.game_limit:
+                        return Response(
+                            {
+                                "detail": (
+                                    f"This tournament pass covers {entitlement.game_limit} games "
+                                    f"({used} created)."
+                                ),
+                                "code": "quota_tournament_games",
+                                "used": used,
+                                "limit": entitlement.game_limit,
+                            },
+                            status=status.HTTP_403_FORBIDDEN,
+                        )
+        # §F5 (#18): hand-picking is a PAID convenience — any active
+        # entitlement or a staff-granted creator plan (C-3 default). The UI
+        # hides the picker otherwise; this is the real gate.
+        hand_picked = serializer.validated_data.get("hand_picked") or None
+        if hand_picked and not can_paid_write(request.user):
+            return Response(
+                {
+                    "detail": "Hand-picking questions comes with any paid plan or pack.",
+                    "code": "hand_pick_locked",
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        # §F4/§F7 (#18): hosting gates on the picked categories. One query;
+        # HTTP-shaped here (the tournament-resolve precedent), exact shapes
+        # pinned: a host's own BOUND category needs its pack ACTIVE
+        # (pack_inactive names reactivation); a host's own UNBOUND custom
+        # category needs authoring rights (plan_required). Free-library
+        # boards stay free for everyone — including lapsed buyers.
+        picked_categories = TriviaCategory.objects.filter(
+            id__in=serializer.validated_data["categories"], deleted_at__isnull=True
+        ).select_related("entitlement__source_subscription")
+        own_unbound = False
+        for category in picked_categories:
+            if category.entitlement_id is not None and category.owner_id == request.user.id:
+                if not category.entitlement.is_active:
+                    return Response(dict(PACK_INACTIVE), status=status.HTTP_403_FORBIDDEN)
+            elif category.owner_id == request.user.id:
+                own_unbound = True
+        if own_unbound and not can_host_own_custom(request.user):
+            return Response(dict(PLAN_REQUIRED), status=status.HTTP_403_FORBIDDEN)
         game = create_game(
             host=request.user,
             mode=serializer.validated_data["mode"],
@@ -83,12 +153,17 @@ class GameCreateView(APIView):
             buzz_sound=serializer.validated_data["buzz_sound"],
             tournament=tournament,
             round_number=serializer.validated_data.get("round_number"),
+            hand_picked=hand_picked,
         )
         host_participant = Participant.objects.create(
             game=game,
             name=request.user.display_name or "Host",
             role=ParticipantRole.HOST,
         )
+        # §F1e (#18): the board backup email — host-only content is fine (the
+        # host already sees answers via the console); failure to send must
+        # never fail the create (send_board_email warns and continues).
+        send_board_email(game)
         return Response(
             {
                 "game": GameStateSerializer(game, context={"request": request}).data,
@@ -421,6 +496,35 @@ class TournamentListCreateView(generics.ListCreateAPIView):
     def create(self, request, *args, **kwargs):
         if denial := quota_denial(request.user, "tournaments"):
             return Response(denial, status=status.HTTP_403_FORBIDDEN)
+        # §F8 slice (#18): the union in limits_for counts ACTIVE passes into
+        # the tournaments allowance; CONSUMPTION happens here. If the plain
+        # lane (plan + overrides, no union) covers this create on its own,
+        # no pass is touched; otherwise the OLDEST unconsumed active pass is
+        # bound to the new tournament (Entitlement.tournament OneToOne = the
+        # "one pass, one tournament" rule as a DB constraint). A user whose
+        # only active pass is already spent gets the house-shaped 403 even
+        # though the union math said yes — the pass, not the count, is the
+        # real allowance (flagged ruling).
+        plain_limit = base_limits_for(request.user).get("tournaments")
+        plain_ok = plain_limit is None or tournaments_used(request.user) + 1 <= plain_limit
+        consume = None
+        if not plain_ok:
+            passes = sorted(unconsumed_active_passes(request.user), key=lambda e: (e.created_at, e.id))
+            if not passes:
+                used = tournaments_used(request.user)
+                return Response(
+                    {
+                        "detail": (
+                            "Your tournament pass is already attached to a tournament — "
+                            "a new tournament needs a new pass."
+                        ),
+                        "code": "quota_tournaments",
+                        "used": used,
+                        "limit": plain_limit or 0,
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            consume = passes[0]
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         try:
@@ -430,6 +534,9 @@ class TournamentListCreateView(generics.ListCreateAPIView):
             # constraint, so the DB is the truth, exactly like join names.
             with transaction.atomic():
                 tournament = serializer.save(owner=request.user)
+                if consume is not None:
+                    consume.tournament = tournament
+                    consume.save(update_fields=["tournament"])
         except IntegrityError:
             return Response(
                 {"name": ["You already have a live tournament with that name."]},

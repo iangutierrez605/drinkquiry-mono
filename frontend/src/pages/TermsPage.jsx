@@ -38,7 +38,7 @@ export default function TermsPage() {
           Drinkquiry contains drinking-game references. By creating an account or playing in drinks mode, you
           confirm that you are of legal drinking age in your jurisdiction. Points mode is available for
           all-ages play at the host's discretion. Never encourage anyone to drink more than they want to, and
-          please drink responsibly — it's a quiz, not a contest. You are responsible for complying with the
+          please drink responsibly. You are responsible for complying with the
           laws that apply where you play, including licensing rules if you run games at a venue.
         </p>
       </section>
@@ -73,8 +73,37 @@ export default function TermsPage() {
         </p>
       </section>
 
+      {/* §F7 (Handoff #18): purchases exist now — plain voice, PLACEHOLDER
+          until a lawyer reviews (same disclaimer as the whole page). */}
       <section className="panel legalpage__section">
-        <h2 className="h2">6. No warranty</h2>
+        <h2 className="h2">6. Purchases, subscriptions and refunds</h2>
+        <p>
+          Some features are paid: one-time game packs, tournament passes, and monthly venue
+          subscriptions. Prices are shown in US dollars before you buy. Payments are processed by
+          Stripe; we never see or store your card details. We email you a receipt for every charge.
+        </p>
+        <p>
+          One-time packs are usable — hostable and editable — for 30 days from purchase. After the
+          window ends, everything you made is kept safe in your account, read-only, and can be
+          reactivated for a smaller fee. Subscriptions renew monthly until cancelled; you can cancel
+          any time from the Manage billing button on your profile, and cancelling stops future
+          charges at the end of the paid period. We never delete your content because a payment
+          ended.
+        </p>
+        <p>
+          If you buy something and haven't meaningfully used it, contact us within 14 days and we
+          will refund it. Once a pack's content has been used to host games, refunds are at our
+          discretion. If a payment fails on a subscription, access continues for a short grace
+          period while the payment retries. To request a refund, email{" "}
+          <a className="supportlink" href={`mailto:${SUPPORT_EMAIL}`}>
+            {SUPPORT_EMAIL}
+          </a>
+          .
+        </p>
+      </section>
+
+      <section className="panel legalpage__section">
+        <h2 className="h2">7. No warranty</h2>
         <p>
           The service is provided "as is", without warranties of any kind. We don't promise it will be
           uninterrupted or error-free, and to the fullest extent the law allows, we are not liable for
@@ -84,7 +113,7 @@ export default function TermsPage() {
       </section>
 
       <section className="panel legalpage__section">
-        <h2 className="h2">7. Changes and contact</h2>
+        <h2 className="h2">8. Changes and contact</h2>
         <p>
           We may update these terms as the product evolves; the date above tells you when they last changed.
           Questions? Email{" "}

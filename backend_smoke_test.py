@@ -58,7 +58,10 @@ def rest():
         blk = p["usage"][k]
         assert set(blk) == {"used", "limit"} and isinstance(blk["used"], int)
         assert blk["limit"] is None or isinstance(blk["limit"], int)
-    ok(f"profile: plan={p['plan']}, usage block shaped per D3 incl. §F3 storage (limit null = unlimited)")
+    # §F2 (#18): the ADDITIVE entitlements summary — a list (empty for a
+    # billing-less account like this seeded creator).
+    assert isinstance(p["usage"]["entitlements"], list)
+    ok(f"profile: plan={p['plan']}, usage block shaped per D3 incl. §F3 storage + #18 entitlements (limit null = unlimited)")
 
     free_email = f"free-{int(time.time())}@test.com"
     requests.post(f"{BASE}/api/auth/register/", json={
@@ -644,11 +647,52 @@ def password_flows(knox, fknox):
     ok("forgot-password: existing vs unknown email → identical 200 bodies (§K1, no enumeration)")
 
 
+def billing_surface(knox):
+    """§F2/§F3 (Handoff #18): the KEYLESS billing surface — what a server
+    without Stripe env must serve. Products (public, pinned bare-array
+    shape), status (authed, pinned keys), webhook rejecting an unsigned
+    POST, checkout answering the clean 503 'billing not configured'."""
+    r = requests.get(f"{BASE}/api/billing/products/")
+    assert r.status_code == 200, r.text
+    products = r.json()
+    assert isinstance(products, list) and products, "products must be a non-empty bare array"
+    for row in products:
+        assert set(row) == {"key", "name", "price", "interval", "blurb", "coming_soon"}, row
+    keys = {row["key"] for row in products}
+    assert {"party_game_50", "big_game_100", "venue_monthly", "tournament_pass"} <= keys
+    assert "party_game_reactivation" not in keys, "reactivation keys stay dark"
+    coming = {row["key"]: row["coming_soon"] for row in products}
+    assert coming["venue_tournament_monthly"] is True, "C-4: Venue Tournament is coming-soon"
+    ok("billing products: public bare array, pinned row shape, reactivations dark, C-4 coming soon")
+
+    r = requests.get(f"{BASE}/api/billing/status/", headers={"Authorization": f"Token {knox}"})
+    assert r.status_code == 200, r.text
+    s = r.json()
+    assert set(s) == {"entitlements", "subscriptions", "purchases", "session"}, s
+    assert s["session"] is None and isinstance(s["entitlements"], list)
+    r = requests.get(f"{BASE}/api/billing/status/")
+    assert r.status_code == 401, r.text
+    ok("billing status: pinned 4-key shape for the seeded creator; anonymous 401")
+
+    r = requests.post(f"{BASE}/api/billing/webhook/", data=b"{}", headers={"Content-Type": "application/json"})
+    assert r.status_code == 503, r.text  # keyless: no webhook secret configured
+    r = requests.post(
+        f"{BASE}/api/billing/checkout/",
+        json={"product": "party_game_50"},
+        headers={"Authorization": f"Token {knox}"},
+    )
+    assert r.status_code == 503 and r.json().get("code") == "billing_not_configured", r.text
+    ok("keyless billing: webhook 503 (no secret → nothing verifiable), checkout billing_not_configured")
+
+
 code, ht, at, aid, bt, bid, knox, fknox = rest()
 asyncio.run(ws_flow(code, ht, at, aid, bt, bid, knox, fknox))
 # §I (#13): BEFORE password_flows — that flow ends by killing the original
 # knox session (change-back revokes other sessions), and this story needs it.
 tournament_story(knox, fknox)
+# §F2 (#18): billing's keyless surface — also before password_flows for the
+# same session-revocation reason.
+billing_surface(knox)
 password_flows(knox, fknox)
 if os.environ.get("SMOKE_MEDIA") == "1":
     media_round_trip()

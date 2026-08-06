@@ -25,19 +25,35 @@ class PublicCategorySerializer(serializers.ModelSerializer):
 class CategorySerializer(serializers.ModelSerializer):
     owner = serializers.PrimaryKeyRelatedField(read_only=True)
     usable_question_count = serializers.SerializerMethodField()
+    # §F4 (#18): pack binding — READ-ONLY here; the view injects it at
+    # create (after ownership/kind/active/cap checks) and it never changes
+    # afterwards. Serialized as the entitlement id so the frontend can chip
+    # bound categories and route their budget meters.
+    entitlement = serializers.PrimaryKeyRelatedField(read_only=True)
 
     class Meta:
         model = Category
         fields = (
             "id", "name", "description", "photo", "owner",
             "visibility", "moderation_status", "moderation_note",
-            "usable_question_count", "created_at",
+            "usable_question_count", "entitlement", "created_at",
         )
-        read_only_fields = ("moderation_status", "moderation_note")
+        read_only_fields = ("moderation_status", "moderation_note", "entitlement")
 
     def get_usable_question_count(self, obj):
         request = self.context.get("request")
         return obj.usable_question_count(request.user if request else None)
+
+    def validate(self, attrs):
+        # §F4 (#18): bound content stays PRIVATE — a pack's categories can
+        # never enter public listings or moderation (pack content is the
+        # buyer's night, not the library's).
+        bound = self.instance is not None and self.instance.entitlement_id is not None
+        if bound and attrs.get("visibility") == Visibility.PUBLIC:
+            raise serializers.ValidationError(
+                {"visibility": "Pack categories stay private to your account."}
+            )
+        return attrs
 
     def validate_visibility(self, value):
         return value
@@ -56,6 +72,13 @@ class CategorySerializer(serializers.ModelSerializer):
             for key, value in validated_data.items():
                 setattr(instance, key, value)
             obj = instance
+        # §F4 (#18): the create-path twin of validate()'s bound-stays-private
+        # rule — the view injects `entitlement` via save(**kwargs), which
+        # lands here as validated_data, after validate() already ran.
+        if wants_public and obj.entitlement_id is not None:
+            raise serializers.ValidationError(
+                {"visibility": "Pack categories stay private to your account."}
+            )
         if wants_public:
             # Public content must be vetted before it is actually public.
             obj.moderation_status = ModerationStatus.PENDING
@@ -85,15 +108,20 @@ class QuestionSerializer(serializers.ModelSerializer):
     # which is what lets the frontend's "no live categories" fallback fire
     # naturally. Read-only and additive; writes still use `categories` ids.
     category_names = serializers.SerializerMethodField()
+    # §F2/§F6 (#18): the venue shelf state — read-only here; the dedicated
+    # archive/unarchive actions are the only writers (unarchive is a quota
+    # choke point, so a PATCH must not be a side door).
+    is_archived = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Question
         fields = (
             "id", "categories", "category_names", "question_text", "answer", "difficulty",
             "media_type", "image", "audio", "video",
-            "owner", "visibility", "moderation_status", "moderation_note", "created_at",
+            "owner", "visibility", "moderation_status", "moderation_note", "is_archived",
+            "created_at",
         )
-        read_only_fields = ("moderation_status", "moderation_note")
+        read_only_fields = ("moderation_status", "moderation_note", "is_archived")
 
     def get_category_names(self, obj):
         # Reads the list prefetch when present; single-row responses
@@ -137,6 +165,39 @@ class QuestionSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     {"categories": f'You cannot add questions to "{category.name}".'}
                 )
+        # §F4 (#18) SCOPE RULE: a question belongs to exactly ONE scope — a
+        # single pack entitlement (every category bound to it) or the
+        # account (every category unbound). Mixing scopes muddles two
+        # budgets; moving a question BETWEEN scopes via PATCH would be a
+        # quota side door (author 50 in a pack, recategorize them out) —
+        # both rejected here, the one place category sets are validated.
+        from billing.access import entitlement_for_categories
+
+        ent_id, ok = entitlement_for_categories(categories)
+        if not ok:
+            raise serializers.ValidationError(
+                {"categories": "A question can't mix pack categories with other categories."}
+            )
+        if self.instance is not None:
+            old_ent_id, _ = entitlement_for_categories(list(self.instance.categories.all()))
+            if old_ent_id != ent_id:
+                raise serializers.ValidationError(
+                    {
+                        "categories": (
+                            "Questions can't move between a pack and the rest of your "
+                            "library — create it fresh where it belongs."
+                        )
+                    }
+                )
+        # Bound content stays PRIVATE (the CategorySerializer twin rule).
+        wants_public = (
+            attrs.get("visibility", getattr(self.instance, "visibility", Visibility.PRIVATE))
+            == Visibility.PUBLIC
+        )
+        if ent_id is not None and wants_public:
+            raise serializers.ValidationError(
+                {"visibility": "Pack questions stay private to your account."}
+            )
         return attrs
 
     def create(self, validated_data):

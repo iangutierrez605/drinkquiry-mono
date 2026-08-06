@@ -258,6 +258,16 @@ class CreateGameSerializer(serializers.Serializer):
     # enforces the pairing; the view resolves ownership/liveness/finished).
     tournament = serializers.IntegerField(required=False, allow_null=True, default=None, min_value=1)
     round_number = serializers.IntegerField(required=False, allow_null=True, default=None, min_value=1)
+    # §F5 (#18): optional hand-picked columns — {"<category_id>": [question
+    # ids in board order]} for any SUBSET of the picked categories; columns
+    # without an entry keep the automatic draw. Shape here, semantics (gate,
+    # ownership, length, dups, archived) in the view + service.
+    hand_picked = serializers.DictField(
+        child=serializers.ListField(child=serializers.IntegerField(min_value=1)),
+        required=False,
+        allow_null=True,
+        default=None,
+    )
 
 
 # --- §I (Handoff #13): tournament payloads ---------------------------------

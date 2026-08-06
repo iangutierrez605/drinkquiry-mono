@@ -29,13 +29,33 @@ KINDS = {
 
 def limits_for(user) -> dict:
     """Quota dict for the user's *effective* plan (expired paid == free),
-    with per-user overrides merged on top (§J1). An override key replaces the
-    plan value; null = unlimited; missing = plan default. Overrides apply to
-    whatever the effective plan is — i.e. they survive a plan lapse (a grant
-    to the user, not the plan; pinned as intended behavior)."""
-    plans = settings.PLAN_LIMITS
-    base = dict(plans.get(user.effective_plan, plans["free"]))
-    base.update(user.limit_overrides or {})
+    with per-user overrides merged on top (§J1), then §F2's (#18)
+    ENTITLEMENT UNION merged on top of that: allowances resolve as
+    (manual plan layer) ∪ (entitlement layer) — the most permissive lane
+    wins per key. Active venue-kind entitlements contribute the
+    account-scoped grants in billing/catalog.ACCOUNT_GRANTS; pack kinds
+    contribute nothing here (their world is their bound categories, counted
+    at their own choke points). Venue + packs may coexist on one account:
+    the venue's active-question cap governs UNBOUND content while each
+    pack's budget governs its bound content (§F6, pinned by tests).
+    Overrides keep their §J1 semantics (a grant to the USER, surviving a
+    plan lapse). `tournaments` additionally unions +1 per ACTIVE tournament
+    pass (the §F8 slice): consumption — binding a pass to the tournament it
+    paid for — happens in the create view, not here."""
+    base = base_limits_for(user)
+    from billing.access import account_grants, active_entitlements
+    from billing.models import EntitlementKind
+
+    for key, value in account_grants(user).items():
+        if base.get(key) is None and key in base:
+            continue  # already unlimited
+        if value is None:
+            base[key] = None
+        else:
+            base[key] = max(base.get(key) or 0, value)
+    passes = len(active_entitlements(user, (EntitlementKind.TOURNAMENT_PASS,)))
+    if passes and base.get("tournaments") is not None:
+        base["tournaments"] = (base.get("tournaments") or 0) + passes
     return base
 
 
@@ -61,6 +81,62 @@ def validate_overrides(value) -> dict:
     return value
 
 
+def base_limits_for(user) -> dict:
+    """The pre-#18 layer alone: plan + §J1 overrides, NO entitlement union.
+    The §F6 two-lane checks below need it to know whether the PLAIN lane
+    covers a write on its own."""
+    plans = settings.PLAN_LIMITS
+    base = dict(plans.get(user.effective_plan, plans["free"]))
+    base.update(user.limit_overrides or {})
+    return base
+
+
+def question_creation_denial(user, count: int = 1) -> dict | None:
+    """§F6 (#18): the two-lane union at the UNBOUND question-create choke.
+
+    Lane 1 (plain): plan + overrides `questions` limit vs questions_used —
+    a manual creator or override holder authors on their total allowance,
+    archived rows included (no shelf concept in this lane).
+    Lane 2 (venue): an active venue-kind entitlement permits the write while
+    ACTIVE (non-archived) questions stay under 100 — archive to make room.
+    Allowed if EITHER lane permits. When both deny, a venue-active user
+    gets the actionable quota_active_questions payload; everyone else the
+    classic quota_questions shape. Batch callers add `requested`.
+    (Pack-BOUND creates never reach this — they answer to their pack.)"""
+    limit = base_limits_for(user).get("questions")
+    used = questions_used(user)
+    if limit is None or used + count <= limit:
+        return None
+    from billing.access import active_question_denial, venue_active
+
+    venue_denial = active_question_denial(user, count)
+    if venue_denial is None:
+        return None
+    if venue_active(user):
+        return venue_denial
+    return _denial(user, "questions", count)
+
+
+def batch_question_creation_denial(user, count: int) -> dict | None:
+    denial = question_creation_denial(user, count)
+    if denial is not None:
+        denial["requested"] = count
+    return denial
+
+
+def question_unarchive_denial(user) -> dict | None:
+    """§F6: the unarchive choke. The row already counts in the plain lane,
+    so unarchive is free whenever plan+overrides cover the user's total;
+    otherwise the venue lane's 100-ACTIVE gate decides (quota_active_
+    questions, house shape)."""
+    limit = base_limits_for(user).get("questions")
+    if limit is None or questions_used(user) <= limit:
+        return None
+    from billing.access import active_question_denial
+
+    return active_question_denial(user, 1)
+
+
 def _mb(n: int) -> str:
     """Human MB for storage messages (payload numbers stay raw bytes)."""
     return f"{n / (1024 * 1024):g} MB"
@@ -80,16 +156,30 @@ def categories_used(user) -> int:
     # §F5 (Handoff #10): soft-deleted categories free their quota slot —
     # same convention questions adopted in #9 (and the same C6-audit lesson:
     # quota counters are an "active" surface).
+    # §F4 (#18): pack-BOUND categories answer to their pack's own small cap
+    # (billing/access.pack_category_denial), never the account quota.
     Category = apps.get_model("trivia", "Category")
-    return Category.objects.filter(owner=user, deleted_at__isnull=True).count()
+    return Category.objects.filter(
+        owner=user, deleted_at__isnull=True, entitlement__isnull=True
+    ).count()
 
 
 def questions_used(user) -> int:
     # §I (Handoff #9): soft-deleted questions free their quota slot — from the
     # owner's perspective a deleted question is gone, even though the row
     # remains for game history.
+    # §F4 (#18): pack-bound questions (any bound category) answer to their
+    # pack's budget, never the account quota. Archived-but-unbound rows DO
+    # still count here — the plain lane has no shelf concept; freeing a
+    # plain slot means deleting (the venue lane's 100-ACTIVE counter lives
+    # in billing/access.active_questions_used instead).
     Question = apps.get_model("trivia", "Question")
-    return Question.objects.filter(owner=user, deleted_at__isnull=True).count()
+    return (
+        Question.objects.filter(owner=user, deleted_at__isnull=True)
+        .exclude(categories__entitlement__isnull=False)
+        .distinct()
+        .count()
+    )
 
 
 def tournaments_used(user) -> int:
@@ -110,8 +200,12 @@ def storage_bytes_used(user) -> int:
     # §I: deleted questions don't count against storage either. Their files
     # stay on disk (live snapshots of games containing them still serialize
     # media) — a small deliberate mismatch, noted in CHANGES.md.
+    # §F4 (#18): pack-bound media draws on the pack's own storage allowance
+    # (billing/access.pack_storage_used), never the account quota.
     q = (
         Question.objects.filter(owner=user, deleted_at__isnull=True)
+        .exclude(categories__entitlement__isnull=False)
+        .distinct()
         .aggregate(total=Sum("media_bytes"))["total"]
         or 0
     )
@@ -119,7 +213,7 @@ def storage_bytes_used(user) -> int:
     # files stay on disk for history — the same deliberate mismatch noted
     # for questions in #9).
     c = (
-        Category.objects.filter(owner=user, deleted_at__isnull=True)
+        Category.objects.filter(owner=user, deleted_at__isnull=True, entitlement__isnull=True)
         .aggregate(total=Sum("photo_bytes"))["total"]
         or 0
     )
@@ -150,8 +244,12 @@ def _storage_limit(user):
 
 
 def usage(user) -> dict:
-    """The `usage` block for GET /api/auth/profile/ (D3; storage added §F3)."""
+    """The `usage` block for GET /api/auth/profile/ (D3; storage added §F3;
+    `entitlements` added ADDITIVELY by #18 §F2 — the smoke's shape
+    assertion moved in the same commit)."""
     limits = limits_for(user)
+    from billing.access import entitlement_usage_summary
+
     return {
         "games_this_month": {"used": games_used_this_month(user), "limit": limits["games_per_month"]},
         "categories": {"used": categories_used(user), "limit": limits["categories"]},
@@ -159,6 +257,10 @@ def usage(user) -> dict:
         "storage": {"used": storage_bytes_used(user), "limit": limits.get("storage_bytes")},
         # §I (Handoff #13): the tournaments meter (.get: missing = unlimited).
         "tournaments": {"used": tournaments_used(user), "limit": limits.get("tournaments")},
+        # §F2 (#18): per-entitlement summaries (packs: budget + days left;
+        # venue: active questions / 100). Empty list for everyone without
+        # billing history — the pre-#18 shape plus one key.
+        "entitlements": entitlement_usage_summary(user),
     }
 
 

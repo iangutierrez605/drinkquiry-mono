@@ -13,6 +13,14 @@ import { Toast } from "../components/shared";
  * (StaffGate). Staff status editing stays Django-admin-only, as before.
  */
 
+const ENT_LABELS = {
+  party_pack: "Party Game",
+  big_pack: "Big Game",
+  venue: "Venue",
+  tournament_pass: "Tournament Pass",
+  venue_tournament: "Venue Tournament",
+};
+
 export default function ManageUsersPage() {
   return (
     <StaffGate title="Manage users" next="/manage/users">
@@ -85,8 +93,12 @@ function Users({ auth, onToast }) {
       </section>
 
       <p className="footnote">
-        Billing: not wired yet — there is no payment system, so plans are set manually right here. Demo access:
-        creator + an expiry (it lapses back to free automatically).
+        {/* §F7 (#18): billing EXISTS now — this note explains the two
+            layers instead of denying one of them. */}
+        Two layers here: <strong>plan</strong> is this manual/ops lane (demo access: creator + an
+        expiry — it lapses back to free automatically), while Stripe purchases grant{" "}
+        <strong>entitlements</strong> — shown read-only on each row, never editable here. A buyer
+        stays plan "free" on purpose; allowances resolve as the most permissive of the two layers.
       </p>
 
       {error && <p className="formerror formerror--block">{error}</p>}
@@ -151,6 +163,11 @@ function UserRow({ auth, user, onToast, onSaved }) {
   const [clearArming, setClearArming] = useState(false);
 
   const lapsed = user.plan !== "free" && user.effective_plan === "free";
+  // §F7 (#18): buyer visibility — active entitlements drive the row chips.
+  const activeEnts = (user.usage?.entitlements || []).filter((e) => e.is_active);
+  const activePacks = activeEnts.filter(
+    (e) => e.kind === "party_pack" || e.kind === "big_pack" || e.kind === "tournament_pass",
+  ).length;
 
   const clearLogo = async () => {
     setBusy(true);
@@ -203,6 +220,18 @@ function UserRow({ auth, user, onToast, onSaved }) {
             {user.plan}
             {lapsed ? " (lapsed → free)" : ""}
           </span>
+          {/* §F7 (#18): Stripe buyers stay plan "free" by design — these
+              chips are how staff SEE them. Data rides usage.entitlements
+              (already in this endpoint's pinned shape). */}
+          {activeEnts.some((e) => e.kind === "venue" || e.kind === "venue_tournament") && (
+            <span className="modbadge modbadge--staff">venue</span>
+          )}
+          {activePacks > 0 && (
+            <span className="modbadge">{activePacks} pack{activePacks === 1 ? "" : "s"}</span>
+          )}
+          {activeEnts.length === 0 && (user.usage?.entitlements || []).length > 0 && (
+            <span className="modbadge">lapsed billing</span>
+          )}
           {Object.keys(user.limit_overrides || {}).length > 0 && <span className="modbadge">custom limits</span>}
           <span className="userrow__chev">{open ? "▾" : "▸"}</span>
         </span>
@@ -212,8 +241,27 @@ function UserRow({ auth, user, onToast, onSaved }) {
         <div className="userrow__body">
           <p className="footnote">
             Joined {new Date(user.date_joined).toLocaleDateString()} · staff status is read-only here (Django admin
-            only) · billing isn't wired — this panel IS the payment override.
+            only) · this panel is the MANUAL lane (plan + overrides); Stripe entitlements below are read-only.
           </p>
+          {(user.usage?.entitlements || []).length > 0 && (
+            <>
+              <h3 className="h2">Purchased (Stripe)</h3>
+              <ul className="userrow__ents">
+                {user.usage.entitlements.map((e) => (
+                  <li key={e.id} className="footnote">
+                    {ENT_LABELS[e.kind] || e.kind} — {e.is_active ? "active" : "ended"}
+                    {e.question_limit != null ? ` · ${e.questions_used}/${e.question_limit} questions` : ""}
+                    {e.game_limit != null ? ` · up to ${e.game_limit} games` : ""}
+                    {e.active_until ? ` · until ${new Date(e.active_until).toLocaleDateString()}` : ""}
+                  </li>
+                ))}
+              </ul>
+              <p className="footnote">
+                Set by webhooks, never hand-edited here — corrections go through Django admin
+                (billing) until the §F9 staff tools land.
+              </p>
+            </>
+          )}
           <div className="userrow__plan">
             <label className="field">
               Plan

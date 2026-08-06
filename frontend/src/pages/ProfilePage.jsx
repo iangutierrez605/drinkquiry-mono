@@ -124,6 +124,17 @@ function ProfileBody({ auth, onAuthGone }) {
         />
       )}
 
+      {/* §F7 (Handoff #18): billing — entitlement meters, purchases, and
+          the Stripe portal hand-off. Renders nothing for accounts with no
+          billing history (most users, forever). */}
+      {profile && (
+        <BillingPanel
+          token={auth.token}
+          entitlements={profile.usage?.entitlements || []}
+          onToast={setToast}
+        />
+      )}
+
       {profile && <ChangePasswordPanel token={auth.token} onToast={setToast} />}
 
       <section className="panel">
@@ -147,6 +158,164 @@ function ProfileBody({ auth, onAuthGone }) {
 }
 
 /* ---------------- §H (Handoff #11): venue branding ---------------- */
+
+/* ---------------- §F7 (Handoff #18): billing panel ---------------- */
+
+const KIND_LABELS = {
+  party_pack: "Party Game",
+  big_pack: "Big Game",
+  venue: "Venue",
+  tournament_pass: "Tournament Pass",
+  venue_tournament: "Venue Tournament",
+};
+
+function daysLeft(iso) {
+  if (!iso) return null;
+  const ms = new Date(iso).getTime() - Date.now();
+  return Math.max(0, Math.ceil(ms / 86400000));
+}
+
+/**
+ * Entitlement meters (packs: questions used / budget + days left; venue:
+ * active questions / 100), the purchase list, and Manage billing → Stripe's
+ * portal. Money copy is PLAIN (rule 8). A buyer is never rendered as a
+ * "creator" — the plan chip above keeps showing the honest manual plan
+ * (free for most buyers); what they bought shows HERE, by its product name.
+ */
+function BillingPanel({ token, entitlements, onToast }) {
+  const [status, setStatus] = useState(null); // /billing/status — lazy
+  const [statusError, setStatusError] = useState(null);
+  const [portalBusy, setPortalBusy] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    // Only fetch the purchase/subscription detail when there's any billing
+    // history to show — the profile's own entitlements list is the cheap
+    // signal (empty for accounts that never bought).
+    if (!entitlements.length) return undefined;
+    api
+      .billingStatus(token)
+      .then((s) => alive && setStatus(s))
+      .catch((err) => alive && setStatusError(errorText(err)));
+    return () => {
+      alive = false;
+    };
+  }, [token, entitlements.length]);
+
+  if (!entitlements.length) return null;
+
+  const openPortal = async () => {
+    setPortalBusy(true);
+    try {
+      const { url } = await api.billingPortal(token);
+      window.location.assign(url);
+    } catch (err) {
+      onToast(
+        err?.data?.code === "billing_not_configured"
+          ? "Billing isn't switched on for this server."
+          : errorText(err),
+      );
+      setPortalBusy(false);
+    }
+  };
+
+  const subs = status?.subscriptions || [];
+  const purchases = (status?.purchases || []).filter((p) => p.status !== "pending");
+
+  return (
+    <section className="panel billing-panel">
+      <h2 className="h2">Billing</h2>
+
+      {entitlements.map((ent) => {
+        const label = KIND_LABELS[ent.kind] || ent.kind;
+        const left = daysLeft(ent.active_until);
+        return (
+          <div key={ent.id} className={`entrow ${ent.is_active ? "" : "entrow--lapsed"}`}>
+            <div className="entrow__head">
+              <strong>{label}</strong>
+              {ent.is_active ? (
+                ent.active_until ? (
+                  <span className="badge">{left} day{left === 1 ? "" : "s"} left</span>
+                ) : (
+                  <span className="badge">active</span>
+                )
+              ) : (
+                <span className="badge badge--muted">ended</span>
+              )}
+            </div>
+            {ent.question_limit != null && (
+              <div className="entrow__meter">
+                {ent.questions_used} / {ent.question_limit} questions used
+                {ent.game_limit != null ? ` · up to ${ent.game_limit} games` : ""}
+              </div>
+            )}
+            {ent.active_questions && (
+              <div className="entrow__meter">
+                {ent.active_questions.used} / {ent.active_questions.limit} active questions
+                {" — archiving frees a slot; archived questions keep forever"}
+              </div>
+            )}
+            {!ent.is_active && ent.kind !== "venue" && ent.kind !== "venue_tournament" && (
+              <div className="footnote">
+                Everything you made is kept safe, read-only. Reactivating this
+                pack brings hosting and editing back — email {SUPPORT_EMAIL} to
+                reactivate.
+              </div>
+            )}
+          </div>
+        );
+      })}
+
+      {subs.map((s) => (
+        <div key={s.product_key} className="entrow">
+          <div className="entrow__head">
+            <strong>{s.name} subscription</strong>
+            <span className="badge">{s.status}</span>
+          </div>
+          {s.status === "past_due" && s.grace_period_ends_at && (
+            <div className="formerror">
+              Your last payment didn't go through. Access continues until{" "}
+              {new Date(s.grace_period_ends_at).toLocaleDateString()} while it
+              retries — update your card via Manage billing below.
+            </div>
+          )}
+          {s.cancel_at_period_end && s.current_period_end && (
+            <div className="footnote">
+              Cancels at the end of the current period (
+              {new Date(s.current_period_end).toLocaleDateString()}). Your
+              content stays yours.
+            </div>
+          )}
+        </div>
+      ))}
+
+      {purchases.length > 0 && (
+        <ul className="billing-purchases">
+          {purchases.map((p, i) => (
+            <li key={i} className="footnote">
+              {p.name} — {p.status}
+              {p.amount_total != null
+                ? ` — $${(p.amount_total / 100).toFixed(2)} ${String(p.currency || "").toUpperCase()}`
+                : ""}
+              {p.purchased_at ? ` — ${new Date(p.purchased_at).toLocaleDateString()}` : ""}
+            </li>
+          ))}
+        </ul>
+      )}
+      {statusError && <p className="formerror">{statusError}</p>}
+
+      <div className="billing-panel__actions">
+        <button className="btn btn--sm" onClick={openPortal} disabled={portalBusy}>
+          {portalBusy ? "Opening…" : "Manage billing"}
+        </button>
+        <span className="footnote">
+          Card details, past invoices and cancellation are handled in Stripe's
+          secure portal. Receipt emails come from us with every charge.
+        </span>
+      </div>
+    </section>
+  );
+}
 
 /**
  * Creator-plan feature: a brand name + logo that every game this account

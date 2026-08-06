@@ -100,6 +100,12 @@ export default function SiteNav() {
         <NavLink to="/create" className={navClass}>
           Make questions
         </NavLink>
+        {/* §F7 (Handoff #18): the store front — public, same rationale as
+            How to play: a bar owner evaluating the product should find the
+            money page without an account. */}
+        <NavLink to="/pricing" className={navClass}>
+          Pricing
+        </NavLink>
         {/* §F4 (Handoff #16): the ways-to-play explainer — public, so a bar
             owner evaluating the product sees it before signing up. */}
         <NavLink to="/how-to-play" className={navClass}>

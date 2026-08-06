@@ -50,6 +50,7 @@ INSTALLED_APPS = [
     "accounts",
     "trivia",
     "games",
+    "billing",
 ]
 
 MIDDLEWARE = [
@@ -310,6 +311,31 @@ MAX_PLAYERS_PER_GAME = 6
 TURNSTILE_SECRET_KEY = os.environ.get("TURNSTILE_SECRET_KEY", "")
 TURNSTILE_SITE_KEY = os.environ.get("TURNSTILE_SITE_KEY", "")
 
+# --- §F2 (Handoff #18): Stripe billing, opt-in via env ---------------------
+# The Resend/Turnstile shape: everything defaults "" and billing is ON iff
+# STRIPE_SECRET_KEY is set — dev, the suite and the smoke run keyless with
+# /checkout/ and /portal/ answering a clean 503-style "billing not
+# configured" (billing/catalog.billing_enabled). Price IDs are resolved
+# server-side ONLY (billing/catalog.py) and never reach the browser. The
+# suite exercises the ON behavior via override_settings (the TurnstileTests
+# precedent); under the test runner the keys are blanked below, exactly like
+# Turnstile's, so a configured .env can't leak billing into the suite.
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_PUBLISHABLE_KEY = os.environ.get("STRIPE_PUBLISHABLE_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_PARTY_GAME_50 = os.environ.get("STRIPE_PRICE_PARTY_GAME_50", "")
+STRIPE_PRICE_BIG_GAME_100 = os.environ.get("STRIPE_PRICE_BIG_GAME_100", "")
+STRIPE_PRICE_VENUE_MONTHLY = os.environ.get("STRIPE_PRICE_VENUE_MONTHLY", "")
+STRIPE_PRICE_TOURNAMENT_PASS = os.environ.get("STRIPE_PRICE_TOURNAMENT_PASS", "")
+STRIPE_PRICE_VENUE_TOURNAMENT_MONTHLY = os.environ.get("STRIPE_PRICE_VENUE_TOURNAMENT_MONTHLY", "")
+STRIPE_PRICE_PARTY_GAME_REACTIVATION = os.environ.get("STRIPE_PRICE_PARTY_GAME_REACTIVATION", "")
+STRIPE_PRICE_BIG_GAME_REACTIVATION = os.environ.get("STRIPE_PRICE_BIG_GAME_REACTIVATION", "")
+# §F3: past_due grace before a venue's custom-content access gates off.
+BILLING_GRACE_DAYS = int(os.environ.get("BILLING_GRACE_DAYS", "7"))
+# C-8: USD only v1; Stripe Tax OFF until the owner confirms registration
+# with a professional (the brief's own disclaimer). Flag ready.
+STRIPE_AUTOMATIC_TAX = env_bool("STRIPE_AUTOMATIC_TAX", False)
+
 # #13 fix: the "suite runs keyless" promise is now ENFORCED, not assumed.
 # Running `manage.py test` inside an environment whose .env sets the
 # Turnstile secret (the compose api container, a configured droplet) used to
@@ -322,6 +348,12 @@ TESTING = len(sys.argv) > 1 and sys.argv[1] == "test"
 if TESTING:
     TURNSTILE_SECRET_KEY = ""
     TURNSTILE_SITE_KEY = ""
+    # §F2 (#18): same enforcement for Stripe — a configured environment must
+    # not leak billing into the suite; BillingTests override_settings the ON
+    # behavior explicitly.
+    STRIPE_SECRET_KEY = ""
+    STRIPE_PUBLISHABLE_KEY = ""
+    STRIPE_WEBHOOK_SECRET = ""
 
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 if RESEND_API_KEY:

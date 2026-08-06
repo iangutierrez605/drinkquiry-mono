@@ -17,6 +17,9 @@ import TournamentDetailPage from "./pages/TournamentDetailPage";
 import ResetPasswordPage from "./pages/ResetPasswordPage";
 import TermsPage from "./pages/TermsPage";
 import PrivacyPage from "./pages/PrivacyPage";
+// Handoff #18 §F7: the store front + the checkout return page.
+import PricingPage from "./pages/PricingPage";
+import BillingSuccessPage from "./pages/BillingSuccessPage";
 import AuthScreen from "./components/AuthScreen";
 import SiteNav from "./components/SiteNav";
 import AgeGate from "./components/AgeGate";
@@ -130,7 +133,7 @@ function Landing() {
         <span className="wordmark wordmark--small">DRINKQUIRY</span>
         {/* §F3: the footer's Host/Make questions/Profile links moved to the
             SiteNav above — keeping both would be the same list twice. */}
-        <span className="landingfoot__note">Please drink responsibly — it's a quiz, not a contest. 🍻</span>
+        <span className="landingfoot__note">Please drink responsibly. 🍻</span>
         {/* §F6 (Handoff #17): the legal links live here (and on the
             register form) — the sitefoot stays support-only for now, a
             one-liner later if wanted. */}
@@ -246,6 +249,9 @@ export default function App() {
               files and in CHANGES). */}
           <Route path="/terms" element={<TermsPage />} />
           <Route path="/privacy" element={<PrivacyPage />} />
+          {/* Handoff #18 §F7 */}
+          <Route path="/pricing" element={<PricingPage />} />
+          <Route path="/billing/success" element={<BillingSuccessPage />} />
           <Route path="/profile" element={<ProfilePage />} />
           {/* §I (Handoff #13): tournaments — inside ChromeLayout (SiteNav),
               auth-funneled by the pages themselves like /host. */}

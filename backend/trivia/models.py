@@ -66,6 +66,22 @@ class Category(ModeratedContentMixin):
     # quota counters, theme listings) filters deleted_at__isnull=True.
     # Restore/staff-delete-endpoint/revise are punted (§M).
     deleted_at = models.DateTimeField(null=True, blank=True)
+    # §F2/§F4 (Handoff #18): pack binding — a purchased pack's content is
+    # the questions inside categories bound to its Entitlement (games are
+    # ephemeral; categories are the durable unit the whole product draws
+    # from — the §A.1 ruling made concrete). Null = ordinary account-scoped
+    # category. Set ONLY at creation (webhook starter category or an owner
+    # create carrying `entitlement`); read-only afterwards — moving content
+    # between a pack and the account is rejected (billing/access.py scope
+    # rule). SET_NULL: an admin hard-delete of an Entitlement row must never
+    # take content with it (entitlements are otherwise PROTECTed anyway).
+    entitlement = models.ForeignKey(
+        "billing.Entitlement",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="bound_categories",
+    )
     photo = models.ImageField(upload_to="categories/", null=True, blank=True, validators=[validate_image])
     # §F3: persisted size of `photo` (post-resize), maintained by save() below
     # so the storage quota is counted from columns, never by listing a bucket.
@@ -113,8 +129,9 @@ class Category(ModeratedContentMixin):
 
     def usable_question_count(self, user=None) -> int:
         """Questions a given user may put on a board from this category.
-        §I1: soft-deleted questions are never usable."""
-        qs = self.questions.filter(deleted_at__isnull=True)
+        §I1: soft-deleted questions are never usable. §F2 (#18): archived
+        questions are never usable either (the venue shelf)."""
+        qs = self.questions.filter(deleted_at__isnull=True, is_archived=False)
         public = models.Q(visibility=Visibility.PUBLIC, moderation_status=ModerationStatus.APPROVED)
         if user is not None and user.is_authenticated:
             return qs.filter(public | models.Q(owner=user)).count()
@@ -153,6 +170,14 @@ class Question(ModeratedContentMixin):
     # on_delete=PROTECT, so a hard delete of any ever-played question was a
     # guaranteed ProtectedError 500.
     deleted_at = models.DateTimeField(null=True, blank=True)
+    # §F2/§F6 (Handoff #18): the Venue "100 ACTIVE questions" shelf state —
+    # DISTINCT from soft delete: archived is owner-reversible shelf space
+    # (the row stays listed to its owner with an archived chip; unarchive is
+    # the choke point). Every draw/usability surface excludes archived
+    # (usable_question_count, usable_questions, the public question_count
+    # annotation); cells already holding one keep it (history). Deliberately
+    # NOT implemented as 100-per-month (brief rule).
+    is_archived = models.BooleanField(default=False)
     # §I3: lineage pointer set when a staff revision supersedes this row —
     # the old row is soft-deleted and points at its replacement. SET_NULL so
     # (someday) hard-purging a replacement never cascades into history.
