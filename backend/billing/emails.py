@@ -33,6 +33,7 @@ def send_purchase_confirmation(
     product_name: str,
     category_name: str | None,
     *,
+    guide_to_create: bool = False,
     amount_total: int | None = None,
     currency: str = "",
     purchased_at=None,
@@ -49,6 +50,16 @@ def send_purchase_confirmation(
         lines += [
             f'A starter category, "{category_name}", is ready in your library. '
             "Add your questions there; your pack's budget and days remaining "
+            "show on your profile's billing panel.",
+            "",
+        ]
+    elif guide_to_create:
+        # #19.1: no auto-created starter — point FRESH pack buyers at
+        # /create, where the category form now offers the pack lane.
+        # Reactivations keep their existing content and skip this line.
+        lines += [
+            'Head to the "Your content" page to set up categories for your '
+            "purchase and add questions; your budget and days remaining "
             "show on your profile's billing panel.",
             "",
         ]

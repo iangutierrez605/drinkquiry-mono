@@ -1585,7 +1585,10 @@ class ModerationEmailTests(BaseCase):
         self.assertEqual(len(mail.outbox), 1)
         msg = mail.outbox[0]
         self.assertEqual(msg.to, ["creator@test.com"])
-        self.assertIn("approved", msg.subject)
+        # §F1(c) (#19): exact subject pinned — approve-by-OTHER-staff sends
+        # this; the (ii) twin, test_self_approval_sends_nothing below,
+        # already existed and stays the self-review pin.
+        self.assertEqual(msg.subject, "Your question was approved")
         self.assertIn("Who wrote Hey Jude?", msg.body)
         self.assertIn("Music", msg.body)
 
@@ -2780,17 +2783,20 @@ class PackAuthoringTests(BaseCase):
         self.assertEqual(r.status_code, 400)
 
     def test_additional_bound_category_cap_and_binding(self):
-        for i in range(4):  # starter + 4 = the cap of 5
+        # #19.1 (owner ruling): party cap 5 → 10 ("50 questions, 10
+        # categories"; big is 20). setUp made one bound category, so 9
+        # more fill the cap; the 11th denies with the structured shape.
+        for i in range(9):
             r = self.client.post(
                 "/api/categories/", {"name": f"More {i}", "entitlement": self.ent.pk}
             )
             self.assertEqual(r.status_code, 201, r.content)
             self.assertEqual(r.json()["entitlement"], self.ent.pk)
-        r = self.client.post("/api/categories/", {"name": "Sixth", "entitlement": self.ent.pk})
+        r = self.client.post("/api/categories/", {"name": "Eleventh", "entitlement": self.ent.pk})
         self.assertEqual(r.status_code, 403)
         payload = r.json()
         self.assertEqual(payload["code"], "quota_pack_categories")
-        self.assertEqual((payload["used"], payload["limit"]), (5, 5))
+        self.assertEqual((payload["used"], payload["limit"]), (10, 10))
         # Someone else's pack id → 400, no existence leak semantics needed.
         self.auth(self.creator)
         r = self.client.post("/api/categories/", {"name": "Steal", "entitlement": self.ent.pk})

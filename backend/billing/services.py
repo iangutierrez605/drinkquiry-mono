@@ -24,7 +24,6 @@ from .emails import (
     send_subscription_started,
 )
 from .models import (
-    BOUND_KINDS,
     Entitlement,
     Purchase,
     PurchaseStatus,
@@ -69,6 +68,87 @@ def process_event(event: dict) -> str:
 
 
 # --- checkout ----------------------------------------------------------------
+
+
+def _recover_purchase_from_metadata(session: dict) -> Purchase | None:
+    """§F4 (Handoff #19): rebuild a LOST pending Purchase from the session's
+    own metadata. Checkout stamps every session with drinkquiry_user_id +
+    product_key (+ reactivates for reactivation buys), and metadata arrives
+    inside the SIGNATURE-VERIFIED payload — it is trustworthy. A row can be
+    missing when the process died between Stripe accepting the session and
+    our DB commit; without recovery that sale could never fulfill. Foreign
+    sessions (Dashboard payment links, other products on the account) carry
+    none of our metadata and return None — the callers then SKIP with a 200
+    instead of 500ing into a forever-retry (C-4).
+
+    Race-safe: get_or_create on the unique session id (a concurrent event's
+    worker may have just rebuilt it), then returned RE-LOCKED via
+    _locked_purchase (select_for_update; house no-select_related rule)."""
+    metadata = session.get("metadata") or {}
+    session_id = str(session.get("id") or "")
+    user_id = str(metadata.get("drinkquiry_user_id") or "")
+    product_key = str(metadata.get("product_key") or "")
+    if not (session_id and user_id and product_key):
+        return None
+    entry = get_product(product_key)
+    if entry is None:
+        return None
+    from accounts.models import User  # lazy — the accounts↔billing convention
+
+    try:
+        user = User.objects.filter(pk=int(user_id)).first()
+    except (TypeError, ValueError):
+        user = None
+    if user is None:
+        return None
+    reactivates = None
+    if entry.get("reactivation_of"):
+        # A reactivation rebuilt WITHOUT a valid target could never fulfill
+        # (_fulfill_paid_purchase would ProcessingError forever) — treat an
+        # unresolvable target as unrecoverable and let the caller skip.
+        try:
+            ent_id = int(metadata.get("reactivates"))
+        except (TypeError, ValueError):
+            ent_id = None
+        if ent_id is not None:
+            reactivates = Entitlement.objects.filter(
+                pk=ent_id, user=user, kind=entry["reactivation_of"]
+            ).first()
+        if reactivates is None:
+            logger.warning(
+                "Session %s looks like ours (user=%s, product=%s) but its "
+                "reactivation target is unresolvable — not rebuilding.",
+                session_id, user.pk, product_key,
+            )
+            return None
+    Purchase.objects.get_or_create(
+        stripe_checkout_session_id=session_id,
+        defaults={
+            "user": user,
+            "product_key": product_key,
+            "reactivates": reactivates,
+            "metadata": {
+                "recovered_from_metadata": True,
+                **({"reactivates": reactivates.pk} if reactivates else {}),
+            },
+        },
+    )
+    logger.warning(
+        "Rebuilt the Purchase row for session %s from its signature-verified "
+        "metadata (user=%s, product=%s) — the pending row was lost before commit.",
+        session_id, user.pk, product_key,
+    )
+    return _locked_purchase(session_id)
+
+
+def _foreign_session_skip(session_id: str, event_label: str) -> str:
+    logger.warning(
+        "%s for unknown session %s with no Drinkquiry metadata — skipping. "
+        "Payment links don't grant anything; purchases must go through the "
+        "site's checkout so they attach to an account.",
+        event_label, session_id,
+    )
+    return "skipped"
 
 
 def _fulfill_paid_purchase(purchase: Purchase, session: dict) -> None:
@@ -119,27 +199,14 @@ def _fulfill_paid_purchase(purchase: Purchase, session: dict) -> None:
         if entry.get("window_days")
         else None,
     )
-    starter_name = None
-    if entry["kind"] in BOUND_KINDS:
-        # §F3: the bound starter category so the buyer lands in a ready
-        # editor. Private, never submittable (bound content stays private —
-        # serializer rule). Name collision with an existing live category is
-        # possible in principle; suffix until unique (bounded by the pack
-        # category cap, so this loop is tiny).
-        from trivia.models import Category
-
-        starter_name = f"{entry['display_name']} — {timezone.now():%b %d, %Y}"
-        name = starter_name
-        suffix = 2
-        while Category.objects.filter(
-            owner=purchase.user, name=name, deleted_at__isnull=True
-        ).exists():
-            name = f"{starter_name} ({suffix})"
-            suffix += 1
-        starter_name = name
-        Category.objects.create(owner=purchase.user, name=name, entitlement=entitlement)
+    # #19.1 (owner ruling): NO auto-created starter category. The #18
+    # starter solved a cold start that no longer exists — /create's
+    # category form now offers the pack lane directly (and the caps grew
+    # to 10/20), so buyers organize their own boards from question one.
+    # The confirmation email's no-category branch points them at /create.
     send_purchase_confirmation(
-        purchase.user, entry["display_name"], starter_name,
+        purchase.user, entry["display_name"], None,
+        guide_to_create=True,
         amount_total=purchase.amount_total, currency=purchase.currency,
         purchased_at=purchase.purchased_at,
         reference=purchase.stripe_payment_intent_id or "",
@@ -149,10 +216,17 @@ def _fulfill_paid_purchase(purchase: Purchase, session: dict) -> None:
 def _handle_checkout_completed(session: dict, created: int) -> str | None:
     mode = session.get("mode")
     session_id = str(session.get("id") or "")
+    # §F4 (#19): locked row → else rebuild from signature-verified metadata
+    # → else it's a FOREIGN sale (Dashboard payment link, another product on
+    # the same Stripe account): skip loudly with a 200. The old
+    # ProcessingError made Stripe retry a grant that can never happen,
+    # forever, on every payment-link sale (C-4).
     purchase = _locked_purchase(session_id)
+    if purchase is None:
+        purchase = _recover_purchase_from_metadata(session)
+    if purchase is None:
+        return _foreign_session_skip(session_id, "checkout.session.completed")
     if mode == "payment":
-        if purchase is None:
-            raise ProcessingError(f"checkout.session.completed for unknown session {session_id}")
         # Brief rule: grant only when actually PAID (async methods complete
         # later via async_payment_succeeded).
         if session.get("payment_status") == "paid":
@@ -165,9 +239,12 @@ def _handle_checkout_completed(session: dict, created: int) -> str | None:
 
 
 def _handle_async_payment_succeeded(session: dict, created: int) -> str | None:
-    purchase = _locked_purchase(str(session.get("id") or ""))
+    session_id = str(session.get("id") or "")
+    purchase = _locked_purchase(session_id)
     if purchase is None:
-        raise ProcessingError("async_payment_succeeded for unknown session")
+        purchase = _recover_purchase_from_metadata(session)  # §F4 (#19)
+    if purchase is None:
+        return _foreign_session_skip(session_id, "checkout.session.async_payment_succeeded")
     _fulfill_paid_purchase(purchase, session)
     return None
 
@@ -196,6 +273,9 @@ def _start_subscription(session: dict) -> None:
     the ongoing truth from here."""
     purchase = _locked_purchase(str(session.get("id") or ""))
     if purchase is None:
+        # §F4 (#19): unreachable in practice — _handle_checkout_completed
+        # recovers or skips BEFORE calling here. Kept as a guard so a future
+        # direct caller can't fulfill a session nobody owns.
         raise ProcessingError("subscription checkout completed for unknown session")
     entry = get_product(purchase.product_key)
     if entry is None or entry["mode"] != "subscription":

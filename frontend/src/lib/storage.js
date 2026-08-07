@@ -60,6 +60,11 @@ export function loadAuth() {
   }
 }
 export function clearAuth() {
+  // §F2 (#19): logout is the choke point — SiteNav's logout, api.js's
+  // dead-token drop and the pages' 401 handlers all route through here.
+  // Purging host seats here (not in each caller) is what closes the
+  // cross-account host-console leak.
+  clearHostSeats();
   localStorage.removeItem("dq_auth");
   announceAuthChange();
 }
@@ -86,12 +91,67 @@ export function saveAgeAck() {
 }
 
 // ---- Host's active game (for resume after reload) ----
-export function saveHostGame(code) {
-  localStorage.setItem("dq_host_game", code.toUpperCase());
+// §F2 (Handoff #19): the pointer is SCOPED to the account that made it.
+// The pre-#19 bare-string value was unscoped and never cleared on logout,
+// so on a shared browser user B's /host visit resumed user A's LIVE host
+// console (the cross-account leak, owner bug 2). Stored shape is now
+// {code, userId}; loadHostGame returns the code only when the CALLER's
+// userId matches. A legacy bare string (or an all-digit code that
+// JSON-parses as a number, or a userId-less object) cannot prove
+// ownership — removed on sight, so the first post-deploy load silently
+// drops old pointers (expected once; resume still works from /profile).
+export function saveHostGame(code, userId) {
+  localStorage.setItem(
+    "dq_host_game",
+    JSON.stringify({ code: code.toUpperCase(), userId: userId ?? null }),
+  );
 }
-export function loadHostGame() {
-  return localStorage.getItem("dq_host_game");
+export function loadHostGame(userId) {
+  const raw = localStorage.getItem("dq_host_game");
+  if (raw == null) return null;
+  let parsed = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    parsed = null; // legacy bare-string code — not valid JSON
+  }
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    typeof parsed.code !== "string" ||
+    parsed.userId == null
+  ) {
+    localStorage.removeItem("dq_host_game");
+    return null;
+  }
+  return userId != null && parsed.userId === userId ? parsed.code : null;
 }
 export function clearHostGame() {
+  localStorage.removeItem("dq_host_game");
+}
+
+// §F2 (Handoff #19): logout must not leave the HOST's seat tokens behind —
+// they authenticate the game surface by design, so a later login by a
+// DIFFERENT account in the same browser could operate the first account's
+// console. Purge every host-ROLE seat (+ its bare-token twin) and the
+// active-game pointer. Player seats and unparseable legacy entries stay
+// (C-2: someone logged out of a host account may still be playing as a
+// player in another tab of this browser).
+export function clearHostSeats() {
+  const doomed = [];
+  for (let i = 0; i < localStorage.length; i += 1) {
+    const key = localStorage.key(i);
+    if (!key || !key.startsWith("dq_seat_")) continue;
+    try {
+      const seat = JSON.parse(localStorage.getItem(key));
+      if (seat && seat.role === "host") doomed.push(key);
+    } catch {
+      /* unparseable legacy entry — leave it (C-2) */
+    }
+  }
+  for (const key of doomed) {
+    localStorage.removeItem(key);
+    localStorage.removeItem(`dq_token_${key.slice("dq_seat_".length)}`);
+  }
   localStorage.removeItem("dq_host_game");
 }

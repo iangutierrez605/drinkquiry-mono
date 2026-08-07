@@ -1732,7 +1732,9 @@ class TournamentQuotaTests(TournamentTestBase):
         self.client.force_authenticate(self.rival)  # plain free account
         res = self.client.post("/api/tournaments/", {"name": "Nope"}, format="json")
         self.assert_quota_403(res, used=0, limit=0)
-        self.assertIn("creator", res.json()["detail"])  # the upsell copy
+        # §F3(d) (#19): the upsell copy now sells the lanes that exist
+        # (packs/Venue), not the retired "creator account" phrasing.
+        self.assertIn("Venue plan", res.json()["detail"])
 
     def test_expired_creator_plan_collapses_to_free(self):
         self.host.plan_expires_at = timezone.now() - timedelta(days=1)

@@ -130,9 +130,10 @@ class GameStateSerializer(serializers.ModelSerializer):
     # stays a dumb render of server state (rule 1) instead of a hardcoded 6.
     max_players = serializers.SerializerMethodField()
     # §H (Handoff #11): venue branding — {"name", "logo"} from the HOST's
-    # profile, or null. Served ONLY while the host's EFFECTIVE plan is
-    # creator (a lapsed plan turns branding off without destroying the
-    # upload) and something is actually set. A snapshot field, so the TV
+    # profile, or null. Served while the host holds an active branding lane
+    # (manual creator plan OR an active venue-kind entitlement — §F3(d),
+    # Handoff #19; a lapse of both turns branding off without destroying
+    # the upload) and something is actually set. A snapshot field, so the TV
     # lobby, the in-play header and the buzzer join line all get it over
     # BOTH transports for free (C2). Every snapshot caller select_related's
     # "host" (checked for N+1 like cells_remaining was).
@@ -193,12 +194,21 @@ class GameStateSerializer(serializers.ModelSerializer):
 
     def get_brand(self, game):
         host = game.host
-        if not host.is_creator:  # effective plan — expiry collapses to free
-            return None
         name = host.brand_name or None
         logo = host.brand_logo or None
         if name is None and logo is None:
-            return None
+            return None  # nothing set — the common case costs zero extra queries
+        # §F3(d) (Handoff #19): plan alone is wrong for buyers (§A.1) — the
+        # Venue promise is "your branding on every screen", and Venue buyers
+        # stay plan:"free". Serve for a manual creator OR an ACTIVE
+        # venue-kind entitlement; a lapse of BOTH lanes turns branding off
+        # without destroying the upload, exactly as before. The entitlement
+        # lookup only runs for non-creator hosts who actually SET branding.
+        if not host.is_creator:
+            from billing.access import venue_active
+
+            if not venue_active(host):
+                return None
         url = None
         if logo:
             url = logo.url

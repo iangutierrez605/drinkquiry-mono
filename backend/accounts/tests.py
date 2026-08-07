@@ -735,7 +735,8 @@ class BrandingTests(QuotaTestBase):
         self.auth(self.free)
         res = self.patch_profile({"brand_name": "SNEAKY"})
         self.assertEqual(res.status_code, 403)
-        self.assertEqual(res.json(), {"detail": "Branding is part of the creator plan."})
+        # §F3(d) (#19): copy names the lane that actually sells branding.
+        self.assertEqual(res.json(), {"detail": "Branding is part of the Venue plan."})
         res = self.patch_profile({"brand_logo": brand_png()})
         self.assertEqual(res.status_code, 403)
         # Reads are fine — and a brand-free PATCH still works for free users.
@@ -791,6 +792,31 @@ class BrandingTests(QuotaTestBase):
         # A free host's game never carries a brand.
         free_game = self.make_game(self.free)
         self.assertIsNone(self.snapshot(free_game)["brand"])
+
+    def test_venue_entitlement_writes_and_serves_branding(self):
+        # §F3(d) (Handoff #19): plan ≠ capability (§A.1) — a Venue buyer
+        # stays plan:"free" forever, but the Venue promise is "your branding
+        # on every screen". Both server gates (ProfileView write, snapshot
+        # serve) honor an ACTIVE venue-kind entitlement; a lapse turns both
+        # off again with the upload kept — the manual-plan precedent.
+        from billing.models import Entitlement, EntitlementKind, Purchase
+
+        purchase = Purchase.objects.create(user=self.free, product_key="venue_monthly")
+        ent = Entitlement.objects.create(
+            user=self.free, kind=EntitlementKind.VENUE, source_purchase=purchase
+        )
+        self.auth(self.free)
+        res = self.patch_profile({"brand_name": "THE FREEHOUSE"})
+        self.assertEqual(res.status_code, 200, res.content)
+        game = self.make_game(self.free)
+        self.assertEqual(self.snapshot(game)["brand"], {"name": "THE FREEHOUSE", "logo": None})
+        # Lapse the entitlement → serving stops, writes re-403, field persists.
+        ent.active_until = timezone.now() - timedelta(days=1)
+        ent.save(update_fields=["active_until"])
+        self.assertIsNone(self.snapshot(game)["brand"])
+        self.assertEqual(self.patch_profile({"brand_name": "CHANGED"}).status_code, 403)
+        self.free.refresh_from_db()
+        self.assertEqual(self.free.brand_name, "THE FREEHOUSE")
 
     def test_plan_lapse_hides_brand_but_fields_persist(self):
         self.auth(self.paid)

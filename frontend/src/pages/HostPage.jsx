@@ -46,8 +46,22 @@ export async function resumeHostGame(authToken, code) {
     role: "host",
   };
   saveSeat(code, seat);
-  saveHostGame(code);
+  // §F2 (#19): the owner-only host-seat endpoint just SUCCEEDED, which
+  // proves the current Knox user is this game's host — stamp the pointer
+  // with that identity so deriveActive honors it.
+  saveHostGame(code, loadAuth()?.user?.id);
   return { code: code.toUpperCase(), token: seat.token };
+}
+
+// §F2 (#19): the active console is derived from the CURRENT auth — the
+// pointer only counts when it was stamped by this very account. Same-browser
+// account switches (logout/login OR an in-place dq_auth overwrite from
+// another tab) can therefore never surface another account's console.
+function deriveActive(auth) {
+  const code = loadHostGame(auth?.user?.id);
+  if (!code) return null;
+  const seat = loadSeat(code);
+  return seat?.token ? { code, token: seat.token } : null;
 }
 
 export default function HostPage() {
@@ -55,13 +69,16 @@ export default function HostPage() {
   // §F: the SiteNav's logout (or a dead Knox token dropped by api.js) clears
   // dq_auth and announces — flip straight back to the login screen.
   useEffect(() => onAuthChange(() => setAuth(loadAuth())), []);
-  // active = {code, token} once a game is created or resumed
-  const [active, setActive] = useState(() => {
-    const code = loadHostGame();
-    if (!code) return null;
-    const seat = loadSeat(code);
-    return seat?.token ? { code, token: seat.token } : null;
-  });
+  // active = {code, token} once a game is created or resumed. §F2 (#19):
+  // derived from the CURRENT auth (see deriveActive above) and RE-derived
+  // whenever the signed-in account changes — an in-place account switch can
+  // never keep a stale console on screen.
+  const [active, setActive] = useState(() => deriveActive(auth));
+  useEffect(() => {
+    setActive(deriveActive(auth));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on the
+    // account identity; deriveActive reads nothing else from auth.
+  }, [auth?.user?.id]);
   // #13 fix: arriving with ?tournament= is an explicit "create ANOTHER
   // game" intent — a tournament runs many games, so the stored active game
   // must not gate the create screen (it used to: after game 1, "+ game in
@@ -98,7 +115,7 @@ export default function HostPage() {
             navigate(`/tournaments/${tournamentId}`);
             return;
           }
-          saveHostGame(code);
+          saveHostGame(code, auth.user?.id); // §F2 (#19): pointer is account-scoped
           clearParams();
           setActive({ code, token });
         }}

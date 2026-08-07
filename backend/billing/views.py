@@ -151,6 +151,10 @@ class CheckoutView(APIView):
                         "drinkquiry_user_id": str(request.user.id),
                         "product_key": key,
                         "purchase_type": entry["mode"],
+                        # §F4(d) (#19): a lost-row REACTIVATION must be
+                        # rebuildable from metadata alone (services.py's
+                        # _recover_purchase_from_metadata).
+                        **({"reactivates": str(reactivates.pk)} if reactivates else {}),
                     },
                     idempotency_key=f"dq-checkout-{purchase.pk}",
                 )

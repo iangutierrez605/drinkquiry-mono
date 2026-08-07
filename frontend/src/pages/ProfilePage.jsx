@@ -369,15 +369,24 @@ function BrandingPanel({ token, profile, onSaved, onToast }) {
   const [file, setFile] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
-  const isCreator = profile.plan !== "free";
+  // §F3(c) (#19): plan ≠ capability (§A.1) — the Venue promise is "your
+  // branding on every screen", and Venue buyers stay plan:"free" forever.
+  // Widened to: manual paid plan OR any ACTIVE venue-kind entitlement
+  // (packs don't include branding). Mirrors the server gate exactly
+  // (ProfileView write + snapshot serve, both widened this handoff).
+  const canBrand =
+    profile.plan !== "free" ||
+    (profile.usage?.entitlements || []).some(
+      (e) => e.is_active && (e.kind === "venue" || e.kind === "venue_tournament"),
+    );
 
-  if (!isCreator)
+  if (!canBrand)
     return (
       <section className="panel panel--center upsell">
         <span className="upsell__emoji">🏷️</span>
         <p>
-          <strong>Brand your games.</strong> Venues on the creator plan put their name and logo on
-          the TV, the lobby and every buzzer — ask an admin about the venue package.
+          <strong>Brand your games.</strong> The Venue plan puts your name and logo on the TV, the
+          lobby and every buzzer — see the Pricing page.
         </p>
       </section>
     );

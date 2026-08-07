@@ -28,6 +28,7 @@ from .models import (
     Purchase,
     PurchaseStatus,
     StripeEvent,
+    StripeEventStatus,
     Subscription,
 )
 
@@ -324,7 +325,11 @@ class WebhookSignatureTests(Base):
 
 @override_settings(**BILLING_ON)
 class FulfillmentTests(Base):
-    def test_paid_checkout_grants_pack_with_starter_category(self):
+    def test_paid_checkout_grants_pack_without_auto_category(self):
+        # #19.1 (owner ruling): fulfillment grants the ENTITLEMENT only —
+        # no auto-created starter category. Buyers make their own via the
+        # pack lane on /create (now surfaced in the category form); the
+        # email's guidance line points them there.
         purchase = self.make_purchase()
         body = event_body("evt_f1", "checkout.session.completed", self.completed_session())
         self.assertEqual(self.hook(body).status_code, 200)
@@ -339,12 +344,11 @@ class FulfillmentTests(Base):
         self.assertAlmostEqual(
             (ent.active_until - ent.active_from).days, 30, delta=1
         )
-        starter = Category.objects.get(entitlement=ent)
-        self.assertEqual(starter.owner, self.user)
-        self.assertEqual(starter.visibility, "private")
+        self.assertEqual(Category.objects.count(), 0)
         self.assertEqual(len(mail.outbox), 1)
         self.assertIn("Party Game", mail.outbox[0].subject)
-        self.assertIn(starter.name, mail.outbox[0].body)
+        self.assertNotIn("starter category", mail.outbox[0].body)
+        self.assertIn("Your content", mail.outbox[0].body)
         # Owner ruling: the app IS the receipt — money facts ride the email.
         self.assertIn("$9.99 USD", mail.outbox[0].body)
         self.assertIn("pi_test_1", mail.outbox[0].body)
@@ -501,14 +505,16 @@ class FulfillmentTests(Base):
             )
         )
         ent2 = Entitlement.objects.get(source_purchase=p2)
-        starter2 = Category.objects.get(entitlement=ent2)
+        # #19.1: no auto starter — the "used pack" fixture makes its own
+        # bound category, exactly as a real buyer now does via /create.
+        bound2 = Category.objects.create(owner=self.user, name="Round 1", entitlement=ent2)
         Question.objects.create(owner=self.user, question_text="Q?", answer="A").categories.set(
-            [starter2]
+            [bound2]
         )
         from games.services import create_game
 
         create_game(
-            host=self.user, mode="drinks", category_ids=[starter2.pk], questions_per_category=1
+            host=self.user, mode="drinks", category_ids=[bound2.pk], questions_per_category=1
         )
         self.hook(event_body("evt_d2", "charge.dispute.created", {"payment_intent": "pi_2"}))
         ent2.refresh_from_db()
@@ -540,6 +546,115 @@ class FulfillmentTests(Base):
         self.assertEqual(re_purchase.status, PurchaseStatus.PAID)
         # No NEW entitlement was minted.
         self.assertEqual(Entitlement.objects.count(), 1)
+
+
+class StripeEventAdminRetryTests(Base):
+    def test_retry_failed_processes_and_grants_idempotently(self):
+        # §F6 (Handoff #19): a valid stored payload whose first processing
+        # "crashed" (row marked failed) retries to a grant; a SECOND retry
+        # of the same payload grants nothing twice (handler idempotence).
+        from unittest.mock import MagicMock, patch
+
+        from django.contrib import admin as dj_admin
+
+        from .admin import StripeEventAdmin
+
+        self.make_purchase()
+        payload = json.loads(
+            event_body("evt_retry1", "checkout.session.completed", self.completed_session())
+        )
+        record = StripeEvent.objects.create(
+            stripe_event_id="evt_retry1",
+            event_type="checkout.session.completed",
+            status=StripeEventStatus.FAILED,
+            error="simulated crash",
+            payload=payload,
+        )
+        # An already-processed row rides along to prove the failed-only guard.
+        bystander = StripeEvent.objects.create(
+            stripe_event_id="evt_retry2",
+            event_type="checkout.session.completed",
+            status=StripeEventStatus.PROCESSED,
+            payload=payload,
+        )
+        model_admin = StripeEventAdmin(StripeEvent, dj_admin.site)
+        with patch.object(StripeEventAdmin, "message_user") as message_user:
+            model_admin.retry_failed(MagicMock(), StripeEvent.objects.all())
+        record.refresh_from_db()
+        self.assertEqual(record.status, StripeEventStatus.PROCESSED)
+        self.assertEqual(record.error, "")
+        self.assertIsNotNone(record.processed_at)
+        bystander.refresh_from_db()  # guard: non-failed rows untouched
+        self.assertIsNone(bystander.processed_at)
+        self.assertEqual(Entitlement.objects.count(), 1)
+        message_user.assert_called_once()
+        # Round two: re-mark failed, retry again → still exactly one grant.
+        record.status = StripeEventStatus.FAILED
+        record.save(update_fields=["status"])
+        with patch.object(StripeEventAdmin, "message_user"):
+            model_admin.retry_failed(MagicMock(), StripeEvent.objects.all())
+        self.assertEqual(Entitlement.objects.count(), 1)
+        self.assertEqual(
+            Purchase.objects.get(stripe_checkout_session_id="cs_test_1").status,
+            PurchaseStatus.PAID,
+        )
+
+
+@override_settings(**BILLING_ON)
+class ForeignSessionTests(Base):
+    """§F4 (Handoff #19): the webhook must never 500 on sessions it can't
+    own. Foreign sessions (Dashboard payment links — no Drinkquiry
+    metadata) SKIP with a 200 so Stripe stops retrying a grant that can
+    never happen; sessions WITH our metadata but a lost pending row are
+    rebuilt from the signature-verified metadata and fulfilled."""
+
+    def test_foreign_completed_session_skips_with_200(self):
+        # The not-a-500 assertion is the point: pre-#19 an unknown session
+        # raised ProcessingError → 500 → Stripe retried forever on every
+        # payment-link sale.
+        body = event_body("evt_fs1", "checkout.session.completed", self.completed_session())
+        res = self.hook(body)
+        self.assertEqual(res.status_code, 200, res.content)
+        record = StripeEvent.objects.get(stripe_event_id="evt_fs1")
+        self.assertEqual(record.status, StripeEventStatus.SKIPPED)
+        self.assertEqual(Purchase.objects.count(), 0)
+        self.assertEqual(Entitlement.objects.count(), 0)
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_our_metadata_rebuilds_and_fulfills(self):
+        # Process death between Stripe accepting the session and our commit:
+        # no pending row, but the session carries our signature-verified
+        # metadata — the row is rebuilt and the grant lands exactly once.
+        session = self.completed_session(
+            metadata={
+                "drinkquiry_user_id": str(self.user.id),
+                "product_key": "party_game_50",
+                "purchase_type": "payment",
+            }
+        )
+        body = event_body("evt_fs2", "checkout.session.completed", session)
+        self.assertEqual(self.hook(body).status_code, 200)
+        record = StripeEvent.objects.get(stripe_event_id="evt_fs2")
+        self.assertEqual(record.status, StripeEventStatus.PROCESSED)
+        purchase = Purchase.objects.get(stripe_checkout_session_id="cs_test_1")
+        self.assertEqual(purchase.user, self.user)
+        self.assertEqual(purchase.status, PurchaseStatus.PAID)
+        self.assertTrue(purchase.metadata.get("recovered_from_metadata"))
+        ent = Entitlement.objects.get(source_purchase=purchase)
+        self.assertEqual(ent.kind, EntitlementKind.PARTY_PACK)
+        self.assertEqual(Category.objects.count(), 0)  # #19.1: no auto category
+        self.assertEqual(len(mail.outbox), 1)  # the one confirmation — nothing doubled
+
+    def test_foreign_subscription_session_skips(self):
+        session = self.completed_session(mode="subscription", subscription="sub_foreign_1")
+        body = event_body("evt_fs3", "checkout.session.completed", session)
+        self.assertEqual(self.hook(body).status_code, 200)
+        self.assertEqual(
+            StripeEvent.objects.get(stripe_event_id="evt_fs3").status,
+            StripeEventStatus.SKIPPED,
+        )
+        self.assertEqual(Subscription.objects.count(), 0)
+        self.assertEqual(Entitlement.objects.count(), 0)
 
 
 @override_settings(**BILLING_ON)

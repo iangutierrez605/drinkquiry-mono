@@ -277,7 +277,12 @@ def _denial(user, kind: str, count: int) -> dict | None:
         return None
     noun = KINDS[kind]
     if limit == 0:
-        detail = f"Your plan doesn't include {noun.replace(' this month', '')}. Upgrade to a creator account to unlock this."
+        # §F3(d) (#19): "upgrade to a creator account" sold a lane nobody
+        # can buy — packs and the Venue plan are what's for sale.
+        detail = (
+            f"Your plan doesn't include {noun.replace(' this month', '')}. "
+            "A game pack or the Venue plan unlocks this — see the pricing page."
+        )
     elif count > 1:
         detail = f"This batch of {count} would put you past your plan's limit of {limit} {noun} ({used} used)."
     else:
@@ -319,7 +324,11 @@ def _storage_denial(user, incoming_bytes: int) -> dict | None:
     if used + incoming_bytes <= limit:
         return None
     if limit == 0:
-        detail = "Your plan doesn't include media storage. Upgrade to a creator account to unlock this."
+        # §F3(d) (#19): same stale-lane fix as _denial's zero-limit copy.
+        detail = (
+            "Your plan doesn't include media storage. "
+            "A game pack or the Venue plan unlocks this — see the pricing page."
+        )
     else:
         detail = (
             f"This upload adds {_mb(incoming_bytes)} of media but you've used "

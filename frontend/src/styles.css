@@ -1546,3 +1546,16 @@ code { font-family: var(--font-mono); color: var(--accent); font-size: 0.9em; }
 
 /* --- tournaments upsell CTA row (#18 copy swap) --- */
 .upsell__actions { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-top: 6px; }
+
+/* ---------- Handoff #19 ---------- */
+
+/* --- pack-lane surfacing on /create (§F5) --- */
+.packstrip {
+  display: flex; flex-wrap: wrap; gap: 6px 18px;
+  background: var(--ink-3); border: 1px solid var(--line); border-radius: 12px;
+  padding: 10px 14px; margin-bottom: 14px;
+}
+.packstrip__item { font-size: 14px; color: var(--dim); }
+.packstrip__item strong { color: var(--accent); font-weight: 600; }
+.packhint { font-size: 13px; color: var(--dim); margin: -4px 0 10px; }
+.badge--pack { color: var(--accent); border-color: var(--accent); margin-left: 8px; }

@@ -78,14 +78,17 @@ export default function CategoryPicker({
   }, [auth.token, params]);
 
   const toggle = (cat) => {
+    // §F5 (#19): `entitlement` rides along (additive) so consumers can
+    // pack-hint a selection without refetching; id/name stay the contract.
+    const entry = { id: cat.id, name: cat.name, entitlement: cat.entitlement ?? null };
     if (single) {
       // Replace-not-accumulate: the swap picker holds at most one choice.
-      onChange(value.has(cat.id) ? new Map() : new Map([[cat.id, { id: cat.id, name: cat.name }]]));
+      onChange(value.has(cat.id) ? new Map() : new Map([[cat.id, entry]]));
       return;
     }
     const next = new Map(value);
     if (next.has(cat.id)) next.delete(cat.id);
-    else next.set(cat.id, { id: cat.id, name: cat.name });
+    else next.set(cat.id, entry);
     onChange(next);
   };
 

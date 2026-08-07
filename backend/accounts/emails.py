@@ -83,6 +83,11 @@ def send_moderation_outcome_email(item, *, approved: bool, actor) -> None:
     (delegated default; remove the `else` branch to send approvals only).
     """
     owner = item.owner
+    # actor == owner: #19: deliberate — the solo-staff owner approving
+    # their own test content lands here; see HANDOFF #19 §F1. (C-1: staff
+    # authoring under their own account shouldn't self-spam. If
+    # self-approval mail is ever wanted, delete the actor clause — one
+    # line — and drop trivia's test_self_approval_sends_nothing pin.)
     if owner is None or (actor is not None and getattr(actor, "pk", None) == owner.pk):
         return
     kind = "question" if hasattr(item, "question_text") else "category"

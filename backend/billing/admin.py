@@ -1,4 +1,5 @@
 from django.contrib import admin
+from django.utils import timezone
 
 from .models import (
     BillingAccount,
@@ -6,6 +7,7 @@ from .models import (
     Entitlement,
     Purchase,
     StripeEvent,
+    StripeEventStatus,
     Subscription,
 )
 
@@ -18,6 +20,45 @@ class StripeEventAdmin(admin.ModelAdmin):
     list_display = ("stripe_event_id", "event_type", "status", "received_at", "processed_at")
     list_filter = ("status", "event_type")
     search_fields = ("stripe_event_id",)
+    actions = ("retry_failed",)
+
+    @admin.action(description="Retry processing — failed rows only")
+    def retry_failed(self, request, queryset):
+        """§F6 (Handoff #19): re-run the processor on the STORED plain-JSON
+        payload — it exists precisely for this (no Stripe round trip).
+        Bookkeeping mirrors the webhook view exactly (processed/skipped on
+        success + processed_at; failed + error on another failure); every
+        handler is idempotent, so retrying a half-succeeded event grants
+        nothing twice. Non-failed rows are silently skipped (C-6 guard)."""
+        from .services import ProcessingError, process_event
+
+        retried = succeeded = 0
+        for event in queryset.filter(status=StripeEventStatus.FAILED):
+            retried += 1
+            try:
+                outcome = process_event(event.payload)
+            except ProcessingError as exc:
+                event.status = StripeEventStatus.FAILED
+                event.error = str(exc)
+                event.save(update_fields=["status", "error"])
+                continue
+            except Exception as exc:  # noqa: BLE001 — recorded, same as the view
+                event.status = StripeEventStatus.FAILED
+                event.error = repr(exc)
+                event.save(update_fields=["status", "error"])
+                continue
+            event.status = (
+                StripeEventStatus.SKIPPED if outcome == "skipped" else StripeEventStatus.PROCESSED
+            )
+            event.error = ""  # a stale error under a green status would mislead
+            event.processed_at = timezone.now()
+            event.save(update_fields=["status", "error", "processed_at"])
+            succeeded += 1
+        self.message_user(
+            request,
+            f"Retried {retried} failed event(s): {succeeded} now processed/skipped, "
+            f"{retried - succeeded} still failed.",
+        )
 
 
 @admin.register(Purchase)

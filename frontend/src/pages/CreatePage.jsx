@@ -8,9 +8,13 @@ import { Toast, UsageMeterLine } from "../components/shared";
 /**
  * /create — creator content management.
  *
- * Gated on profile.plan !== "free" (the server reports the *effective* plan,
- * so an expired paid plan already reads as "free" — no expiry math here).
- * Admin sets the plan by hand; Stripe writes the same field later.
+ * Gated on CAPABILITY, not plan (§F3, Handoff #19). plan ≠ capability
+ * (§A.1): Stripe writes ENTITLEMENTS, never `plan` (#18 ruling — the
+ * manual/ops lane and the billing lane must never fight), so every buyer
+ * stays plan:"free" forever and a plan-only read locks out every paying
+ * customer. The door opens for a manual paid plan, ANY entitlement (active
+ * OR lapsed — lapsed buyers must still see their kept-safe content; C-3),
+ * or a §J1 limit override. The server chokes stay the truth.
  * Two forms (category, question) posting multipart FormData, plus a
  * "my content" list with moderation badges and owner-only edit/delete.
  * Quotas are enforced server-side; the meters here are cosmetic.
@@ -24,6 +28,23 @@ const MB = (bytes) => `${Math.round(bytes / 1024 / 1024)} MB`;
 // §F3: storage meter values are bytes; format them where the entries are
 // built (this file / ProfilePage), never inside the shared UsageMeterLine.
 const fmtMB = (bytes) => `${Math.round((bytes / 1024 / 1024) * 10) / 10} MB`;
+
+// §F5 (#19): entitlement-kind display labels + days-left, duplicated from
+// ProfilePage/ManageUsersPage (the existing house precedent — three tiny
+// copies beat a new shared module mid-handoff; noted in CHANGES).
+const KIND_LABELS = {
+  party_pack: "Party Game",
+  big_pack: "Big Game",
+  venue: "Venue",
+  tournament_pass: "Tournament Pass",
+  venue_tournament: "Venue Tournament",
+};
+
+function daysLeft(iso) {
+  if (!iso) return null;
+  const ms = new Date(iso).getTime() - Date.now();
+  return Math.max(0, Math.ceil(ms / 86400000));
+}
 
 export default function CreatePage() {
   const [auth, setAuth] = useState(loadAuth());
@@ -52,6 +73,17 @@ export default function CreatePage() {
     };
   }, [auth]);
 
+  // §F5 (#19): pack budgets live in profile.usage.entitlements — refetch
+  // after authoring changes so the meter strip moves (the §F3 owner
+  // retest: "its budget meter moves"). Silent-fail: cosmetic meters only.
+  const refreshProfile = useCallback(() => {
+    if (!auth) return;
+    api
+      .profile(auth.token)
+      .then(setProfile)
+      .catch(() => {});
+  }, [auth]);
+
   if (!auth)
     return (
       <Shell>
@@ -78,24 +110,42 @@ export default function CreatePage() {
       </Shell>
     );
 
-  if (profile.plan === "free")
+  // §F3 (#19): any capability lane opens the workspace — manual plan,
+  // entitlements (active OR lapsed, C-3: writes on lapsed packs 403
+  // informatively server-side with pack_inactive), or §J1 overrides
+  // raising the free plan's 0-limits. Locked-out is ONLY no-plan,
+  // no-entitlement-ever, no-overrides.
+  const usage = profile.usage || {};
+  const openLimit = (block) => !!block && (block.limit === null || block.limit > 0);
+  const canEnter =
+    profile.plan !== "free" ||
+    (usage.entitlements?.length ?? 0) > 0 ||
+    openLimit(usage.questions) ||
+    openLimit(usage.categories);
+
+  if (!canEnter)
     return (
       <Shell user={profile} token={auth.token}>
         <section className="panel panel--center upsell">
           <span className="upsell__emoji">🔒</span>
           <h2 className="h2">Creating custom content is a paid feature</h2>
           <p className="footnote">
-            Coming soon. For now, an admin can enable creator access on your account — everything else about
-            hosting games works without it.
+            Grab a game pack or the Venue plan to build your own categories and questions — hosting
+            from the free library needs no plan at all.
           </p>
-          <Link className="btn btn--ghost" to="/host">
-            Back to hosting
-          </Link>
+          <div className="upsell__actions">
+            <Link className="btn btn--primary" to="/pricing">
+              See packs &amp; plans
+            </Link>
+            <Link className="btn btn--ghost" to="/host">
+              Back to hosting
+            </Link>
+          </div>
         </section>
       </Shell>
     );
 
-  return <CreatorWorkspace auth={auth} profile={profile} />;
+  return <CreatorWorkspace auth={auth} profile={profile} onUsageChanged={refreshProfile} />;
 }
 
 function Shell({ user, token, children }) {
@@ -150,33 +200,84 @@ function useMinePager(auth, kind) {
   return { rows, count, hasNext, error, more, refresh };
 }
 
-function CreatorWorkspace({ auth, profile }) {
+function CreatorWorkspace({ auth, profile, onUsageChanged }) {
   const [toast, setToast] = useState(null);
   const ownCats = useMinePager(auth, "categories");
   const ownQs = useMinePager(auth, "questions");
   const loadError = ownCats.error || ownQs.error;
+  const entitlements = profile.usage?.entitlements || [];
 
   const refreshCats = ownCats.refresh;
   const refreshQs = ownQs.refresh;
   const refresh = useCallback(() => {
     refreshCats();
     refreshQs();
-  }, [refreshCats, refreshQs]);
+    onUsageChanged(); // §F5 (#19): pack budgets ride the profile
+  }, [refreshCats, refreshQs, onUsageChanged]);
 
   return (
     <Shell user={profile} token={auth.token}>
       {loadError && <p className="formerror formerror--block">{loadError}</p>}
 
+      <PackMeterStrip entitlements={entitlements} />
       <UsageMeters ownCats={ownCats} ownQs={ownQs} usage={profile.usage} />
 
-      <CategoryForm auth={auth} onSaved={refresh} onToast={setToast} />
-      <QuestionForm auth={auth} onSaved={refresh} onToast={setToast} />
+      <CategoryForm
+        auth={auth}
+        entitlements={entitlements}
+        accountOpen={
+          !!profile.usage?.categories &&
+          (profile.usage.categories.limit === null || profile.usage.categories.limit > 0)
+        }
+        onSaved={refresh}
+        onToast={setToast}
+      />
+      <QuestionForm auth={auth} entitlements={entitlements} onSaved={refresh} onToast={setToast} />
       <BulkUpload auth={auth} isStaff={!!profile.is_staff} onImported={refresh} onToast={setToast} />
 
-      <MyContent auth={auth} ownCats={ownCats} ownQs={ownQs} onChanged={refresh} onToast={setToast} />
+      <MyContent
+        auth={auth}
+        ownCats={ownCats}
+        ownQs={ownQs}
+        entitlements={entitlements}
+        onChanged={refresh}
+        onToast={setToast}
+      />
 
       <Toast message={toast} tone="info" onDone={() => setToast(null)} />
     </Shell>
+  );
+}
+
+/* ---------------- Pack meter strip (§F5, Handoff #19) ---------------- */
+
+/**
+ * "Your pack lives HERE, with THIS budget" — one line per ACTIVE
+ * entitlement from profile.usage.entitlements (packs: budget + days left;
+ * venue: active-question meter). Cosmetic only: the server chokes stay the
+ * truth, these numbers just stop a buyer wondering where their purchase
+ * went (the owner's own bug-3 confusion is the spec).
+ */
+function PackMeterStrip({ entitlements }) {
+  const active = (entitlements || []).filter((e) => e.is_active);
+  if (!active.length) return null;
+  return (
+    <div className="packstrip">
+      {active.map((e) => {
+        const bits = [];
+        if (e.question_limit != null) bits.push(`${e.questions_used}/${e.question_limit} questions`);
+        if (e.active_questions)
+          bits.push(`${e.active_questions.used}/${e.active_questions.limit} active questions`);
+        const left = daysLeft(e.active_until);
+        if (left != null) bits.push(`${left} day${left === 1 ? "" : "s"} left`);
+        return (
+          <span key={e.id} className="packstrip__item">
+            <strong>{KIND_LABELS[e.kind] || e.kind}</strong>
+            {bits.length ? ` — ${bits.join(" · ")}` : ""}
+          </span>
+        );
+      })}
+    </div>
   );
 }
 
@@ -208,11 +309,21 @@ function UsageMeters({ ownCats, ownQs, usage }) {
 
 /* ---------------- Category form ---------------- */
 
-function CategoryForm({ auth, onSaved, onToast }) {
+function CategoryForm({ auth, entitlements, accountOpen, onSaved, onToast }) {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [photo, setPhoto] = useState(null);
   const [visibility, setVisibility] = useState("private");
+  // #19.1: WHERE the category lives — "account" or a pack entitlement id.
+  // The backend has taken `entitlement: <id>` since #18; this form just
+  // never offered it, which left pure pack buyers (account lane = 0) with
+  // nowhere to create — the owner's exact report. Bound kinds are the
+  // rows with a question budget; venue rows are account-scoped already.
+  const packs = (entitlements || []).filter((e) => e.is_active && e.question_limit != null);
+  const [home, setHome] = useState(() =>
+    accountOpen || !packs.length ? "account" : String(packs[0].id),
+  );
+  const packHome = home !== "account";
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
 
@@ -229,19 +340,30 @@ function CategoryForm({ auth, onSaved, onToast }) {
       fd.append("name", name.trim());
       if (description.trim()) fd.append("description", description.trim());
       if (photo) fd.append("photo", photo);
-      fd.append("visibility", visibility);
+      if (packHome) {
+        // Bound categories are private by definition (serializer rule);
+        // sending no visibility lets the server default stand.
+        fd.append("entitlement", home);
+      } else {
+        fd.append("visibility", visibility);
+      }
       const created = await api.createCategory(auth.token, fd);
+      const packLabel = packHome
+        ? KIND_LABELS[packs.find((p) => String(p.id) === home)?.kind] || "pack"
+        : null;
       onToast(
-        created.visibility === "public"
-          ? `“${created.name}” created — awaiting moderation before others can use it.`
-          : `“${created.name}” created — private, usable in your games right away.`,
+        packHome
+          ? `“${created.name}” created inside your ${packLabel} pack — questions there use its budget.`
+          : created.visibility === "public"
+            ? `“${created.name}” created — awaiting moderation before others can use it.`
+            : `“${created.name}” created — private, usable in your games right away.`,
       );
       setName("");
       setDescription("");
       setPhoto(null);
       onSaved();
     } catch (err) {
-      setError(quotaMessage(err) ?? (err instanceof ApiError && err.status === 403 ? UPSELL_403 : errorText(err)));
+      setError(forbidden(err));
     } finally {
       setBusy(false);
     }
@@ -251,6 +373,23 @@ function CategoryForm({ auth, onSaved, onToast }) {
     <section className="panel">
       <h2 className="h2">New category</h2>
       <form onSubmit={submit}>
+        {packs.length > 0 && (
+          <label className="field">
+            Where does this category live?
+            <select value={home} onChange={(e) => setHome(e.target.value)}>
+              <option value="account">My library (account plan)</option>
+              {packs.map((p) => {
+                const left = daysLeft(p.active_until);
+                return (
+                  <option key={p.id} value={String(p.id)}>
+                    {KIND_LABELS[p.kind] || p.kind} pack
+                    {left != null ? ` · ${left} day${left === 1 ? "" : "s"} left` : ""}
+                  </option>
+                );
+              })}
+            </select>
+          </label>
+        )}
         <label className="field">
           Name
           <input value={name} onChange={(e) => setName(e.target.value)} required maxLength={100} placeholder="e.g. 90s One-Hit Wonders" />
@@ -263,7 +402,11 @@ function CategoryForm({ auth, onSaved, onToast }) {
           Cover photo <span className="field__hint">(optional, image ≤ 10 MB — big photos are resized automatically)</span>
           <input type="file" accept="image/*" onChange={(e) => setPhoto(e.target.files?.[0] ?? null)} />
         </label>
-        <VisibilityPick value={visibility} onChange={setVisibility} />
+        {packHome ? (
+          <p className="footnote">Pack categories stay private to your account — the pack is your night, not the library.</p>
+        ) : (
+          <VisibilityPick value={visibility} onChange={setVisibility} />
+        )}
         {error && <p className="formerror">{error}</p>}
         <button className="btn btn--primary" disabled={busy || !name.trim()}>
           {busy ? "Saving…" : "Create category"}
@@ -275,7 +418,7 @@ function CategoryForm({ auth, onSaved, onToast }) {
 
 /* ---------------- Question form ---------------- */
 
-function QuestionForm({ auth, onSaved, onToast }) {
+function QuestionForm({ auth, entitlements, onSaved, onToast }) {
   // §F6 (Handoff #10): a question can live in SEVERAL categories. §F7
   // (#15): the fetch-all checkbox list became the shared searchable
   // CategoryPicker — `picked` is a Map(id → {id, name}) captured at click
@@ -322,7 +465,7 @@ function QuestionForm({ auth, onSaved, onToast }) {
       setPicked(new Map());
       onSaved();
     } catch (err) {
-      setError(quotaMessage(err) ?? (err instanceof ApiError && err.status === 403 ? UPSELL_403 : errorText(err)));
+      setError(forbidden(err));
     } finally {
       setBusy(false);
     }
@@ -339,6 +482,20 @@ function QuestionForm({ auth, onSaved, onToast }) {
           legend="Categories"
           hint="(pick one or more — a question can live in several)"
         />
+        {(() => {
+          // §F5(c) (#19): one line when the selection includes a pack-bound
+          // category. Cosmetic — mixed scopes still 400 server-side.
+          const boundId = [...picked.values()].map((c) => c.entitlement).find((e) => e != null);
+          if (boundId == null) return null;
+          const ent = (entitlements || []).find((e) => e.id === boundId);
+          return (
+            <p className="packhint">
+              {ent && ent.question_limit != null
+                ? `Counts against your ${KIND_LABELS[ent.kind] || ent.kind} budget (${ent.questions_used}/${ent.question_limit} used).`
+                : "Counts against your pack's question budget."}
+            </p>
+          );
+        })()}
         <label className="field">
           Question
           <textarea value={questionText} onChange={(e) => setQuestionText(e.target.value)} required rows={3} maxLength={500} />
@@ -617,7 +774,7 @@ function ModerationBadge({ item }) {
   );
 }
 
-function MyContent({ auth, ownCats, ownQs, onChanged, onToast }) {
+function MyContent({ auth, ownCats, ownQs, entitlements, onChanged, onToast }) {
   // §F7 (#15): both lists are ?mine=1 server pages (Load more appends) —
   // the old flow fetched EVERY visible row and client-filtered to the
   // owner's. Category labels ride each question row as `category_names`
@@ -648,6 +805,20 @@ function MyContent({ auth, ownCats, ownQs, onChanged, onToast }) {
         <div key={c.id} className="ownrow">
           <div className="ownrow__main">
             <strong>{c.name}</strong>
+            {c.entitlement != null && (
+              // §F5(b) (#19): bound categories wear a "pack" chip; the
+              // tooltip names which pack (CategorySerializer exposes the
+              // entitlement id — #18).
+              <span
+                className="badge badge--pack"
+                title={(() => {
+                  const ent = (entitlements || []).find((e) => e.id === c.entitlement);
+                  return ent ? `${KIND_LABELS[ent.kind] || ent.kind} pack category` : "Pack category";
+                })()}
+              >
+                pack
+              </span>
+            )}
             <span className="ownrow__meta">
               category · {c.usable_question_count} usable question{c.usable_question_count === 1 ? "" : "s"}
             </span>
@@ -760,7 +931,16 @@ function DeleteButton({ label, onDelete }) {
   );
 }
 
-const UPSELL_403 = "Your account doesn't have creator access yet — an admin can enable it.";
+// §F3 (#19): pricing-aware, and ONLY a fallback — a 403 that carries a
+// server `detail` (pack_inactive, plan_required, …) must surface that
+// informative copy, not this generic line (the old constant masked #18's
+// structured messages; a §F3(d) sibling of the stale "admin can enable"
+// string, listed in CHANGES).
+const UPSELL_403 =
+  "This needs a game pack or the Venue plan — see the Pricing page. Hosting from the free library is always free.";
+const forbidden = (err) =>
+  quotaMessage(err) ??
+  (err instanceof ApiError && err.status === 403 && !err.data?.detail ? UPSELL_403 : errorText(err));
 
 /** Friendly text for the backend's structured quota 403s ({code: "quota_*"}). */
 function quotaMessage(err) {
@@ -768,11 +948,21 @@ function quotaMessage(err) {
   if (!q) return null;
   if (q.code === "quota_storage") {
     // §F3: numbers are bytes — format MB here, at the message, not upstream.
-    if (q.limit === 0) return "Your plan doesn't include media storage — upgrade to a creator account to unlock it.";
+    if (q.limit === 0)
+      return "Your current plan doesn't include media storage — a game pack or the Venue plan unlocks it (see the Pricing page).";
     const add = q.requested != null ? `This upload adds ${fmtMB(q.requested)} of media, but you` : "You";
     return `${add}'ve used ${fmtMB(q.used)} of your plan's ${fmtMB(q.limit)} media storage. Delete some media first.`;
   }
-  if (q.limit === 0) return "Your plan doesn't include custom content — upgrade to a creator account to unlock it.";
+  if (q.limit === 0) {
+    // §F3(b) (#19): a pack buyer creating into an UNBOUND category is
+    // correctly denied by the ACCOUNT lane (free = 0 questions); the hint
+    // routes them to the lane they paid for — their pack's bound category.
+    const base =
+      "Your current plan doesn't include custom content — a game pack or the Venue plan unlocks it (see the Pricing page).";
+    return q.code === "quota_questions"
+      ? `${base} (Pack owners: add questions inside your pack's own category.)`
+      : base;
+  }
   if (q.requested != null) {
     // Batch 403 from bulk upload: say how far the file overshoots the plan,
     // in the right noun for the quota that tripped (§F: categories or questions).
