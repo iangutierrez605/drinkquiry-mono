@@ -287,7 +287,7 @@ PLAN_LIMITS = {
 # join view. A settings constant, not a per-game field (configurability is
 # punted). The host's control seat does NOT count. Exposed to clients as the
 # snapshot's top-level `max_players` so frontends never hardcode the number.
-MAX_PLAYERS_PER_GAME = 6
+MAX_PLAYERS_PER_GAME = 10
 
 # --- Transactional email (Handoff #9 §K): Resend via Anymail ---------------
 # Env-driven with a console fallback, so dev and the test suite never need a
