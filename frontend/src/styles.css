@@ -1587,3 +1587,82 @@ code { font-family: var(--font-mono); color: var(--accent); font-size: 0.9em; }
   padding: 16px 20px; margin: 22px 0 6px;
 }
 .packsexplainer p { margin: 8px 0 0; color: var(--dim); line-height: 1.55; }
+
+/* ---------- Handoff #21 ---------- */
+/* THUNDER FUCKED (§F2): splashes, countdowns, host panels — marquee lemon
+   is the storm's color (--warn/--onwarn, the "money moment" token), coral
+   stays for danger only. Buzz check (§F3) rides the mint live/ok token. */
+
+/* The TV takeover: fanfare / ready / running all share the frame. */
+.tv__thunder {
+  position: fixed; inset: 0; z-index: 30; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 10px; text-align: center;
+  background:
+    radial-gradient(ellipse at 50% 30%, rgba(var(--warn-rgb), 0.16), transparent 60%),
+    var(--ink-2);
+  animation: thunderin 0.35s ease-out;
+}
+@keyframes thunderin { from { opacity: 0; transform: scale(1.04); } to { opacity: 1; transform: none; } }
+.tv__thunderbolt { font-size: clamp(64px, 14vh, 140px); filter: drop-shadow(0 0 26px rgba(var(--warn-rgb), 0.55)); }
+.tv__thundername {
+  font-size: clamp(34px, 7vw, 84px); font-weight: 800; letter-spacing: 0.04em;
+  color: var(--warn); text-shadow: 0 0 34px rgba(var(--warn-rgb), 0.4);
+}
+.tv__thundersub { font-size: clamp(16px, 2.6vw, 26px); color: var(--dim); }
+.tv__thunder--running .tv__thundername { color: var(--paper); }
+.tv__chugcount {
+  font-size: clamp(120px, 38vh, 380px); font-weight: 800; line-height: 0.95;
+  color: var(--warn); text-shadow: 0 0 60px rgba(var(--warn-rgb), 0.5);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The wager chip rides the existing valuechip frame. */
+.valuechip--thunder { background: var(--warn); color: var(--onwarn); border-color: var(--warn); }
+
+/* Host-side panels (§F2): fanfare + the clock. */
+.thunderpanel {
+  border: 1px dashed var(--warn); border-radius: 14px; background: var(--ink-4);
+  padding: 14px 16px; margin: 10px 0; display: flex; flex-direction: column; gap: 8px;
+  align-items: flex-start;
+}
+.thunderpanel__bolt { font-size: 22px; font-weight: 800; color: var(--warn); letter-spacing: 0.03em; }
+.thunderpanel--clock { align-items: stretch; }
+.thunderwager { margin: 6px 0 10px; }
+.thunderwager__row { display: flex; gap: 8px; margin-top: 6px; }
+.thunderwager__row input { width: 110px; }
+
+/* Buzzer (§F2/§F3): the phone's states + mini countdown + lobby smash. */
+.bigbuzz--thunder { background: var(--warn); color: var(--onwarn); }
+.bigbuzz--check { background: var(--ink-4); color: var(--paper); border: 2px dashed var(--accent); }
+.bigbuzz--checked { background: var(--ink-4); color: var(--accent); border: 2px solid var(--accent); }
+.buzzchug {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 6px; min-height: 240px;
+}
+.buzzchug__count {
+  font-size: 120px; font-weight: 800; color: var(--warn); line-height: 1;
+  font-variant-numeric: tabular-nums; text-shadow: 0 0 30px rgba(var(--warn-rgb), 0.45);
+}
+.buzzchug__line { font-size: 20px; font-weight: 700; color: var(--paper); letter-spacing: 0.03em; }
+.buzzdrinkline--thunder { color: var(--warn); font-weight: 700; }
+
+/* Buzz-check ✓ (§F3): host lobby list + TV joiner chips — mint = "live/ok". */
+.lobbycheck { color: var(--accent); font-weight: 800; margin-right: 6px; }
+.tv__joinercheck {
+  color: var(--accent); font-weight: 800; margin-right: 5px;
+  animation: checkpulse 1.6s ease-in-out 2;
+}
+@keyframes checkpulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+/* §F4c: the blocked-create copy's tournament link. */
+.passlink { color: var(--warn); text-decoration: underline; }
+
+/* ---------- Handoff #21.1 ---------- */
+/* The ⚡ opt-out checkbox on the create screen's Mode panel. */
+.thundertoggle {
+  display: flex; align-items: center; gap: 10px; margin-top: 12px;
+  padding: 10px 12px; border: 1px dashed rgba(var(--warn-rgb), 0.5);
+  border-radius: 10px; background: var(--ink-4); cursor: pointer;
+}
+.thundertoggle input { accent-color: var(--warn); width: 18px; height: 18px; }
+.thundertoggle span { color: var(--paper); }

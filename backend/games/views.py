@@ -8,6 +8,7 @@ from accounts.quotas import base_limits_for, quota_denial, tournaments_used
 from billing.access import (
     PACK_INACTIVE,
     PLAN_REQUIRED,
+    attached_live_pass_tournaments,
     can_host_own_custom,
     can_paid_write,
     unconsumed_active_passes,
@@ -151,6 +152,7 @@ class GameCreateView(APIView):
             questions_per_category=serializer.validated_data["questions_per_category"],
             # §H (#13): the host's per-game sound choice (serializer default 1).
             buzz_sound=serializer.validated_data["buzz_sound"],
+            thunder=serializer.validated_data["thunder"],  # #21.1: ⚡ opt-out
             tournament=tournament,
             round_number=serializer.validated_data.get("round_number"),
             hand_picked=hand_picked,
@@ -287,7 +289,11 @@ class GameStateView(APIView):
             Game.objects.prefetch_related("columns__cells", "participants", "columns__category")
             # "host" feeds the brand; "tournament" feeds §I's identity
             # block (no per-snapshot queries for either).
-            .select_related("current_cell__question", "judged_participant", "host", "tournament"),
+            # current_cell__thunder_chugger feeds §F2's (#21) chug block.
+            .select_related(
+                "current_cell__question", "current_cell__thunder_chugger",
+                "judged_participant", "host", "tournament",
+            ),
             code=code.upper(),
         )
         context = {"request": request}
@@ -662,6 +668,22 @@ class TournamentListCreateView(generics.ListCreateAPIView):
 
     def create(self, request, *args, **kwargs):
         if denial := quota_denial(request.user, "tournaments"):
+            # §F4c (#21), C-8: for a pass holder the generic "plan's limit"
+            # line is both confusing (they bought a pass, not a plan) and
+            # the old copy's road to the delete trap. When an ACTIVE pass is
+            # attached to a LIVE tournament, the detail NAMES it instead —
+            # the frontend links it via the usage summary's `tournament`
+            # block. STRING only; the pinned quota-403 family shape
+            # {detail, code, used, limit} is untouched.
+            running = attached_live_pass_tournaments(request.user)
+            if running:
+                denial = {
+                    **denial,
+                    "detail": (
+                        f"Your Tournament Pass is running “{running[0].name}” — "
+                        "open it from your tournaments list. A new tournament needs a new pass."
+                    ),
+                }
             return Response(denial, status=status.HTTP_403_FORBIDDEN)
         # §F8 slice (#18): the union in limits_for counts ACTIVE passes into
         # the tournaments allowance; CONSUMPTION happens here. If the plain
@@ -679,12 +701,25 @@ class TournamentListCreateView(generics.ListCreateAPIView):
             passes = sorted(unconsumed_active_passes(request.user), key=lambda e: (e.created_at, e.id))
             if not passes:
                 used = tournaments_used(request.user)
+                # §F4c (#21), C-8: the copy stops hinting at deletion (the
+                # trap this handoff removes) and NAMES the running
+                # tournament instead — the frontend links it via the usage
+                # summary's additive `tournament` block. Shape unchanged:
+                # the pinned quota-403 family {detail, code, used, limit}.
+                running = attached_live_pass_tournaments(request.user)
+                if running:
+                    detail = (
+                        f"Your Tournament Pass is running “{running[0].name}” — "
+                        "open it from your tournaments list. A new tournament needs a new pass."
+                    )
+                else:
+                    detail = (
+                        "Your tournament pass is already attached to a tournament — "
+                        "a new tournament needs a new pass."
+                    )
                 return Response(
                     {
-                        "detail": (
-                            "Your tournament pass is already attached to a tournament — "
-                            "a new tournament needs a new pass."
-                        ),
+                        "detail": detail,
                         "code": "quota_tournaments",
                         "used": used,
                         "limit": plain_limit or 0,
@@ -714,10 +749,16 @@ class TournamentListCreateView(generics.ListCreateAPIView):
 
 class TournamentDetailView(APIView):
     """GET /api/tournaments/<pk>/ — the control-room payload (games +
-    standings + advancers). DELETE — soft delete (the house liveness flag);
-    the name frees immediately via the partial constraint, attached games
-    keep their history (Game.tournament survives; only serving surfaces that
-    filter deleted_at stop listing it)."""
+    standings + advancers).
+
+    DELETE — §F4b (#21), C-8: REMOVED for owners (a plain structured 409;
+    deliberately removed, not deferred — §M). Deleting looked like the way
+    to free a stuck pass, silently orphaned real history, and the pass bug
+    it "solved" is fixed at the source (billing.access, live-only counting)
+    — so the trap goes. STAFF keep the pre-#21 soft delete as the support
+    escape hatch (the house liveness flag: the name frees via the partial
+    constraint, attached games keep their history), and the Django admin is
+    untouched."""
 
     permission_classes = (permissions.IsAuthenticated,)
 
@@ -743,6 +784,18 @@ class TournamentDetailView(APIView):
 
     def delete(self, request, pk):
         tournament = _own_live_tournament(request, pk)
+        if not request.user.is_staff:
+            # Exactly {detail, code} — the documented plain structured shape.
+            return Response(
+                {
+                    "detail": (
+                        "Tournaments can't be deleted — your pass stays attached to "
+                        "its tournament. Email us if something's wrong."
+                    ),
+                    "code": "tournament_delete_disabled",
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
         tournament.deleted_at = timezone.now()
         tournament.save(update_fields=["deleted_at"])
         return Response(status=status.HTTP_204_NO_CONTENT)

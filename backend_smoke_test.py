@@ -192,25 +192,34 @@ def rest():
     ok("reclaim seat with stored token → 200 same participant (reload flow)")
 
     # --- Handoff #7 §G/§I: player cap + buzzer sound assignment ------------
+    # #21 owner-drift adaptation: the owner raised MAX_PLAYERS_PER_GAME
+    # (6 → 10) in live settings — the smoke now derives the cap from the
+    # snapshot's own max_players and pins the MECHANISM (cap enforced,
+    # exact 409 shape, reclaim-at-cap, round-robin sounds), never the
+    # number, matching the suite's JoinCapAndSoundTests treatment.
     snap = requests.get(f"{BASE}/api/games/{code}/").json()
-    assert snap.get("max_players") == 6, snap.get("max_players")
-    for nm in ("Team C", "Team D", "Team E", "Team F"):
+    cap = snap.get("max_players")
+    assert isinstance(cap, int) and cap >= 2, snap.get("max_players")
+    filler = [f"Team {chr(ord('C') + i)}" for i in range(cap - 2)]  # A + B already seated
+    for nm in filler:
         r = j({"name": nm}); assert r.status_code == 201, r.text
         assert "buzzer_sound" in r.json()["participant"], r.text  # §I: in the join response
-    r = j({"name": "Team G"})
+    r = j({"name": "Team Overflow"})
     assert r.status_code == 409, r.text
     full = r.json()
     assert set(full) == {"detail", "code", "limit"}, full  # NEW contract, exact shape
-    assert full["code"] == "game_full" and full["limit"] == 6, full
-    ok('7th team join → 409 {"detail", code: "game_full", limit: 6} exact shape (§G)')
+    assert full["code"] == "game_full" and full["limit"] == cap, full
+    ok(f'join past the cap → 409 {{"detail", code: "game_full", limit: {cap}}} exact shape (§G; cap from snapshot)')
     r = j({"name": "Team A", "participant_token": a_tok})
     assert r.status_code == 200, r.text
     ok("reclaim still 200 AT the cap — reload flow survives a full table (§G)")
     snap = requests.get(f"{BASE}/api/games/{code}/").json()
     sounds = {p["name"]: p.get("buzzer_sound") for p in snap["participants"] if p["role"] == "player"}
-    expect = {"TEAM A": 1, "TEAM B": 2, "TEAM C": 3, "TEAM D": 4, "TEAM E": 1, "TEAM F": 2}
+    expect = {"TEAM A": 1, "TEAM B": 2}
+    for i, nm in enumerate(filler):
+        expect[nm.upper()] = ((2 + i) % 4) + 1  # round-robin 1–4 by join order
     assert sounds == expect, sounds  # §H1: snapshot names are ALL CAPS now
-    ok(f"buzzer_sound in snapshot, round-robin by join order: {[sounds[n] for n in sorted(expect)]} (§I)")
+    ok(f"buzzer_sound in snapshot, round-robin by join order across {cap} seats (§I)")
     # The extra teams C–F just prove the cap; the game keeps playing with the
     # existing two, so the downstream WS flow is untouched.
     return code, host_token, a_tok, a_id, b_tok, b_id, knox, fknox
@@ -424,6 +433,7 @@ async def ws_flow(code, host_tok, a_tok, a_id, b_tok, b_id, knox, fknox):
         await host.send(json.dumps({"action": "finish_game"}))
         s = (await latest_state(host))["game"]
         assert s["status"] == "finished"; ok("finish_game → finished")
+        table_cap = s["max_players"]  # #21: history pin derives from the snapshot too
 
     # --- Handoff #6 §G: game history + report (host's own games only) ------
     hh = {"Authorization": f"Token {knox}"}
@@ -431,7 +441,7 @@ async def ws_flow(code, host_tok, a_tok, a_id, b_tok, b_id, knox, fknox):
     assert r.status_code == 200 and "results" in r.json(), r.text
     row = next(g for g in r.json()["results"] if g["code"] == code)  # newest-first; host reuses this account
     assert row["status"] == "finished" and row["finished_at"] and row["winners"] == ["TEAM B"], row
-    assert row["participant_count"] == 6, row  # §G filled the table to the cap earlier
+    assert row["participant_count"] == table_cap, row  # §G filled the table to the cap earlier (#21: cap from snapshot)
     ok(f"history lists {code} with winners {row['winners']} (§G2)")
 
     r = requests.get(f"{BASE}/api/games/{code}/report/", headers=hh)
@@ -749,8 +759,175 @@ def billing_surface(knox):
     ok("keyless billing: webhook 503 (no secret → nothing verifiable), checkout billing_not_configured")
 
 
+
+
+# --- Handoff #21: §F1/§F2 THUNDER FUCKED + §F3 buzz check -------------------
+async def _thunder_ws(code, host_tok, zap_tok, zap_id, crack_tok, crack_id, spots, knox):
+    url = lambda t: f"{WS}/ws/game/{code}/?token={t}"
+    async with websockets.connect(url(host_tok), origin=ORIGIN) as host, \
+               websockets.connect(url(zap_tok), origin=ORIGIN) as zap, \
+               websockets.connect(url(crack_tok), origin=ORIGIN) as crack:
+        async def act(ws, action, **payload):
+            await ws.send(json.dumps({"action": action, **payload}))
+
+        # §F3: the lobby test smash — the ✓ lands in the shared snapshot
+        # (host lobby + TV render it); C-7: a visual aid, never a gate.
+        await act(zap, "buzz_check")
+        s = (await latest_state(host))["game"]
+        checked = {p["name"]: p["buzz_checked"] for p in s["participants"] if p["role"] == "player"}
+        assert checked == {"TEAM ZAP": True, "TEAM CRACK": False}, checked
+        ok("lobby buzz_check → ZAP ✓ in the snapshot, CRACK unchecked (§F3)")
+
+        await act(host, "start_game")
+        s = (await latest_state(host))["game"]; assert s["status"] == "active"
+        await asyncio.gather(drain(zap), drain(crack))
+        await act(crack, "buzz_check")
+        e = await recv_until(crack, "error")
+        assert "lobby" in e["detail"].lower(), e
+        ok(f"buzz_check after start → '{e['detail']}' (lobby-only, §F3)")
+
+        # --- ⚡ #1: the happy path, stage by stage (C-2/C-4/C-5) -----------
+        await act(host, "open_cell", cell_id=spots[0])
+        s = (await latest_state(host))["game"]
+        chug = s["chug"]
+        assert chug["stage"] == "fanfare" and s["buzzer_open"] is False, chug
+        assert set(chug) == {"stage", "wager", "chugger_name", "started_at", "seconds"}, chug
+        assert s["current_cell"]["thunder"] is True
+        assert s["current_cell"]["question_text"] is None  # withheld until reveal
+        # No-spoiler mid-flow: every board-grid row keeps the pinned key set
+        # — the OTHER unopened ⚡ is indistinguishable.
+        for col in s["columns"]:
+            for row in col["cells"]:
+                assert set(row) == {"id", "row", "value", "state", "answered_by", "answered_correctly"}, row
+        ok("open ⚡ → chug.stage=fanfare, exact 5-key block, question WITHHELD, grid rows spoiler-free (§F1/§F2)")
+
+        await act(zap, "buzz")
+        e = await recv_until(zap, "error"); ok(f"buzz during fanfare → '{e['detail']}' (locked until reveal)")
+
+        await act(host, "thunder_reveal")
+        s = (await latest_state(host))["game"]
+        assert s["chug"]["stage"] == "answering" and s["buzzer_open"] is True
+        assert s["current_cell"]["question_text"], "question should ride the payload after reveal"
+        ok("thunder_reveal → answering, buzzer OPEN, question in the payload (C-5)")
+
+        await asyncio.gather(drain(zap), drain(crack))
+        await act(zap, "buzz")
+        s = (await latest_state(host))["game"]
+        assert s["buzzer_open"] is False, "first buzz must LOCK on a ⚡ (C-2, no steals)"
+        ok("first buzz locks the buzzer (C-2)")
+
+        await drain(host)
+        await act(host, "judge", participant_id=zap_id, correct=True)
+        e = await recv_until(host, "error")
+        assert e.get("code") == "thunder_wager_required" and set(e) == {"type", "detail", "code"}, e
+        ok('judge before wager → structured {"detail", code: "thunder_wager_required"} (§F2)')
+
+        await act(host, "thunder_wager", seconds=12)
+        s = (await latest_state(host))["game"]
+        assert s["chug"]["wager"] == 12 and s["chug"]["seconds"] == 12, s["chug"]
+        await act(host, "judge", participant_id=zap_id, correct=True)
+        s = (await latest_state(host))["game"]
+        assert s["chug"]["stage"] == "pick" and s["revealed_answer"], s["chug"]
+        ok("wager 12 typed; judge correct → stage pick, answer revealed (C-4 pending the pick)")
+
+        await drain(zap)
+        await act(zap, "give_drink", target_participant_id=crack_id)
+        s = (await latest_state(host))["game"]
+        chug = s["chug"]
+        assert chug["stage"] == "ready" and chug["chugger_name"] == "TEAM CRACK", chug
+        tallies = {p["name"]: (p["drinks_taken"], p["drinks_given"], p["score"])
+                   for p in s["participants"] if p["role"] == "player"}
+        assert tallies["TEAM CRACK"][0] == 12 and tallies["TEAM ZAP"][1] == 12 and tallies["TEAM ZAP"][2] == 12, tallies
+        ok("winner's phone picks CRACK → ready; seconds ARE the stakes: taken/given/score all 12 (C-4)")
+
+        await act(host, "thunder_clock")
+        s = (await latest_state(host))["game"]
+        chug = s["chug"]
+        assert chug["stage"] == "running" and chug["started_at"], chug
+        from datetime import datetime as _dt
+        _dt.fromisoformat(chug["started_at"])  # the anchor every screen counts from
+        ok("thunder_clock → running with a parseable server anchor (C-5)")
+
+        await act(host, "close_cell")
+        s = (await latest_state(host))["game"]
+        assert s["chug"] is None and s["current_cell"] is None
+        ok("close ⚡ → chug block back to null")
+
+        # --- ⚡ #2: the wrong path — NO steals, reveal, self-chug (C-6) ----
+        await act(host, "open_cell", cell_id=spots[1])
+        await act(host, "thunder_reveal")
+        await latest_state(host)
+        await asyncio.gather(drain(zap), drain(crack))
+        await act(crack, "buzz")
+        await act(host, "thunder_wager", seconds=5)
+        await act(host, "judge", participant_id=crack_id, correct=False)
+        s = (await latest_state(host))["game"]
+        chug = s["chug"]
+        assert s["buzzer_open"] is False, "wrong on ⚡ must NOT reopen (no steals)"
+        assert s["revealed_answer"], "wrong on ⚡ reveals immediately (C-6)"
+        assert chug["stage"] == "ready" and chug["chugger_name"] == "TEAM CRACK", chug
+        tallies = {p["name"]: (p["drinks_taken"], p["drinks_given"])
+                   for p in s["participants"] if p["role"] == "player"}
+        assert tallies["TEAM CRACK"] == (12 + 5, 0), tallies  # self-chug, credit to NOBODY
+        ok("wrong on ⚡ → no reopen, answer up, self-chug 5 credited to nobody (C-4/C-6)")
+        await act(host, "thunder_clock")
+        await act(host, "close_cell")
+        s = (await latest_state(host))["game"]
+        assert s["chug"] is None
+        ok("second ⚡ clocked and closed — board resumes")
+
+
+def thunder_story(knox):
+    """§L5 (#21): the THUNDER FUCKED chapter — its own fresh drinks board
+    (2×5 = 10 cells → exactly 2 ⚡ per C-1), ⚡ located via the HOST-PRIVATE
+    board view (never the public snapshot — that's the point), then the full
+    C-2 flow over WS twice: the correct path and the wrong path."""
+    hh = {"Authorization": f"Token {knox}"}
+    cats = requests.get(f"{BASE}/api/categories/", headers=hh).json()["results"]
+    r = requests.post(f"{BASE}/api/games/", headers=hh,
+                      json={"mode": "drinks", "categories": [c["id"] for c in cats[:2]],
+                            "questions_per_category": 5})
+    assert r.status_code == 201, r.text
+    d = r.json(); code, host_tok = d["game"]["code"], d["participant_token"]
+
+    board = requests.get(f"{BASE}/api/games/{code}/board/", headers=hh).json()
+    spots = [c["id"] for col in board["columns"] for c in col["cells"] if c.get("is_thunder")]
+    rows = {c["id"]: c["row"] for col in board["columns"] for c in col["cells"]}
+    cols_of = {c["id"]: i for i, col in enumerate(board["columns"]) for c in col["cells"]}
+    assert len(spots) == 2, f"expected 2 ⚡ on a 10-cell drinks board, got {len(spots)}"
+    assert all(rows[s] > 0 for s in spots), "row 0 must never be ⚡ (C-1)"
+    assert len({cols_of[s] for s in spots}) == 2, "at most one ⚡ per column (C-1)"
+    public = requests.get(f"{BASE}/api/games/{code}/").json()
+    assert "thunder" not in json.dumps(public).lower(), "public snapshot must not spoil ⚡ (§B)"
+    ok(f"fresh drinks 2×5 board {code}: 2 ⚡ via host-private board view, rows>0, distinct columns, public payload spoiler-free (§F1)")
+
+    j = lambda body: requests.post(f"{BASE}/api/games/{code}/join/", json=body)
+    r = j({"name": "Team Zap"}); assert r.status_code == 201, r.text
+    assert r.json()["participant"]["buzz_checked"] is False  # additive key, join response too
+    zap_tok, zap_id = r.json()["participant_token"], r.json()["participant"]["id"]
+    r = j({"name": "Team Crack"}); assert r.status_code == 201, r.text
+    crack_tok, crack_id = r.json()["participant_token"], r.json()["participant"]["id"]
+    asyncio.run(_thunder_ws(code, host_tok, zap_tok, zap_id, crack_tok, crack_id, spots, knox))
+
+    # #21.1: the ⚡ opt-out — a thunder:false drinks board marks NOTHING
+    # (host-private board view confirms; the create response's own snapshot
+    # is the public no-"thunder" payload).
+    r = requests.post(f"{BASE}/api/games/", headers=hh,
+                      json={"mode": "drinks", "categories": [cats[0]["id"]],
+                            "questions_per_category": 3, "thunder": False})
+    assert r.status_code == 201, r.text
+    off_code = r.json()["game"]["code"]
+    assert "thunder" not in json.dumps(r.json()["game"]).lower()
+    off_board = requests.get(f"{BASE}/api/games/{off_code}/board/", headers=hh).json()
+    off_spots = [c for col in off_board["columns"] for c in col["cells"] if c.get("is_thunder")]
+    assert off_spots == [], off_spots
+    ok(f"⚡ opt-out: thunder=false board {off_code} marks nothing (#21.1)")
+
 code, ht, at, aid, bt, bid, knox, fknox = rest()
 asyncio.run(ws_flow(code, ht, at, aid, bt, bid, knox, fknox))
+# §L5 (#21): THUNDER FUCKED + buzz check — fresh board, re-runnable (its
+# own game; no throttled surface touched).
+thunder_story(knox)
 # §I (#13): BEFORE password_flows — that flow ends by killing the original
 # knox session (change-back revokes other sessions), and this story needs it.
 tournament_story(knox, fknox)

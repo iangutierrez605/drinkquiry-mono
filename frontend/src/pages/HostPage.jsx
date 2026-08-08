@@ -13,7 +13,7 @@ import {
   saveSeat,
 } from "../lib/storage";
 import { useGameSocket } from "../lib/useGameSocket";
-import { ensureAudio, playBuzz } from "../lib/sounds";
+import { ensureAudio, playBuzz, playOfficialSting, playThunderSting } from "../lib/sounds";
 import AuthScreen from "../components/AuthScreen";
 import CategoryPicker from "../components/CategoryPicker";
 import {
@@ -24,6 +24,7 @@ import {
   MediaBlock,
   ScoreStrip,
   Toast,
+  useChugRemaining,
 } from "../components/shared";
 
 // §F1 (Handoff #9): AuthScreen moved to src/components/AuthScreen.jsx (it
@@ -172,6 +173,10 @@ function CreateScreen({ auth, onCreated, onResumed }) {
   const [unfinished, setUnfinished] = useState(null);
   const [resumeBusy, setResumeBusy] = useState(null);
   const [mode, setMode] = useState("drinks");
+  // #21.1: the ⚡ opt-out — drinks boards mark Thunder cells by default;
+  // untick for a play-without night. Sent only in drinks mode (points
+  // boards never mark regardless).
+  const [thunderOn, setThunderOn] = useState(true);
   const [perCategory, setPerCategory] = useState(5);
   // §H (#13): the game's ONE buzz sound — a host choice at creation (the
   // preview tap is the WebAudio gesture). Server validates 1–4 (rule 4).
@@ -354,6 +359,8 @@ function CreateScreen({ auth, onCreated, onResumed }) {
         categories: [...picked.keys()],
         questions_per_category: perCategory,
         buzz_sound: buzzSound,
+        // #21.1: ⚡ opt-out rides only in drinks mode; default true.
+        ...(mode === "drinks" ? { thunder: thunderOn } : {}),
         // §I4: attach when arriving from a tournament (both or neither —
         // the server enforces the pairing and re-checks ownership).
         ...(tournamentId ? { tournament: tournamentId, round_number: roundNumber } : {}),
@@ -454,6 +461,18 @@ function CreateScreen({ auth, onCreated, onResumed }) {
             <span>Classic quiz-show scoring: +value right, −value wrong</span>
           </button>
         </div>
+        {mode === "drinks" && (
+          <label className="thundertoggle">
+            <input
+              type="checkbox"
+              checked={thunderOn}
+              onChange={(e) => setThunderOn(e.target.checked)}
+            />
+            <span>
+              ⚡ <strong>Thunder cells</strong> — hide 1–2 chug-wager daily doubles on the board
+            </span>
+          </label>
+        )}
       </section>
 
       <section className="panel">
@@ -879,7 +898,15 @@ function HostGame({ code, token, auth, onLeave }) {
   const openCell = game?.current_cell;
   const players = game?.participants.filter((p) => p.role === "player") ?? [];
 
-  const openCellAction = useCallback((cellId) => send("open_cell", { cell_id: cellId }), [send]);
+  const openCellAction = useCallback(
+    (cellId) => {
+      // §F2 (#21): the click IS the browser-audio gesture — unlock here so
+      // a ⚡ cell's sting can actually play the moment fanfare lands.
+      ensureAudio();
+      send("open_cell", { cell_id: cellId });
+    },
+    [send],
+  );
 
   // §F1 (Handoff #6): host-private answer, fetched over the Knox side channel
   // whenever the snapshot shows a newly opened cell. It is DISPLAY data only —
@@ -919,6 +946,42 @@ function HostGame({ code, token, auth, onLeave }) {
   // done properly); the hook's event-driven value stays as the fallback for
   // older backends that don't send `revealed_answer` yet.
   const shownReveal = game?.revealed_answer ?? revealedAnswer;
+
+  // §F2 (#21): THUNDER FUCKED — the chug block + local countdown (both
+  // pure snapshot renders), and the C-5 sting choreography: the sting plays
+  // ON THIS SCREEN once per ⚡ cell when fanfare lands, and its END
+  // auto-fires the reveal (server never sleeps — the timer lives here);
+  // the manual Reveal button below stays as the muted-laptop fallback.
+  const chug = game?.chug ?? null;
+  const chugRemaining = useChugRemaining(chug);
+  const stungCellRef = useRef(null);
+  useEffect(() => {
+    if (chug?.stage !== "fanfare" || openCellId == null) return undefined;
+    if (stungCellRef.current === openCellId) return undefined;
+    stungCellRef.current = openCellId;
+    ensureAudio();
+    // #21.2 (owner-directed): the sting plays (OFFICIAL file when present,
+    // synthesized fallback) but the reveal NEVER auto-fires — the host's
+    // "Reveal the question" button is the ONE path now, so the room gets a
+    // beat after the sting for every team to lock in the chug seconds
+    // they'd shout if they win the race. Cleanup still stops official
+    // playback (revealing mid-sting cuts it cleanly).
+    let cancelled = false;
+    let stopOfficial = null;
+    (async () => {
+      const official = await playOfficialSting();
+      if (cancelled) {
+        official?.stop();
+        return;
+      }
+      if (official) stopOfficial = official.stop;
+      else playThunderSting();
+    })();
+    return () => {
+      cancelled = true;
+      stopOfficial?.();
+    };
+  }, [chug?.stage, openCellId]);
 
   useEffect(() => {
     if (authFailed) onLeave(); // stale seat: back to creation
@@ -1029,9 +1092,18 @@ function HostGame({ code, token, auth, onLeave }) {
               <p className="footnote">Table's full — extra players share a teammate's buzzer.</p>
             )}
             {players.length === 0 && <p className="footnote">Waiting for buzzers…</p>}
+            <p className="footnote">
+              {/* §F3 (#21), C-7: a visual aid — start whenever you like. */}
+              ✓ = that phone gave its buzzer a test smash.
+            </p>
             <ul className="lobbylist">
               {players.map((p) => (
                 <li key={p.id} className={p.connected ? "" : "lobbylist--offline"}>
+                  {p.buzz_checked && (
+                    <span className="lobbycheck" title="buzzer checked">
+                      ✓
+                    </span>
+                  )}
                   <span>
                     {p.name} {p.connected ? "🟢" : "⚪"}
                   </span>
@@ -1118,15 +1190,48 @@ function HostGame({ code, token, auth, onLeave }) {
             <section className="hostq">
               <div className="hostq__main">
                 <div className="hostq__meta">
-                  <span className="valuechip">
-                    {game.mode === "drinks" ? `${openCell.value} drinks` : `${openCell.value} pts`}
-                  </span>
+                  {chug ? (
+                    <span className="valuechip valuechip--thunder">
+                      ⚡ {chug.wager != null ? `${chug.wager}s chug` : "THUNDER FUCKED"}
+                    </span>
+                  ) : (
+                    <span className="valuechip">
+                      {game.mode === "drinks" ? `${openCell.value} drinks` : `${openCell.value} pts`}
+                    </span>
+                  )}
                   <span className={`buzzstate ${game.buzzer_open ? "buzzstate--open" : "buzzstate--locked"}`}>
                     {game.buzzer_open ? "BUZZER OPEN" : "BUZZER LOCKED"}
                   </span>
                 </div>
-                <p className="hostq__text">{openCell.question_text}</p>
-                <MediaBlock cell={openCell} />
+                {chug?.stage === "fanfare" ? (
+                  /* §F2 (#21): the question is server-WITHHELD in fanfare —
+                     the sting is playing on this screen; reveal auto-fires
+                     when it ends, and this button is the muted-laptop
+                     fallback (C-5). */
+                  <div className="thunderpanel">
+                    <div className="thunderpanel__bolt">⚡ THUNDER FUCKED</div>
+                    <p className="footnote">
+                      {/* #21.2: reveal is host-manual ONLY — the pause after the
+                          sting is when every team locks in their chug seconds. */}
+                      The question stays hidden until YOU reveal it. Let the sting play,
+                      give the teams a beat to decide their chug seconds — the race winner
+                      shouts theirs — then hit the button. Board and buzzers hold on the
+                      splash.
+                    </p>
+                    <p className="footnote">
+                      The TV plays the chug track during the countdown — make sure its
+                      sound is on (the 🔊 corner).
+                    </p>
+                    <button className="btn btn--gold btn--big" onClick={() => send("thunder_reveal")}>
+                      Reveal the question
+                    </button>
+                  </div>
+                ) : (
+                  <>
+                    <p className="hostq__text">{openCell.question_text}</p>
+                    <MediaBlock cell={openCell} />
+                  </>
+                )}
                 {shownReveal == null &&
                   (hostAnswer?.cellId === openCell.id ? (
                     <div className="answercard answercard--private">
@@ -1167,9 +1272,20 @@ function HostGame({ code, token, auth, onLeave }) {
 
               <div className="hostq__side">
                 <h2 className="h2">Buzz order</h2>
+                {chug && chug.stage === "answering" && openCell.buzzes.length > 0 && (
+                  <ThunderWagerBox
+                    key={openCell.id}
+                    wager={chug.wager}
+                    teamName={openCell.buzzes[0]?.name}
+                    onSet={(seconds) => send("thunder_wager", { seconds })}
+                  />
+                )}
                 <BuzzList buzzes={openCell.buzzes}>
                   {(b) =>
-                    !judgedCorrect && (
+                    !judgedCorrect &&
+                    // §F2 (#21): on a ⚡ cell the wager comes first (the
+                    // server 409s otherwise — this hiding is cosmetic).
+                    (!chug || chug.wager != null) && (
                       <span className="judgebtns">
                         <button
                           className="btn btn--good btn--sm"
@@ -1192,7 +1308,9 @@ function HostGame({ code, token, auth, onLeave }) {
                   <div className="drinkassign">
                     <h2 className="h2">
                       {winner
-                        ? `${winner.name} answered right — THEIR phone picks who drinks ${openCell.value}`
+                        ? chug
+                          ? `${winner.name} nailed it — THEIR phone picks who chugs ${chug.wager}s ⚡`
+                          : `${winner.name} answered right — THEIR phone picks who drinks ${openCell.value}`
                         : "Who drinks?"}
                     </h2>
                     <p className="footnote">
@@ -1209,13 +1327,34 @@ function HostGame({ code, token, auth, onLeave }) {
                           onClick={() => send("assign_drinks", { to_participant_id: p.id })}
                         >
                           🍺 {p.role === "host" ? `${p.name} (you)` : p.id === winnerId ? `${p.name} (the winners)` : p.name}{" "}
-                          drinks {openCell.value}
+                          {chug ? `chugs ${chug.wager}s` : `drinks ${openCell.value}`}
                         </button>
                       ))}
                     </div>
                   </div>
                 )}
-                {game.mode === "drinks" && drinksAssigned && (
+                {chug && chug.stage === "ready" && (
+                  <div className="thunderpanel thunderpanel--clock">
+                    <h2 className="h2">⚡ {chug.chugger_name} chugs {chug.seconds}s</h2>
+                    <p className="footnote">
+                      Start when the room's ready — the countdown goes FULL SCREEN on the TV
+                      and it plays the chug track (its 🔊 corner must be on; no track file
+                      yet = numbers only).
+                    </p>
+                    <button className="btn btn--gold btn--big" onClick={() => send("thunder_clock")}>
+                      ⏱ Start the clock
+                    </button>
+                  </div>
+                )}
+                {chug && chug.stage === "running" && (
+                  <div className="thunderpanel thunderpanel--clock">
+                    <h2 className="h2">
+                      {chugRemaining === 0 ? "🍻 Done!" : `⏱ ${chugRemaining}s`} — {chug.chugger_name}
+                    </h2>
+                    <p className="footnote">Close the cell when the glass is down.</p>
+                  </div>
+                )}
+                {game.mode === "drinks" && drinksAssigned && !chug && (
                   <div className="drinkassign drinkassign--done">
                     <h2 className="h2">Drinks assigned ✔</h2>
                     {drinkAttribution && (
@@ -1231,7 +1370,8 @@ function HostGame({ code, token, auth, onLeave }) {
                 )}
 
                 <div className="hostctl">
-                  {!game.buzzer_open && !judgedCorrect && (
+                  {!game.buzzer_open && !judgedCorrect && chug?.stage !== "fanfare" &&
+                    !(chug && ["pick", "ready", "running"].includes(chug.stage)) && (
                     <button className="btn btn--primary" onClick={() => send("open_buzzer")}>
                       Open buzzer
                     </button>
@@ -1306,6 +1446,41 @@ export function FlagButton({ token, questionId, onToast, small = true }) {
     </button>
   );
 }
+
+/**
+ * §F2 (#21): the wager entry — the buzzed-in team SHOUTS their seconds and
+ * the host (the referee, C-3's trust model) types them. 3–30, server-
+ * validated; retype pre-judgment is a typo fix. Local state only; the
+ * snapshot's chug.wager is the truth the chip above renders.
+ */
+function ThunderWagerBox({ wager, teamName, onSet }) {
+  const [value, setValue] = useState(wager != null ? String(wager) : "");
+  const parsed = Number.parseInt(value, 10);
+  const valid = Number.isInteger(parsed) && parsed >= 3 && parsed <= 30;
+  return (
+    <div className="thunderwager">
+      <label className="field">
+        ⚡ {teamName ? `${teamName} shouts their chug seconds` : "Chug seconds"} (3–30)
+        <span className="thunderwager__row">
+          <input
+            type="number"
+            min={3}
+            max={30}
+            inputMode="numeric"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            placeholder="e.g. 10"
+          />
+          <button type="button" className="btn btn--gold btn--sm" disabled={!valid} onClick={() => onSet(parsed)}>
+            {wager != null ? "Update" : "Lock it in"}
+          </button>
+        </span>
+      </label>
+      {wager != null && <p className="footnote">Wager set: {wager}s — judge when they answer.</p>}
+    </div>
+  );
+}
+
 
 /**
  * §J3: the host's lobby preview — per-category expandable lists of the drawn

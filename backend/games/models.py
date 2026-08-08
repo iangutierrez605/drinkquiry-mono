@@ -141,6 +141,28 @@ class BoardCell(models.Model):
     # First assignment wins, whichever side it came from.
     drinks_assigned = models.BooleanField(default=False)
 
+    # §F1 (Handoff #21): "THUNDER FUCKED" — drinks-mode daily doubles. The
+    # CELL is thunder (a replaced question stays thunder — CellReplaceView
+    # rides this flag, not the question). Set by create_game per C-1
+    # (services._pick_thunder_cells); NEVER serialized on public payloads
+    # while the cell is unopened (§B no-spoiler pin — the grep test).
+    is_thunder = models.BooleanField(default=False)
+    # The C-2 sighted race has two host beats a normal cell doesn't:
+    # thunder_revealed marks the sting → question moment (stage "fanfare" →
+    # "answering"; persisted so a reload can't re-hide or pre-show the
+    # question), and the trio below tells the story for the report:
+    # the shouted seconds (C-3 bounds), WHO drank (SET_NULL — a kicked seat
+    # keeps the history line), and the clock anchor every screen counts down
+    # from (C-5: server timestamp in the snapshot, zero per-second
+    # broadcasts). All null until their stage happens; they persist after
+    # close so the finished report can say "<chugger> chugged Ns".
+    thunder_revealed = models.BooleanField(default=False)
+    thunder_wager = models.PositiveSmallIntegerField(null=True, blank=True)
+    thunder_chugger = models.ForeignKey(
+        "Participant", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    thunder_started_at = models.DateTimeField(null=True, blank=True)
+
     class Meta:
         ordering = ("column__position", "row")
         constraints = [
@@ -201,6 +223,12 @@ class Participant(models.Model):
         "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     connected = models.BooleanField(default=False)
+    # §F3 (Handoff #21): the lobby buzzer check — stamped when this seat
+    # gives it a test smash in the lobby (services.mark_buzz_checked). A
+    # VISUAL aid only (C-7): the host can start regardless, and there is no
+    # reset — a kicked-and-rejoined seat is a NEW row and arrives unchecked
+    # naturally (pinned). Serialized additively as `buzz_checked` (bool).
+    buzz_checked_at = models.DateTimeField(null=True, blank=True)
     joined_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

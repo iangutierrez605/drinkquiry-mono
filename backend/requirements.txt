@@ -28,3 +28,9 @@ requests>=2.31
 # blind major bump can silently move them. api_version is pinned in code to
 # 2026-07-29.dahlia; bump both together.
 stripe==15.4.0
+# Handoff #21 §F5: the ONE approved new backend dep this session — the host
+# crib-sheet PDF (games/pdf.py; attached to the questions email). Pure
+# python, pinned exact per C-9 ("latest stable 4.x" at ship time; 5.0.0
+# exists but is outside the sanctioned line — bump deliberately, not by
+# accident). Nothing else new (§B: any other requirements change is drift).
+reportlab==4.5.1

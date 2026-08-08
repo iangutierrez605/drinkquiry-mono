@@ -205,3 +205,24 @@ export function FinalStandings({ game }) {
     </div>
   );
 }
+
+/**
+ * §F2 (Handoff #21): the drift-proof chug countdown — every screen computes
+ * remaining LOCALLY from the snapshot's server anchor (chug.started_at +
+ * chug.seconds; C-5: zero per-second broadcasts). Returns whole seconds
+ * remaining (clamped at 0) while stage is "running", else null. Client
+ * clock skew shifts all screens in this room identically at worst — the TV
+ * is the referee's face anyway.
+ */
+export function useChugRemaining(chug) {
+  const running = chug?.stage === "running" && chug.started_at && chug.seconds != null;
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!running) return undefined;
+    const id = setInterval(() => setNow(Date.now()), 200);
+    return () => clearInterval(id);
+  }, [running]);
+  if (!running) return null;
+  const elapsed = (now - new Date(chug.started_at).getTime()) / 1000;
+  return Math.max(0, Math.ceil(chug.seconds - elapsed));
+}

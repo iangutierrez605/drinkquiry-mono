@@ -6,9 +6,20 @@ from .models import BoardCell, BoardColumn, Buzz, CellState, Game, GameStatus, P
 class ParticipantSerializer(serializers.ModelSerializer):
     # buzzer_sound (§I): 1-4, present in the snapshot and the join response so
     # clients read their sound from server state, never local guessing.
+    # buzz_checked (§F3 #21, ADDITIVE): the lobby test-smash landed for this
+    # seat — the host lobby and the TV lobby render the ✓ from it (C-7).
+    # Derived, never the raw timestamp (nobody needs the when).
+    buzz_checked = serializers.SerializerMethodField()
+
     class Meta:
         model = Participant
-        fields = ("id", "name", "role", "score", "drinks_taken", "drinks_given", "connected", "buzzer_sound")
+        fields = (
+            "id", "name", "role", "score", "drinks_taken", "drinks_given", "connected",
+            "buzzer_sound", "buzz_checked",
+        )
+
+    def get_buzz_checked(self, participant):
+        return participant.buzz_checked_at is not None
 
 
 class BuzzSerializer(serializers.ModelSerializer):
@@ -92,6 +103,67 @@ class OpenCellSerializer(serializers.ModelSerializer):
             "amount": assignment.amount,
         }
 
+    def to_representation(self, cell):
+        """§F2 (#21): Thunder shaping, on the OPEN cell only.
+
+        `thunder: true` rides the payload ONLY when the cell is Thunder —
+        never a `thunder: false` on normal cells, so the §B no-spoiler grep
+        ("no 'thunder' anywhere while a Thunder cell sits unopened") holds
+        by construction. During stage "fanfare" the question CONTENT is
+        withheld (keys stay, values null — shape-stable): the board and the
+        buzzer show the ⚡ splash, and the text enters the payload only at
+        the host's reveal. Rule 5 untouched: the ANSWER path is still
+        exclusively `revealed_answer`.
+        """
+        data = super().to_representation(cell)
+        if cell.is_thunder:
+            data["thunder"] = True
+            if not cell.thunder_revealed:
+                for key in ("question_text", "media_type", "image", "audio", "video"):
+                    data[key] = None
+        return data
+
+
+def chug_state(game) -> dict | None:
+    """§F2 (#21): the snapshot's top-level `chug` block — THE documented
+    shape, pinned by an exact-set test (ThunderFlowTests):
+
+        null                            — no Thunder cell is open
+        {"stage":        "fanfare" | "answering" | "pick" | "ready" | "running",
+         "wager":        int | null,    — the shouted seconds (C-3: 3–30)
+         "chugger_name": str | null,    — WHO drinks, as a NAME (never an id
+                                          or token on public surfaces — §B)
+         "started_at":   iso8601 | null,— the server clock anchor (C-5)
+         "seconds":      int | null}    — the countdown length; equals wager
+                                          (kept explicit so countdown code
+                                          never reaches into judging fields)
+
+    All five keys ALWAYS present when the block exists. Stage derives
+    entirely from persisted cell state (see services: the §F2 stage
+    machine), so WS broadcasts, REST polls and reloads can never disagree.
+    """
+    cell = game.current_cell
+    if cell is None or not cell.is_thunder:
+        return None
+    if not cell.thunder_revealed:
+        stage = "fanfare"
+    elif cell.answered_correctly is None:
+        stage = "answering"
+    elif cell.thunder_chugger_id is None:
+        stage = "pick"
+    elif cell.thunder_started_at is None:
+        stage = "ready"
+    else:
+        stage = "running"
+    chugger = cell.thunder_chugger
+    return {
+        "stage": stage,
+        "wager": cell.thunder_wager,
+        "chugger_name": chugger.name if chugger is not None else None,
+        "started_at": cell.thunder_started_at.isoformat() if cell.thunder_started_at else None,
+        "seconds": cell.thunder_wager,
+    }
+
 
 class ColumnSerializer(serializers.ModelSerializer):
     category_name = serializers.CharField(source="category.name", read_only=True)
@@ -158,6 +230,12 @@ class GameStateSerializer(serializers.ModelSerializer):
     # ambiguous between "host hasn't advanced yet" and "didn't qualify" —
     # the host announces results, not this payload.
     my_advancement = serializers.SerializerMethodField()
+    # §F2 (#21): the THUNDER FUCKED live block — null except during a
+    # Thunder cell's life. Shape + stage machine documented on chug_state
+    # above (the module-level function so the suite can call it directly).
+    # ADDITIVE per §B; a snapshot field, so WS boards, polling boards and
+    # phones all render the same stages with zero transport special-casing.
+    chug = serializers.SerializerMethodField()
     # §H1 (Handoff #10): cells not yet ANSWERED — derived here, never stored,
     # so the snapshot stays the source of truth and BOTH transports (WS and
     # the polling board) get it for free (C2). An OPEN cell still counts as
@@ -178,9 +256,12 @@ class GameStateSerializer(serializers.ModelSerializer):
             # one session (C12: the suite and the smoke assert it; removing
             # a public field is #14 territory after clients migrate — §M).
             "code", "mode", "status", "questions_per_category", "buzz_sound", "max_players",
-            "cells_remaining", "buzzer_open", "current_cell", "revealed_answer", "columns",
+            "cells_remaining", "buzzer_open", "current_cell", "chug", "revealed_answer", "columns",
             "participants", "former_players", "brand", "tournament", "my_advancement", "created_at",
         )
+
+    def get_chug(self, game):
+        return chug_state(game)
 
     def get_participants(self, game):
         # Filtered in Python over the prefetched list (never .filter(), which
@@ -307,6 +388,12 @@ class CreateGameSerializer(serializers.Serializer):
     # the picker's four options are cosmetic; 0, 5 and "x" all 400 here),
     # default 1 when omitted so old clients keep working unchanged.
     buzz_sound = serializers.IntegerField(min_value=1, max_value=4, default=1)
+    # #21.1 (owner-directed): the ⚡ opt-out — drinks boards mark Thunder
+    # cells by DEFAULT; false skips the marking entirely (a play-without
+    # night). Creation-time only, fully materialized in is_thunder columns
+    # (no stored flag, no migration); harmless on points boards (which
+    # never mark regardless). Strict-bool at the service (rule 4).
+    thunder = serializers.BooleanField(required=False, default=True)
     # §I (#13): optional tournament attach — BOTH or NEITHER (the service
     # enforces the pairing; the view resolves ownership/liveness/finished).
     tournament = serializers.IntegerField(required=False, allow_null=True, default=None, min_value=1)
@@ -446,10 +533,20 @@ class ReportQuestionSerializer(serializers.ModelSerializer):
     question_text = serializers.CharField(source="question.question_text", read_only=True)
     answer = serializers.CharField(source="question.answer", read_only=True)
     answered_by_name = serializers.CharField(source="answered_by.name", read_only=True, default=None)
+    # §F1c (#21): the Thunder story for the finished report — ⚡, the shouted
+    # wager, and who chugged ("<chugger> chugged Ns"; the frontend derives
+    # "their own" when chugger == answered_by). ADDITIVE; this serializer is
+    # already the post-finish, answer-bearing, host-private surface.
+    is_thunder = serializers.BooleanField(read_only=True)
+    thunder_wager = serializers.IntegerField(read_only=True)
+    thunder_chugger_name = serializers.CharField(source="thunder_chugger.name", read_only=True, default=None)
 
     class Meta:
         model = BoardCell
-        fields = ("id", "row", "value", "state", "question_text", "answer", "answered_by_name", "answered_correctly")
+        fields = (
+            "id", "row", "value", "state", "question_text", "answer", "answered_by_name",
+            "answered_correctly", "is_thunder", "thunder_wager", "thunder_chugger_name",
+        )
 
 
 class ReportColumnSerializer(serializers.ModelSerializer):
@@ -510,10 +607,14 @@ class BoardDetailCellSerializer(serializers.ModelSerializer):
     answer = serializers.CharField(source="question.answer", read_only=True)
     difficulty = serializers.IntegerField(source="question.difficulty", read_only=True)
     media_type = serializers.CharField(source="question.media_type", read_only=True)
+    # §F1 (#21): the host may see WHERE the ⚡ sit (this surface is
+    # host-private Knox — it is exactly where the §B no-spoiler pin says
+    # thunder flags MAY ride; the crib-sheet PDF marks them the same way).
+    is_thunder = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = BoardCell
-        fields = ("id", "row", "value", "state", "question_id", "question_text", "answer", "difficulty", "media_type")
+        fields = ("id", "row", "value", "state", "question_id", "question_text", "answer", "difficulty", "media_type", "is_thunder")
 
 
 class BoardDetailColumnSerializer(serializers.ModelSerializer):

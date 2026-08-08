@@ -338,8 +338,10 @@ export const api = {
   tournament: (token, id) => request(`/api/tournaments/${id}/`, { authToken: token }),
   finishTournament: (token, id) =>
     request(`/api/tournaments/${id}/finish/`, { method: "POST", authToken: token }),
-  deleteTournament: (token, id) =>
-    request(`/api/tournaments/${id}/`, { method: "DELETE", authToken: token }),
+  // §F4b (#21): deleteTournament REMOVED — the server answers owner
+  // deletes with a structured 409 (tournament_delete_disabled) and the
+  // console lost the affordance; the stuck-pass reason to want it is
+  // fixed at the source (soft-deleted tournaments free their pass).
   advanceRound: (token, id, roundNumber, perGame) =>
     request(`/api/tournaments/${id}/rounds/${roundNumber}/advance/`, {
       method: "POST",
@@ -371,7 +373,7 @@ export const api = {
   // §F5 (#18): hand_picked = {categoryId: [orderedQuestionIds]} — the
   // paid picker's payload. BOTH ends wired (destructure + body), per the
   // #17 lesson above.
-  createGame: (token, { mode, categories, questions_per_category, buzz_sound, tournament, round_number, hand_picked }) =>
+  createGame: (token, { mode, categories, questions_per_category, buzz_sound, thunder, tournament, round_number, hand_picked }) =>
     request("/api/games/", {
       method: "POST",
       authToken: token,
@@ -380,6 +382,9 @@ export const api = {
         categories,
         questions_per_category,
         ...(buzz_sound ? { buzz_sound } : {}),
+        // #21.1: the ⚡ opt-out — sent only when the caller passed a
+        // boolean (old callers' bodies stay byte-identical).
+        ...(typeof thunder === "boolean" ? { thunder } : {}),
         ...(tournament ? { tournament, round_number } : {}),
         ...(hand_picked && Object.keys(hand_picked).length ? { hand_picked } : {}),
       },

@@ -694,14 +694,17 @@ class StatusViewTests(Base):
         ent_row = body["entitlements"][0]
         # §F5 (#20): the ADDITIVE category pair — this exact-set assertion
         # moved in the same commit that added the keys (§B rule).
+        # §F4c (#21): + "tournament" — the exact-set assertion moved in the
+        # same commit that added the key (§B rule, again).
         self.assertEqual(
             set(ent_row),
             {
                 "id", "kind", "is_active", "active_from", "active_until",
                 "question_limit", "questions_used", "game_limit",
-                "category_limit", "categories_used",
+                "category_limit", "categories_used", "tournament",
             },
         )
+        self.assertIsNone(ent_row["tournament"])  # a game pack never attaches
         self.assertEqual(ent_row["questions_used"], 0)
         self.assertEqual(ent_row["categories_used"], 0)
         self.assertEqual(ent_row["category_limit"], 10)  # party_game_50, #19.1's cap

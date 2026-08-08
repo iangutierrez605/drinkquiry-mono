@@ -17,6 +17,7 @@ shipping).
 import json
 from datetime import timedelta
 
+from django.conf import settings
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
@@ -385,29 +386,36 @@ class JoinCapAndSoundTests(GameTestBase):
         return self.client.post(f"/api/games/{self.game.code}/join/", body, format="json")
 
     def fill_to_cap(self):
-        responses = [self.join(f"Team {i}") for i in range(1, 7)]
+        # #21 owner-drift adaptation: the owner raised MAX_PLAYERS_PER_GAME
+        # (6 → 10) in settings; these tests now pin the MECHANISM against
+        # whatever the setting says — the cap enforced, the host excluded,
+        # the exact 409 shape, the snapshot exposure — never the number.
+        cap = settings.MAX_PLAYERS_PER_GAME
+        responses = [self.join(f"Team {i}") for i in range(1, cap + 1)]
         for r in responses:
             self.assertEqual(r.status_code, 201, r.data)
         return responses
 
-    def test_sixth_join_succeeds_seventh_gets_exact_409_shape(self):
+    def test_join_at_cap_succeeds_next_gets_exact_409_shape(self):
+        cap = settings.MAX_PLAYERS_PER_GAME
         self.fill_to_cap()
-        res = self.join("Team 7")
+        res = self.join(f"Team {cap + 1}")
         self.assertEqual(res.status_code, 409, res.data)
         body = res.json()
         # NEW contract, separate from the quota 403s: exactly these keys.
         self.assertEqual(set(body), {"detail", "code", "limit"})
         self.assertEqual(body["code"], "game_full")
-        self.assertEqual(body["limit"], 6)
+        self.assertEqual(body["limit"], cap)
         self.assertIsInstance(body["limit"], int)  # Response(), not coerced exception detail
-        self.assertEqual(self.game.participants.filter(role=ParticipantRole.PLAYER).count(), 6)
+        self.assertEqual(self.game.participants.filter(role=ParticipantRole.PLAYER).count(), cap)
 
     def test_host_seat_excluded_from_the_count(self):
-        # 5 players + the host seat: a 6th player must still fit.
-        for i in range(1, 6):
+        # cap-1 players + the host seat: one more player must still fit.
+        cap = settings.MAX_PLAYERS_PER_GAME
+        for i in range(1, cap):
             self.assertEqual(self.join(f"Team {i}").status_code, 201)
-        self.assertEqual(self.join("Team 6").status_code, 201)
-        self.assertEqual(self.join("Team 7").status_code, 409)
+        self.assertEqual(self.join(f"Team {cap}").status_code, 201)
+        self.assertEqual(self.join(f"Team {cap + 1}").status_code, 409)
 
     def test_rejoin_with_valid_token_returns_200_at_cap(self):
         first = self.fill_to_cap()[0].json()
@@ -424,7 +432,7 @@ class JoinCapAndSoundTests(GameTestBase):
     def test_snapshot_exposes_max_players(self):
         res = self.client.get(f"/api/games/{self.game.code}/")
         self.assertEqual(res.status_code, 200)
-        self.assertEqual(res.json()["max_players"], 6)
+        self.assertEqual(res.json()["max_players"], settings.MAX_PLAYERS_PER_GAME)
 
     # --- §I: round-robin sound by join order -------------------------------
 
@@ -1687,8 +1695,11 @@ class TournamentCrudTests(TournamentTestBase):
         self.assertEqual(res.json(), {"name": ["You already have a live tournament with that name."]})
         # a DIFFERENT owner may reuse the name (per-owner constraint)
         self.make_tournament(owner=self.rival, name="Summer Fest Trivia Tournament")
-        # soft delete frees it for me too (the FOURTH house partial)
-        self.assertEqual(self.client.delete(f"/api/tournaments/{first['id']}/").status_code, 204)
+        # §F4b (#21): the owner's REST delete is GONE (structured 409; see
+        # TournamentDeleteAndPassTests) — but soft delete itself (the staff/
+        # admin path) still frees the name via the FOURTH house partial.
+        self.assertEqual(self.client.delete(f"/api/tournaments/{first['id']}/").status_code, 409)
+        Tournament.objects.filter(pk=first["id"]).update(deleted_at=timezone.now())
         self.assertEqual(self.api_create().status_code, 201)
         row = Tournament.objects.get(pk=first["id"])
         self.assertIsNotNone(row.deleted_at)  # soft, not gone
@@ -1754,7 +1765,10 @@ class TournamentQuotaTests(TournamentTestBase):
         self.host.save(update_fields=["limit_overrides"])
         first = self.api_create().json()
         self.assert_quota_403(self.api_create(name="Another"), used=1, limit=1)
-        self.client.delete(f"/api/tournaments/{first['id']}/")
+        # §F4b (#21): owner REST delete is a 409 now — the slot-freeing
+        # mechanic itself (live-only counting) is unchanged, exercised here
+        # via the model (the staff/admin road).
+        Tournament.objects.filter(pk=first["id"]).update(deleted_at=timezone.now())
         self.assertEqual(self.api_create(name="Another").status_code, 201)
 
     def test_profile_usage_carries_the_meter(self):
@@ -2337,8 +2351,9 @@ class ClaimEndpointTests(TournamentTestBase):
 
     def test_full_target_gets_the_pinned_game_full_shape(self):
         # Flagged ruling: the cap holds for claims too, with the EXACT
-        # game_full contract the join endpoint pins.
-        for i in range(6):
+        # game_full contract the join endpoint pins. (#21: cap from
+        # settings — the owner-drift adaptation, see JoinCapAndSoundTests.)
+        for i in range(settings.MAX_PLAYERS_PER_GAME):
             self.client.post(f"/api/games/{self.g2.code}/join/", {"name": f"WALKUP {i}"}, format="json")
         res = self.claim()
         self.assertEqual(res.status_code, 409)
@@ -2670,15 +2685,19 @@ class TournamentPassTests(APITestCase):
         self.assertEqual(r.status_code, 403)
         self.assertEqual(r.json()["code"], "quota_tournaments")
         self.assertEqual((r.json()["used"], r.json()["limit"]), (1, 1))
-        # The SPENT-PASS corner: soft-deleting the tournament frees the used
-        # count, but the pass stays bound (soft delete keeps the FK) — the
-        # union math says yes, consumption says no, and the specific message
-        # explains why.
-        self.client.delete(f"/api/tournaments/{tid}/")
+        # §F4 (#21): the pre-#21 SPENT-PASS dead end is gone by design. The
+        # blocked copy now NAMES the running tournament (C-8; no more
+        # delete hints), the owner's delete road answers the structured
+        # 409, and a soft delete (staff road) FREES the pass — the owner's
+        # repro, pinned end to end in TournamentDeleteAndPassTests.
+        self.assertIn("Cup", r.json()["detail"])
+        self.assertNotIn("delete", r.json()["detail"].lower())
+        self.assertEqual(self.client.delete(f"/api/tournaments/{tid}/").status_code, 409)
+        Tournament.objects.filter(pk=tid).update(deleted_at=timezone.now())
         r = self.client.post("/api/tournaments/", {"name": "Cup 3", "location": ""}, format="json")
-        self.assertEqual(r.status_code, 403)
-        self.assertEqual(r.json()["code"], "quota_tournaments")
-        self.assertIn("already attached", r.json()["detail"])
+        self.assertEqual(r.status_code, 201, r.content)  # the freed pass funds it
+        ent.refresh_from_db()
+        self.assertEqual(ent.tournament_id, r.json()["id"])
 
     def test_creator_plan_create_does_not_consume(self):
         self.buyer.plan = "creator"
@@ -2772,7 +2791,718 @@ class BoardEmailTests(APITestCase):
     def test_send_failure_never_breaks_the_create(self):
         from unittest import mock
 
-        with mock.patch("games.emails.send_mail", side_effect=RuntimeError("smtp down")):
+        # §F5 (#21): the sender is EmailMultiAlternatives now (HTML + PDF);
+        # the patch target moved WITH it so this stays a real failure test,
+        # not a mock nobody calls.
+        with mock.patch(
+            "games.emails.EmailMultiAlternatives.send", side_effect=RuntimeError("smtp down")
+        ):
             r = self._create()
         self.assertEqual(r.status_code, 201, r.content)  # warn-and-continue
         self.assertEqual(Game.objects.count(), 1)
+
+
+# --- Handoff #21: §F1/§F2 THUNDER FUCKED · §F3 buzz check · §F4 delete/pass ·
+# §F5 crib sheet -------------------------------------------------------------
+
+
+from .models import Buzz
+from .serializers import CellSerializer as _CellSer21, chug_state as _chug21
+from .services import (
+    _pick_thunder_cells,
+    mark_buzz_checked,
+    remove_player,
+    replace_cell_question,
+    set_thunder_wager,
+    start_thunder_clock,
+    thunder_reveal,
+)
+
+
+def _drinks_game(host, *, categories=1, per=5):
+    cats = [
+        seed_category(f"Zap{Game.objects.count()}-{i}", n_questions=per)
+        for i in range(categories)
+    ]
+    return create_game(
+        host=host, mode="drinks", category_ids=[c.id for c in cats], questions_per_category=per
+    )
+
+
+class ThunderPlacementTests(GameTestBase):
+    """§F1d: C-1's count/placement rules across board sizes, the row-0
+    exclusion, one-per-column, replace keeps the flag, and the §B no-spoiler
+    grep — a Thunder cell is INDISTINGUISHABLE in public payloads until
+    opened."""
+
+    def thunder_cells(self, game):
+        return list(game.cells.filter(is_thunder=True))
+
+    def test_ten_plus_cell_drinks_board_gets_two(self):
+        game = _drinks_game(self.host, categories=2, per=5)  # 10 cells
+        self.assertEqual(len(self.thunder_cells(game)), 2)
+
+    def test_two_to_nine_cell_drinks_board_gets_one(self):
+        game = _drinks_game(self.host, categories=1, per=3)  # 3 cells
+        self.assertEqual(len(self.thunder_cells(game)), 1)
+
+    def test_one_cell_board_gets_none(self):
+        game = _drinks_game(self.host, categories=1, per=1)
+        self.assertEqual(self.thunder_cells(game), [])
+
+    def test_points_boards_never_get_one(self):
+        cats = [seed_category("Pt-a", 5), seed_category("Pt-b", 5)]
+        game = create_game(
+            host=self.host, mode="points", category_ids=[c.id for c in cats], questions_per_category=5
+        )
+        self.assertEqual(self.thunder_cells(game), [])
+
+    def test_row_zero_excluded_even_when_the_count_says_one(self):
+        # Recorded ruling: a 1-row board (all cells row 0) marks NOTHING —
+        # the cheap-top-row exclusion outranks the 2–9-cells count.
+        cats = [seed_category(f"Top{i}", 1) for i in range(4)]
+        game = create_game(
+            host=self.host, mode="drinks", category_ids=[c.id for c in cats], questions_per_category=1
+        )
+        self.assertEqual(self.thunder_cells(game), [])
+
+    def test_never_row_zero_and_at_most_one_per_column(self):
+        # Placement is random — run the picker repeatedly on fresh boards
+        # and pin the invariants, not the coordinates.
+        for _ in range(6):
+            game = _drinks_game(self.host, categories=2, per=5)
+            marked = self.thunder_cells(game)
+            self.assertEqual(len(marked), 2)
+            self.assertTrue(all(cell.row > 0 for cell in marked))
+            self.assertEqual(len({cell.column_id for cell in marked}), len(marked))
+
+    def test_picker_is_directly_callable_and_drinks_only(self):
+        # C-1's "deterministic access for tests": the ONE small function,
+        # runnable against a built board. On a points board it's a no-op.
+        cats = [seed_category("Direct", 5)]
+        game = create_game(
+            host=self.host, mode="points", category_ids=[cats[0].id], questions_per_category=5
+        )
+        self.assertEqual(_pick_thunder_cells(game), [])
+        game.mode = "drinks"
+        game.save(update_fields=["mode"])
+        chosen = _pick_thunder_cells(game)
+        self.assertEqual(len(chosen), 1)
+        self.assertTrue(chosen[0].is_thunder)
+
+    def test_replace_cell_question_keeps_the_cell_thunder(self):
+        cat = seed_category("SwapPool", n_questions=8)  # 3 spares to draw from
+        game = create_game(
+            host=self.host, mode="drinks", category_ids=[cat.id], questions_per_category=5
+        )
+        cell = self.thunder_cells(game)[0]
+        old_question_id = cell.question_id
+        replaced = replace_cell_question(code=game.code, cell_id=cell.id, host=self.host)
+        self.assertTrue(replaced.is_thunder)  # the CELL is thunder, not the question
+        self.assertNotEqual(replaced.question_id, old_question_id)
+
+    def test_host_private_board_detail_marks_thunder(self):
+        game = _drinks_game(self.host, categories=1, per=5)
+        cell = self.thunder_cells(game)[0]
+        self.as_host()
+        res = self.client.get(f"/api/games/{game.code}/board/")
+        self.assertEqual(res.status_code, 200)
+        rows = [c for col in res.json()["columns"] for c in col["cells"]]
+        flags = {row["id"]: row["is_thunder"] for row in rows}
+        self.assertTrue(flags[cell.id])
+        self.assertEqual(sum(1 for v in flags.values() if v), 1)
+
+    def test_no_spoiler_public_payloads_with_a_normal_cell_open(self):
+        # §B pin, the grep way: with a Thunder cell UNOPENED on the board,
+        # the full public snapshot (the buzzer's payload too — WS broadcasts
+        # serialize the same GameStateSerializer) never says "thunder".
+        game = _drinks_game(self.host, categories=1, per=5)
+        thunder_cell = self.thunder_cells(game)[0]
+        normal = game.cells.filter(is_thunder=False).first()
+        open_cell(code=game.code, cell_id=normal.id)
+        payload = json.dumps(self.client.get(f"/api/games/{game.code}/").json())
+        self.assertNotIn("thunder", payload.lower())
+        self.assertEqual(BoardCell.objects.get(pk=thunder_cell.pk).state, "hidden")
+        # The per-cell public row shape is pinned too (belt + suspenders for
+        # the mid-flow sweep in ThunderFlowTests).
+        self.assertEqual(
+            set(_CellSer21(normal).data),
+            {"id", "row", "value", "state", "answered_by", "answered_correctly"},
+        )
+
+
+class ThunderFlowTests(GameTestBase):
+    """§F2: the live flow — stages, tallies per C-4, the C-2/C-6 rule
+    differences (no steals, wager follows the buzz, wrong reveals + self-
+    chugs), the guard family, and the chug block's pinned exact shape."""
+
+    def setUp(self):
+        self.game = _drinks_game(self.host, categories=1, per=5)
+        self.cell = self.game.cells.get(is_thunder=True)
+        self.a, self.b = self.add_players(self.game, "TEAM A", "TEAM B")
+
+    def chug(self):
+        game = Game.objects.select_related(
+            "current_cell__thunder_chugger", "current_cell__question"
+        ).get(pk=self.game.pk)
+        return _chug21(game)
+
+    def to_answering(self):
+        open_cell(code=self.game.code, cell_id=self.cell.id)
+        thunder_reveal(code=self.game.code)
+
+    def test_happy_path_stage_by_stage_with_tallies(self):
+        open_cell(code=self.game.code, cell_id=self.cell.id)
+        game = Game.objects.get(pk=self.game.pk)
+        self.assertFalse(game.buzzer_open)  # sting first; no early smashes
+        self.assertEqual(self.chug()["stage"], "fanfare")
+        # Fanfare WITHHOLDS the question (§F2.1) — keys stay, values null.
+        snap = self.client.get(f"/api/games/{self.game.code}/").json()
+        self.assertIsNone(snap["current_cell"]["question_text"])
+        self.assertIsNone(snap["current_cell"]["media_type"])
+        self.assertIs(snap["current_cell"]["thunder"], True)
+        self.assertIsNone(snap["revealed_answer"])  # rule 5 untouched
+
+        thunder_reveal(code=self.game.code)
+        self.assertEqual(self.chug()["stage"], "answering")
+        game.refresh_from_db()
+        self.assertTrue(game.buzzer_open)
+        snap = self.client.get(f"/api/games/{self.game.code}/").json()
+        self.assertEqual(snap["current_cell"]["question_text"], self.cell.question.question_text)
+
+        register_buzz(code=self.game.code, participant=self.a)
+        game.refresh_from_db()
+        self.assertFalse(game.buzzer_open)  # C-2: first buzz LOCKS on thunder
+
+        set_thunder_wager(code=self.game.code, seconds=17)
+        self.assertEqual(self.chug()["wager"], 17)
+
+        judge_buzz(code=self.game.code, participant_id=self.a.id, correct=True)
+        self.assertEqual(self.chug()["stage"], "pick")
+        game.refresh_from_db()
+        self.assertIsNotNone(game.current_cell.question.answer)
+        self.assertTrue(game.answer_revealed)  # correct reveals, as everywhere
+
+        assign_drink(code=self.game.code, actor=self.a, target_participant_id=self.b.id)
+        state = self.chug()
+        self.assertEqual(state["stage"], "ready")
+        self.assertEqual(state["chugger_name"], "TEAM B")
+        self.a.refresh_from_db(); self.b.refresh_from_db()
+        # C-4: the seconds ARE the stakes — never the cell's printed value.
+        self.assertEqual(self.b.drinks_taken, 17)
+        self.assertEqual(self.a.drinks_given, 17)
+        self.assertEqual(self.a.score, 17)
+
+        start_thunder_clock(code=self.game.code)
+        state = self.chug()
+        self.assertEqual(state["stage"], "running")
+        self.assertIsNotNone(state["started_at"])
+        self.assertEqual(state["seconds"], 17)
+
+        close_cell(code=self.game.code)
+        game.refresh_from_db()
+        self.assertIsNone(game.current_cell_id)
+        self.assertIsNone(_chug21(game))
+        self.cell.refresh_from_db()
+        self.assertEqual(self.cell.state, "answered")
+        self.assertEqual(self.cell.thunder_chugger_id, self.b.id)  # the report's line
+
+    def test_wrong_answer_no_steal_reveal_and_self_chug(self):
+        self.to_answering()
+        register_buzz(code=self.game.code, participant=self.a)
+        set_thunder_wager(code=self.game.code, seconds=5)
+        judge_buzz(code=self.game.code, participant_id=self.a.id, correct=False)
+        game = Game.objects.get(pk=self.game.pk)
+        self.assertFalse(game.buzzer_open)  # C-2: NO steals — never reopens
+        self.assertTrue(game.answer_revealed)  # C-6: nothing left to protect
+        self.a.refresh_from_db()
+        self.assertEqual(self.a.drinks_taken, 5)  # their own shout
+        self.assertEqual(self.a.drinks_given, 0)  # credit to NOBODY
+        self.assertEqual(self.a.score, 0)
+        state = self.chug()
+        self.assertEqual(state["stage"], "ready")
+        self.assertEqual(state["chugger_name"], "TEAM A")
+        self.cell.refresh_from_db()
+        self.assertTrue(self.cell.drinks_assigned)  # the guard family extends
+        start_thunder_clock(code=self.game.code)  # the room still counts down
+        self.assertEqual(self.chug()["stage"], "running")
+
+    def test_wager_bounds_and_types(self):
+        self.to_answering()
+        register_buzz(code=self.game.code, participant=self.a)
+        for bad in (2, 31, 0, -3):
+            with self.assertRaisesMessage(ActionError, "3–30"):
+                set_thunder_wager(code=self.game.code, seconds=bad)
+        for not_an_int in ("7", 7.5, True, None):
+            with self.assertRaisesMessage(ActionError, "whole number"):
+                set_thunder_wager(code=self.game.code, seconds=not_an_int)
+        set_thunder_wager(code=self.game.code, seconds=3)
+        set_thunder_wager(code=self.game.code, seconds=30)  # retype = typo fix
+        self.assertEqual(self.chug()["wager"], 30)
+
+    def test_judge_before_wager_blocked_with_structured_code(self):
+        self.to_answering()
+        register_buzz(code=self.game.code, participant=self.a)
+        with self.assertRaises(StructuredActionError) as caught:
+            judge_buzz(code=self.game.code, participant_id=self.a.id, correct=True)
+        self.assertEqual(caught.exception.payload["code"], "thunder_wager_required")
+        self.assertEqual(set(caught.exception.payload), {"detail", "code"})
+
+    def test_wager_before_buzz_blocked(self):
+        self.to_answering()
+        with self.assertRaisesMessage(ActionError, "follows the buzz"):
+            set_thunder_wager(code=self.game.code, seconds=10)
+
+    def test_fanfare_keeps_the_buzzer_locked(self):
+        open_cell(code=self.game.code, cell_id=self.cell.id)
+        with self.assertRaisesMessage(ActionError, "locked"):
+            register_buzz(code=self.game.code, participant=self.a)
+
+    def test_thunder_reveal_guards(self):
+        normal = self.game.cells.filter(is_thunder=False).first()
+        open_cell(code=self.game.code, cell_id=normal.id)
+        with self.assertRaisesMessage(ActionError, "isn't a Thunder cell"):
+            thunder_reveal(code=self.game.code)
+        close_cell(code=self.game.code)
+        self.to_answering()
+        with self.assertRaisesMessage(ActionError, "already up"):
+            thunder_reveal(code=self.game.code)
+
+    def test_chug_block_exact_shape_at_every_stage(self):
+        keys = {"stage", "wager", "chugger_name", "started_at", "seconds"}
+        open_cell(code=self.game.code, cell_id=self.cell.id)
+        self.assertEqual(set(self.chug()), keys)
+        thunder_reveal(code=self.game.code)
+        register_buzz(code=self.game.code, participant=self.a)
+        set_thunder_wager(code=self.game.code, seconds=8)
+        judge_buzz(code=self.game.code, participant_id=self.a.id, correct=True)
+        state = self.chug()
+        self.assertEqual(set(state), keys)
+        self.assertEqual(
+            state, {"stage": "pick", "wager": 8, "chugger_name": None, "started_at": None, "seconds": 8}
+        )
+        assign_drink(code=self.game.code, actor=self.a, target_participant_id=self.a.id)
+        start_thunder_clock(code=self.game.code)
+        state = self.chug()
+        self.assertEqual(set(state), keys)
+        # ISO 8601, parseable — the anchor every screen counts down from.
+        from datetime import datetime as _dt
+
+        _dt.fromisoformat(state["started_at"])
+
+    def test_self_pick_credits_and_drinks_the_same_team(self):
+        self.to_answering()
+        register_buzz(code=self.game.code, participant=self.a)
+        set_thunder_wager(code=self.game.code, seconds=12)
+        judge_buzz(code=self.game.code, participant_id=self.a.id, correct=True)
+        assign_drink(code=self.game.code, actor=self.a, target_participant_id=self.a.id)
+        self.a.refresh_from_db()
+        self.assertEqual((self.a.drinks_taken, self.a.drinks_given, self.a.score), (12, 12, 12))
+
+    def test_double_assignment_lands_on_the_pinned_guard(self):
+        self.to_answering()
+        register_buzz(code=self.game.code, participant=self.a)
+        set_thunder_wager(code=self.game.code, seconds=6)
+        judge_buzz(code=self.game.code, participant_id=self.a.id, correct=True)
+        assign_drink(code=self.game.code, actor=self.a, target_participant_id=self.b.id)
+        with self.assertRaises(StructuredActionError) as caught:
+            assign_drink(code=self.game.code, actor=self.a, target_participant_id=self.a.id)
+        self.assertEqual(caught.exception.payload["code"], "drinks_already_assigned")
+        self.b.refresh_from_db()
+        self.assertEqual(self.b.drinks_taken, 6)  # first assignment stood
+
+    def test_reset_pre_judgment_clears_wager_keeps_question(self):
+        self.to_answering()
+        register_buzz(code=self.game.code, participant=self.a)
+        set_thunder_wager(code=self.game.code, seconds=9)
+        reset_buzzer(code=self.game.code)
+        self.cell.refresh_from_db()
+        self.assertIsNone(self.cell.thunder_wager)
+        self.assertTrue(self.cell.thunder_revealed)  # no re-hiding theater
+        self.assertEqual(self.chug()["stage"], "answering")
+        self.assertEqual(Buzz.objects.filter(cell=self.cell).count(), 0)
+        set_buzzer(code=self.game.code, is_open=True)  # referee restarts the race
+        register_buzz(code=self.game.code, participant=self.b)
+
+    def test_reset_post_judgment_blocked(self):
+        self.to_answering()
+        register_buzz(code=self.game.code, participant=self.a)
+        set_thunder_wager(code=self.game.code, seconds=4)
+        judge_buzz(code=self.game.code, participant_id=self.a.id, correct=False)
+        with self.assertRaisesMessage(ActionError, "verdicts stick"):
+            reset_buzzer(code=self.game.code)
+
+    def test_clock_guards(self):
+        self.to_answering()
+        with self.assertRaisesMessage(ActionError, "judge the answer first"):
+            start_thunder_clock(code=self.game.code)
+        register_buzz(code=self.game.code, participant=self.a)
+        set_thunder_wager(code=self.game.code, seconds=10)
+        judge_buzz(code=self.game.code, participant_id=self.a.id, correct=False)
+        start_thunder_clock(code=self.game.code)
+        with self.assertRaisesMessage(ActionError, "already running"):
+            start_thunder_clock(code=self.game.code)
+
+    def test_removed_winner_voids_the_wager_too(self):
+        self.to_answering()
+        register_buzz(code=self.game.code, participant=self.a)
+        set_thunder_wager(code=self.game.code, seconds=15)
+        judge_buzz(code=self.game.code, participant_id=self.a.id, correct=True)
+        host_seat = Participant.objects.create(
+            game=self.game, name="Host", role=ParticipantRole.HOST
+        )
+        remove_player(code=self.game.code, participant_id=self.a.id, actor=host_seat)
+        self.cell.refresh_from_db()
+        self.assertIsNone(self.cell.thunder_wager)  # the shout left with them
+        self.assertIsNone(self.cell.answered_by_id)
+        self.assertEqual(self.chug()["stage"], "answering")  # fresh race
+        self.b.refresh_from_db()
+        self.assertEqual(self.b.drinks_taken, 0)  # nothing was ever applied
+
+    def test_mid_flow_sweep_other_thunder_cell_stays_invisible(self):
+        # §F2's mid-flow no-spoiler: with one ⚡ OPEN (its payload may say
+        # thunder), the OTHER unopened ⚡ must stay indistinguishable — every
+        # board-grid cell row carries exactly the pinned public keys.
+        game = _drinks_game(self.host, categories=2, per=5)  # 10 cells, 2 ⚡
+        first, second = list(game.cells.filter(is_thunder=True))
+        open_cell(code=game.code, cell_id=first.id)
+        thunder_reveal(code=game.code)
+        snap = self.client.get(f"/api/games/{game.code}/").json()
+        for column in snap["columns"]:
+            for row in column["cells"]:
+                self.assertEqual(
+                    set(row), {"id", "row", "value", "state", "answered_by", "answered_correctly"}
+                )
+        self.assertIs(snap["current_cell"]["thunder"], True)
+        self.assertEqual(BoardCell.objects.get(pk=second.pk).state, "hidden")
+
+
+class BuzzCheckTests(GameTestBase):
+    """§F3d: stamp + serialization, lobby-only, host rejection, reconnect
+    keeps it (same row), kicked-and-rejoined arrives unchecked (new row —
+    the natural reset, pinned)."""
+
+    def setUp(self):
+        self.game = make_game(self.host, mode="drinks")
+        (self.a,) = self.add_players(self.game, "CHECKERS")
+
+    def test_stamp_and_snapshot_flag(self):
+        mark_buzz_checked(code=self.game.code, participant=self.a)
+        self.a.refresh_from_db()
+        self.assertIsNotNone(self.a.buzz_checked_at)
+        snap = self.client.get(f"/api/games/{self.game.code}/").json()
+        row = next(p for p in snap["participants"] if p["name"] == "CHECKERS")
+        self.assertIs(row["buzz_checked"], True)
+
+    def test_unchecked_serializes_false(self):
+        snap = self.client.get(f"/api/games/{self.game.code}/").json()
+        row = next(p for p in snap["participants"] if p["name"] == "CHECKERS")
+        self.assertIs(row["buzz_checked"], False)
+
+    def test_lobby_only(self):
+        Game.objects.filter(pk=self.game.pk).update(status=GameStatus.ACTIVE)
+        with self.assertRaisesMessage(ActionError, "lobby thing"):
+            mark_buzz_checked(code=self.game.code, participant=self.a)
+
+    def test_host_seat_rejected(self):
+        host_seat = Participant.objects.create(game=self.game, name="Host", role=ParticipantRole.HOST)
+        with self.assertRaisesMessage(ActionError, "no buzzer"):
+            mark_buzz_checked(code=self.game.code, participant=host_seat)
+
+    def test_check_survives_rejoin_same_seat(self):
+        mark_buzz_checked(code=self.game.code, participant=self.a)
+        res = self.client.post(
+            f"/api/games/{self.game.code}/join/",
+            {"name": "CHECKERS", "participant_token": self.a.token},
+            format="json",
+        )
+        self.assertEqual(res.status_code, 200)  # the reload flow, same row
+        self.assertIs(res.json()["participant"]["buzz_checked"], True)
+
+    def test_kicked_and_rejoined_seat_arrives_unchecked(self):
+        mark_buzz_checked(code=self.game.code, participant=self.a)
+        host_seat = Participant.objects.create(game=self.game, name="Host", role=ParticipantRole.HOST)
+        remove_player(code=self.game.code, participant_id=self.a.id, actor=host_seat)
+        res = self.client.post(
+            f"/api/games/{self.game.code}/join/", {"name": "CHECKERS"}, format="json"
+        )
+        self.assertEqual(res.status_code, 201)  # a NEW row (the partial unique freed the name)
+        self.assertIs(res.json()["participant"]["buzz_checked"], False)
+        self.assertNotEqual(res.json()["participant"]["id"], self.a.id)
+
+
+class TournamentDeleteAndPassTests(APITestCase):
+    """§F4d: the pass-attachment check ignores soft-deleted tournaments (the
+    owner's exact repro), the owner delete 409, the staff escape hatch, and
+    the naming copy path (403 detail + the usage summary's tournament
+    block)."""
+
+    def setUp(self):
+        self.owner = User.objects.create_user("passowner@test.com", "sturdy-pass-123")
+        self.client.force_authenticate(self.owner)
+
+    def make_pass(self, session="cs_tp"):
+        return _pack(self.owner, kind=_Kind18.TOURNAMENT_PASS, question_limit=200, session=session)
+
+    def create_tournament(self, name):
+        return self.client.post("/api/tournaments/", {"name": name, "location": ""}, format="json")
+
+    def test_soft_deleted_tournament_frees_the_pass_the_owner_repro(self):
+        ent = self.make_pass()
+        first = self.create_tournament("Stuck Night")
+        self.assertEqual(first.status_code, 201, first.content)
+        ent.refresh_from_db()
+        self.assertEqual(ent.tournament_id, first.json()["id"])  # consumed
+        blocked = self.create_tournament("Second Night")
+        self.assertEqual(blocked.status_code, 403)  # one pass, one tournament
+        # The pre-#21 deletion the owner already performed: soft delete.
+        Tournament.objects.filter(pk=first.json()["id"]).update(deleted_at=timezone.now())
+        retry = self.create_tournament("Second Night")
+        self.assertEqual(retry.status_code, 201, retry.content)  # the fix
+        ent.refresh_from_db()
+        self.assertEqual(ent.tournament_id, retry.json()["id"])  # pass re-bound
+
+    def test_owner_delete_gets_the_plain_structured_409(self):
+        self.make_pass()
+        created = self.create_tournament("Keeper")
+        pk = created.json()["id"]
+        res = self.client.delete(f"/api/tournaments/{pk}/")
+        self.assertEqual(res.status_code, 409)
+        body = res.json()
+        self.assertEqual(set(body), {"detail", "code"})  # the documented plain shape
+        self.assertEqual(body["code"], "tournament_delete_disabled")
+        self.assertIn("pass stays attached", body["detail"])
+        self.assertIsNone(Tournament.objects.get(pk=pk).deleted_at)  # still live
+
+    def test_staff_delete_still_soft_deletes(self):
+        staff = User.objects.create_user("staff21@test.com", "sturdy-pass-123", is_staff=True)
+        staff.limit_overrides = {"tournaments": 5}
+        staff.save(update_fields=["limit_overrides"])
+        self.client.force_authenticate(staff)
+        created = self.create_tournament("Support Case")
+        self.assertEqual(created.status_code, 201, created.content)
+        pk = created.json()["id"]
+        res = self.client.delete(f"/api/tournaments/{pk}/")
+        self.assertEqual(res.status_code, 204)
+        self.assertIsNotNone(Tournament.objects.get(pk=pk).deleted_at)
+
+    def test_blocked_create_names_the_running_tournament(self):
+        # The COMMON blocked path for a pass holder: their pass tournament
+        # is live, so tournaments_used == the unioned limit and the generic
+        # quota denial fires — which now names the running tournament.
+        self.make_pass()
+        self.assertEqual(self.create_tournament("Thursday Throwdown").status_code, 201)
+        res = self.create_tournament("Another One")
+        self.assertEqual(res.status_code, 403)
+        body = res.json()
+        # Shape stays the pinned quota-403 family; only the STRING grew.
+        self.assertEqual(set(body), {"detail", "code", "used", "limit"})
+        self.assertEqual(body["code"], "quota_tournaments")
+        self.assertIn("Thursday Throwdown", body["detail"])
+        self.assertNotIn("delete", body["detail"].lower())  # C-8: the hint is gone
+
+    def test_finished_attached_pass_corner_also_names(self):
+        # The other branch (quota passes, no unconsumed pass): a FINISHED
+        # but undeleted attachment frees the used-count without freeing the
+        # pass — the "already attached" 403 now names it too.
+        self.make_pass()
+        created = self.create_tournament("Sealed Night")
+        pk = created.json()["id"]
+        self.client.post(f"/api/tournaments/{pk}/finish/")
+        res = self.create_tournament("After Party")
+        self.assertEqual(res.status_code, 403)
+        body = res.json()
+        self.assertEqual(set(body), {"detail", "code", "used", "limit"})
+        self.assertIn("Sealed Night", body["detail"])
+
+    def test_usage_summary_carries_the_live_attachment(self):
+        from billing.access import entitlement_usage_summary
+
+        self.make_pass()
+        created = self.create_tournament("Named Night")
+        pk = created.json()["id"]
+        row = entitlement_usage_summary(self.owner)[0]
+        self.assertEqual(row["tournament"], {"id": pk, "name": "Named Night"})
+        Tournament.objects.filter(pk=pk).update(deleted_at=timezone.now())
+        row = entitlement_usage_summary(self.owner)[0]
+        self.assertIsNone(row["tournament"])  # deleted = detached, matching the pass fix
+
+
+class CribSheetTests(APITestCase):
+    """§F5d: the PDF opens with >= 1 page and a light text extraction finds
+    the code/questions/markers (no pypdf — reportlab writes, we read the
+    content streams); the email attaches it with the right mimetype and
+    filename; a PDF failure downgrades, never breaks; points boards carry
+    no ⚡."""
+
+    def setUp(self):
+        self.host = User.objects.create_user("crib@test.com", "sturdy-pass-123", plan="creator")
+        self.client.force_authenticate(self.host)
+
+    @staticmethod
+    def pdf_text(data: bytes) -> str:
+        # The promised "light text extraction with what's already available":
+        # inflate every stream (decompressobj tolerates the trailing EOL
+        # before `endstream`), keep only streams that carry TEXT operators
+        # (Tj/TJ — this is what skips embedded font files), then join the
+        # (...) string literals. Helvetica text is literal WinAnsi, so plain
+        # words are findable; the ⚡ runs through the subset TTF as glyph
+        # ids, which is exactly why the assertions below are on WORDS.
+        import re as _re
+        import zlib as _zlib
+
+        import base64 as _b64
+
+        chunks = []
+        for match in _re.finditer(rb"stream\r?\n(.*?)endstream", data, _re.S):
+            raw = match.group(1).strip()
+            if raw.endswith(b"~>"):  # reportlab's default: ASCII85 over Flate
+                try:
+                    raw = _b64.a85decode(raw, adobe=True)
+                except Exception:
+                    pass
+            try:
+                raw = _zlib.decompressobj().decompress(raw)
+            except Exception:
+                pass
+            if b"Tj" in raw or b"TJ" in raw:
+                chunks.append(raw)
+        blob = b"".join(chunks)
+        literals = _re.findall(rb"\((?:\\.|[^\\()])*\)", blob)
+        return b"".join(l[1:-1] for l in literals).decode("latin-1", "ignore")
+
+    def test_pdf_builds_pages_and_findable_text(self):
+        from games.pdf import build_crib_sheet_pdf
+
+        cat = seed_category("Cribbed", 3)
+        game = create_game(
+            host=self.host, mode="drinks", category_ids=[cat.id], questions_per_category=3
+        )
+        data = build_crib_sheet_pdf(game)
+        self.assertTrue(data.startswith(b"%PDF"))
+        self.assertGreaterEqual(data.count(b"/Type /Page"), 1)  # page count >= 1
+        text = self.pdf_text(data)
+        self.assertIn(game.code, text)
+        self.assertIn("Cribbed", text)
+        self.assertIn("question", text)  # the seeded question text
+        self.assertIn("SECRET-Cribbed-0", text)  # answers ride along (host-only)
+        self.assertIn("THUNDER", text)  # exactly one ⚡ on a 3-cell drinks board
+        self.assertIn("wager", text)
+
+    def test_points_board_carries_no_thunder_marker(self):
+        from games.pdf import build_crib_sheet_pdf
+
+        cat = seed_category("Pointy", 3)
+        game = create_game(
+            host=self.host, mode="points", category_ids=[cat.id], questions_per_category=3
+        )
+        text = self.pdf_text(build_crib_sheet_pdf(game))
+        self.assertNotIn("THUNDER", text)
+        self.assertNotIn("wager", text)
+
+    def test_email_attaches_the_pdf_with_html_alternative(self):
+        from django.core import mail
+
+        cat = seed_category("Mailer21", 3)
+        res = self.client.post(
+            "/api/games/",
+            {"mode": "drinks", "categories": [cat.id], "questions_per_category": 3},
+            format="json",
+        )
+        self.assertEqual(res.status_code, 201, res.content)
+        code = res.json()["game"]["code"]
+        message = mail.outbox[0]
+        self.assertEqual(len(message.attachments), 1)
+        filename, payload, mimetype = message.attachments[0]
+        self.assertEqual(filename, f"drinkquiry-{code}.pdf")
+        self.assertEqual(mimetype, "application/pdf")
+        self.assertTrue(payload.startswith(b"%PDF"))
+        html, html_type = message.alternatives[0]
+        self.assertEqual(html_type, "text/html")
+        self.assertIn("Mailer21", html)
+        self.assertIn("THUNDER FUCKED", html)  # §A.4: the brand, verbatim
+        self.assertIn("SECRET-Mailer21-0", html)  # answers, host-only as ever
+        self.assertIn("SECRET-Mailer21-0", message.body)  # plain part STAYS
+
+    def test_pdf_failure_downgrades_never_breaks(self):
+        from unittest import mock
+
+        from django.core import mail
+
+        cat = seed_category("Fragile", 3)
+        with mock.patch("games.pdf.build_crib_sheet_pdf", side_effect=RuntimeError("font gremlin")):
+            res = self.client.post(
+                "/api/games/",
+                {"mode": "drinks", "categories": [cat.id], "questions_per_category": 3},
+                format="json",
+            )
+        self.assertEqual(res.status_code, 201, res.content)
+        message = mail.outbox[0]
+        self.assertEqual(message.attachments, [])  # downgraded
+        self.assertIn("SECRET-Fragile-0", message.body)  # email still whole
+
+
+class ThunderToggleTests(APITestCase):
+    """#21.1 (owner-directed): the ⚡ opt-out at creation — drinks boards
+    mark by default, `thunder: false` skips marking entirely (materialized
+    only in is_thunder; nothing stored, nothing to toggle later), points
+    boards ignore it, and the service is strict-bool (rule 4)."""
+
+    def setUp(self):
+        self.host = User.objects.create_user("toggle@test.com", "sturdy-pass-123", plan="creator")
+        self.client.force_authenticate(self.host)
+
+    def api_create(self, **extra):
+        cat = seed_category(f"Tog{Game.objects.count()}", 5)
+        return self.client.post(
+            "/api/games/",
+            {"mode": "drinks", "categories": [cat.id], "questions_per_category": 5, **extra},
+            format="json",
+        )
+
+    def test_default_marks_and_false_skips(self):
+        on = self.api_create()
+        self.assertEqual(on.status_code, 201, on.content)
+        game_on = Game.objects.get(code=on.json()["game"]["code"])
+        self.assertEqual(game_on.cells.filter(is_thunder=True).count(), 1)  # 5 cells → 1 ⚡
+        off = self.api_create(thunder=False)
+        self.assertEqual(off.status_code, 201, off.content)
+        game_off = Game.objects.get(code=off.json()["game"]["code"])
+        self.assertEqual(game_off.cells.filter(is_thunder=True).count(), 0)
+
+    def test_opted_out_board_email_and_pdf_carry_no_markers(self):
+        from django.core import mail
+
+        from games.pdf import build_crib_sheet_pdf
+
+        res = self.api_create(thunder=False)
+        self.assertEqual(res.status_code, 201, res.content)
+        game = Game.objects.get(code=res.json()["game"]["code"])
+        self.assertNotIn("THUNDER", CribSheetTests.pdf_text(build_crib_sheet_pdf(game)))
+        html = mail.outbox[-1].alternatives[0][0]
+        self.assertNotIn("THUNDER", html)
+
+    def test_points_boards_ignore_it_harmlessly(self):
+        cat = seed_category("TogPts", 5)
+        for flag in (True, False):
+            res = self.client.post(
+                "/api/games/",
+                {"mode": "points", "categories": [cat.id], "questions_per_category": 5, "thunder": flag},
+                format="json",
+            )
+            self.assertEqual(res.status_code, 201, res.content)
+            game = Game.objects.get(code=res.json()["game"]["code"])
+            self.assertEqual(game.cells.filter(is_thunder=True).count(), 0)
+
+    def test_service_is_strict_bool(self):
+        cat = seed_category("TogStrict", 5)
+        with self.assertRaises(DRFValidationError):
+            create_game(
+                host=self.host, mode="drinks", category_ids=[cat.id],
+                questions_per_category=5, thunder="yes",
+            )
+        game = create_game(
+            host=self.host, mode="drinks", category_ids=[cat.id],
+            questions_per_category=5, thunder=False,
+        )
+        self.assertEqual(game.cells.filter(is_thunder=True).count(), 0)

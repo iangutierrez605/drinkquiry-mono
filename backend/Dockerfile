@@ -8,6 +8,10 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 libmagic1 \
+    # §F5 (#21): the crib-sheet PDF's ⚡ needs a Unicode font — slim ships
+    # none. games/pdf.py registers DejaVu when present and falls back to a
+    # text marker when not, so this line is belt AND suspenders.
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

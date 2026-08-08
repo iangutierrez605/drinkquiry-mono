@@ -24,6 +24,7 @@ from .models import (
     Game,
     GameMode,
     GameStatus,
+    Participant,
     ParticipantRole,
 )
 
@@ -44,6 +45,54 @@ class StructuredActionError(ActionError):
 
 
 PUBLIC_APPROVED = Q(visibility=Visibility.PUBLIC, moderation_status=ModerationStatus.APPROVED)
+
+# §F2 (Handoff #21), C-3: the chug-wager bounds. The host is the referee
+# (same trust model as judging) — the server just keeps the number sane.
+THUNDER_WAGER_MIN = 3
+THUNDER_WAGER_MAX = 30
+
+
+def _pick_thunder_cells(game: Game) -> list[BoardCell]:
+    """§F1b (Handoff #21), C-1: mark this board's THUNDER FUCKED cells.
+
+    Drinks boards ONLY (points boards never get one — pinned). Count by
+    TOTAL cells: 2 on boards with >= 10, 1 on 2–9, 0 on a 1-cell board.
+    Placement is uniformly random EXCLUDING row 0 (the cheap top row) with
+    at most one per column — chosen server-side at create so the board is
+    fixed before anyone joins. Kept as ONE small function so the suite can
+    call it directly against a built board (C-1's "deterministic access"
+    is the DB + the host-private board view; there is deliberately NO
+    test-only create param).
+
+    Edge (recorded ruling): a 1-row board (questions_per_category=1) has
+    only row-0 cells, so even a 2–9-cell board of that shape marks NOTHING
+    — the row-0 exclusion outranks the count. Same if eligible columns run
+    out (can't happen with row-0 excluded and count <= 2 unless the board
+    has < count columns holding a row > 0 cell).
+    """
+    import random
+
+    if game.mode != GameMode.DRINKS:
+        return []
+    cells = list(game.cells.all())
+    total = len(cells)
+    count = 0 if total < 2 else (2 if total >= 10 else 1)
+    if count == 0:
+        return []
+    by_column: dict[int, list[BoardCell]] = {}
+    for cell in cells:
+        if cell.row == 0:
+            continue  # C-1: never the cheap top row
+        by_column.setdefault(cell.column_id, []).append(cell)
+    column_ids = list(by_column)
+    random.shuffle(column_ids)
+    chosen: list[BoardCell] = []
+    for column_id in column_ids[:count]:  # at most one per column
+        chosen.append(random.choice(by_column[column_id]))
+    for cell in chosen:
+        cell.is_thunder = True
+        cell.save(update_fields=["is_thunder"])
+    return chosen
 
 
 def usable_questions(category: Category, user):
@@ -113,6 +162,7 @@ def create_game(
     category_ids: list[int],
     questions_per_category: int,
     buzz_sound: int = 1,
+    thunder: bool = True,
     tournament=None,
     round_number: int | None = None,
     hand_picked: dict | None = None,
@@ -298,6 +348,17 @@ def create_game(
             BoardCell.objects.create(
                 game=game, column=column, question=question, row=row, value=_cell_value(mode, row)
             )
+    # §F1 (#21): mark the board's THUNDER FUCKED cells (drinks only, C-1).
+    # After the board loop so the pick sees the finished grid; inside this
+    # same transaction so no snapshot can ever catch a half-marked board.
+    # #21.1: `thunder=False` (the create-screen opt-out) skips the marking
+    # entirely — the board is fully ⚡-free forever (nothing stored, nothing
+    # to toggle later); the email/PDF naturally carry no markers. Validated
+    # strict-bool here because the suite calls this directly (rule 4).
+    if not isinstance(thunder, bool):
+        raise ValidationError({"thunder": ["Must be true or false."]})
+    if thunder:
+        _pick_thunder_cells(game)
     if tournament is not None:
         _auto_target_advancers(tournament=tournament, next_round=round_number)
     return game
@@ -486,11 +547,154 @@ def set_buzzer(*, code: str, is_open: bool) -> Game:
     return game
 
 
+# --- §F2 (Handoff #21): THUNDER FUCKED — the live flow ----------------------
+# Stage machine, DERIVED entirely from persisted cell state (reload-proof,
+# identical over WS and REST — the snapshot's `chug` block reads it in
+# serializers.chug_state):
+#   "fanfare"   open + not thunder_revealed        (sting; question WITHHELD)
+#   "answering" thunder_revealed, unjudged         (race → wager → judge)
+#   "pick"      judged CORRECT, no chugger yet     (winning phone picks)
+#   "ready"     chugger set, clock not started     (host: "Start the clock")
+#   "running"   thunder_started_at set             (screens count down)
+# close_cell returns the block to null exactly as it clears current_cell.
+
+
+def _thunder_cell(game: Game) -> BoardCell:
+    """The open cell, which must be Thunder — the shared guard for the three
+    host actions below. Fetched separately (the select_for_update +
+    nullable-FK Postgres foot-gun, house rule)."""
+    if game.current_cell_id is None:
+        raise ActionError("No question is open.")
+    cell = BoardCell.objects.get(pk=game.current_cell_id)
+    if not cell.is_thunder:
+        raise ActionError("This isn't a Thunder cell.")
+    return cell
+
+
+def _apply_chug(*, cell: BoardCell, chugger, credit) -> None:
+    """C-4: the seconds ARE the stakes, replacing the cell's printed value.
+
+    `chugger` drinks the wager (drinks_taken += wager); `credit` is the
+    answering team on the CORRECT path (drinks_given + score += wager — the
+    drinks-mode credit side, so the leaderboard reads exactly like a normal
+    win of `wager` drinks) or None on the WRONG path (self-chug, credit to
+    NOBODY — pinned). One DrinkAssignment row tells the history either way
+    (self-chug rows point at themselves), and the §G once-per-cell marker
+    is consumed here, which is how the drinks_already_assigned guard family
+    extends to the chug."""
+    wager = cell.thunder_wager
+    DrinkAssignment.objects.create(
+        cell=cell,
+        from_participant=credit if credit is not None else chugger,
+        to_participant=chugger,
+        amount=wager,
+    )
+    chugger.drinks_taken += wager
+    chugger.save(update_fields=["drinks_taken"])
+    if credit is not None:
+        credit.refresh_from_db()  # the chugger may BE the credit (self-pick)
+        credit.drinks_given += wager
+        credit.score += wager  # drinks dealt double as the leaderboard
+        credit.save(update_fields=["drinks_given", "score"])
+    cell.thunder_chugger = chugger
+    cell.drinks_assigned = True
+    cell.save(update_fields=["thunder_chugger", "drinks_assigned"])
+
+
+@transaction.atomic
+def thunder_reveal(*, code: str) -> Game:
+    """C-5: fanfare → answering. The host screen auto-fires this when its
+    sting playback ends (with a manual button fallback — the server never
+    sleeps); the question text enters the payload and the buzzer OPENS for
+    the sighted race (C-2)."""
+    game = Game.objects.select_for_update().get(code=code)
+    cell = _thunder_cell(game)
+    if cell.thunder_revealed:
+        raise ActionError("The question is already up.")
+    cell.thunder_revealed = True
+    cell.save(update_fields=["thunder_revealed"])
+    game.buzzer_open = True
+    fields = ["buzzer_open"] + _clear_judgment(game)  # a fresh race, no verdict
+    game.save(update_fields=fields)
+    return game
+
+
+@transaction.atomic
+def set_thunder_wager(*, code: str, seconds) -> Game:
+    """C-2/C-3: the WAGER follows the buzz — the locked-in team shouts their
+    chug seconds and the host (the referee) types them. Integer 3–30;
+    re-typing pre-judgment is allowed (typo fix); judged cells are sealed."""
+    game = Game.objects.select_for_update().get(code=code)
+    cell = _thunder_cell(game)
+    if isinstance(seconds, bool) or not isinstance(seconds, int):
+        raise ActionError("Chug seconds must be a whole number.")
+    if not (THUNDER_WAGER_MIN <= seconds <= THUNDER_WAGER_MAX):
+        raise ActionError(
+            f"Chug seconds run {THUNDER_WAGER_MIN}–{THUNDER_WAGER_MAX}."
+        )
+    if cell.answered_correctly is not None:
+        raise ActionError("Already judged — the wager is locked in.")
+    if not Buzz.objects.filter(cell=cell).exists():
+        raise ActionError("The wager follows the buzz — wait for a team to buzz in.")
+    cell.thunder_wager = seconds
+    cell.save(update_fields=["thunder_wager"])
+    return game
+
+
+@transaction.atomic
+def start_thunder_clock(*, code: str) -> Game:
+    """C-5: ALWAYS host-manual — the room needs to be ready (and the song
+    cued on the venue's own speakers; the app deliberately never plays it —
+    §A.6). Stamps the server-side anchor every screen counts down from."""
+    game = Game.objects.select_for_update().get(code=code)
+    cell = _thunder_cell(game)
+    if cell.thunder_chugger_id is None:
+        raise ActionError("Nobody's holding a drink yet — judge the answer first.")
+    if cell.thunder_started_at is not None:
+        raise ActionError("The clock is already running.")
+    cell.thunder_started_at = timezone.now()
+    cell.save(update_fields=["thunder_started_at"])
+    return game
+
+
+@transaction.atomic
+def mark_buzz_checked(*, code: str, participant) -> Game:
+    """§F3 (Handoff #21): the lobby buzzer check — the player taps their
+    buzzer in the lobby (their own sound plays LOCALLY on the phone; that's
+    the point of the check) and this stamps the seat so the host lobby and
+    the TV lobby can show the ✓. Lobby-only; a visual aid, never a start
+    gate (C-7)."""
+    game = Game.objects.select_for_update().get(code=code)
+    if game.status != GameStatus.LOBBY:
+        raise ActionError("The test smash is a lobby thing — the game already started.")
+    if participant.role == ParticipantRole.HOST:
+        raise ActionError("The host seat has no buzzer to check.")
+    Participant.objects.filter(pk=participant.pk).update(buzz_checked_at=timezone.now())
+    return game
+
+
 @transaction.atomic
 def reset_buzzer(*, code: str) -> Game:
     game = Game.objects.select_for_update().get(code=code)
     if game.current_cell_id is None:
         raise ActionError("No question is open.")
+    # §F2 (#21), C-6: reset is the referee undo and works PRE-judgment only
+    # on a Thunder cell — post-judgment the tallies already moved (the
+    # wrong-answer self-chug applies instantly), and un-drinking is not a
+    # thing. Pre-judgment it also clears the shouted wager (the wager
+    # follows the buzz; no buzz, no wager). The question stays revealed —
+    # un-revealing what the room already saw is theater (the remove_player
+    # precedent) — so the stage stays "answering" and the host reopens the
+    # buzzer for a fresh race.
+    cell = BoardCell.objects.only("id", "is_thunder", "answered_correctly", "thunder_wager").get(
+        pk=game.current_cell_id
+    )
+    if cell.is_thunder:
+        if cell.answered_correctly is not None:
+            raise ActionError("Thunder verdicts stick — the chug already counts. Close the cell to move on.")
+        if cell.thunder_wager is not None:
+            cell.thunder_wager = None
+            cell.save(update_fields=["thunder_wager"])
     Buzz.objects.filter(cell_id=game.current_cell_id).delete()
     game.buzzer_open = False
     fields = ["buzzer_open"] + _clear_judgment(game)  # §F: fresh round, no verdict
@@ -510,6 +714,13 @@ def register_buzz(*, code: str, participant) -> int:
         buzz = Buzz.objects.create(cell_id=game.current_cell_id, participant=participant)
     except IntegrityError:
         raise ActionError("You already buzzed.")
+    # §F2 (#21), C-2: on a Thunder cell the FIRST buzz locks the buzzer for
+    # real — the race decides THE team (their shout sets the wager) and
+    # there are no steals, so later buzzes would be noise. Normal cells keep
+    # accumulating an ordered list exactly as before.
+    if BoardCell.objects.filter(pk=game.current_cell_id, is_thunder=True).exists():
+        game.buzzer_open = False
+        game.save(update_fields=["buzzer_open"])
     if game.judged_participant_id is not None:
         # §F: a NEW buzz supersedes the previous team's verdict on screen —
         # the board flips from "✘ WRONG — X" to the fresh buzz list.
@@ -533,6 +744,33 @@ def judge_buzz(*, code: str, participant_id, correct: bool) -> Game:
     participant = game.participants.filter(pk=participant_id, removed_at__isnull=True).first()
     if participant is None:
         raise ActionError("Unknown participant.")
+    if cell.is_thunder:
+        # §F2 (#21): the ONE big rule difference (C-2/C-6). Judging needs
+        # the wager on the table first (the seconds ARE the stakes); a
+        # CORRECT verdict hands the pick to the winning phone exactly like
+        # a normal cell (stage "pick" — assign_drink applies the wager);
+        # a WRONG verdict never reopens the buzzer (NO steals), reveals
+        # the answer immediately (there's no steal to protect), and the
+        # self-chug applies right here — the answering team drinks their
+        # own shout, credit to nobody.
+        if cell.thunder_wager is None:
+            raise StructuredActionError(
+                "Set the chug wager first — the buzzed-in team shouts their seconds.",
+                "thunder_wager_required",
+            )
+        cell.answered_by = participant
+        cell.answered_correctly = correct
+        cell.save(update_fields=["answered_by", "answered_correctly"])
+        game.buzzer_open = False
+        game.save(update_fields=["buzzer_open"])
+        if not game.answer_revealed:
+            _perform_reveal(game)  # both verdicts show the answer on thunder
+        if not correct:
+            _apply_chug(cell=cell, chugger=participant, credit=None)
+        game.judged_participant = participant
+        game.judged_correct = correct
+        game.save(update_fields=["judged_participant", "judged_correct"])
+        return game
     if correct:
         cell.answered_by = participant
         cell.answered_correctly = True
@@ -589,6 +827,14 @@ def assign_drink(*, code: str, actor, target_participant_id) -> Game:
         raise ActionError("Pick who drinks.")
     # (Self-assignment allowed; see docstring for the one-line forbid spot.)
     winner = cell.answered_by
+    if cell.is_thunder:
+        # §F2 (#21), C-4: on a Thunder cell the pick moves the WAGER, not
+        # the printed value — same picker, same actors (winning phone or
+        # host fallback), same once-per-cell marker (consumed inside
+        # _apply_chug, which is what makes a second attempt land on the
+        # drinks_already_assigned guard above). Stage → "ready".
+        _apply_chug(cell=cell, chugger=target, credit=winner)
+        return game
     DrinkAssignment.objects.create(
         cell=cell, from_participant_id=winner.pk, to_participant=target, amount=cell.value
     )
@@ -657,7 +903,16 @@ def remove_player(*, code: str, participant_id, actor) -> Game:
         if cell.answered_by_id == participant.pk and not cell.drinks_assigned:
             cell.answered_by = None
             cell.answered_correctly = None
-            cell.save(update_fields=["answered_by", "answered_correctly"])
+            void_fields = ["answered_by", "answered_correctly"]
+            # §F2 (#21): on a Thunder cell this void can only be stage
+            # "pick" (judged correct, drink not yet assigned — the wrong
+            # path consumes drinks_assigned instantly). The wager was the
+            # vanished team's shout, so it goes with them; the round
+            # restarts in "answering" with the buzzer reopened below.
+            if cell.is_thunder and cell.thunder_wager is not None:
+                cell.thunder_wager = None
+                void_fields.append("thunder_wager")
+            cell.save(update_fields=void_fields)
             game.buzzer_open = True  # the round restarts for everyone else
             game_fields.append("buzzer_open")
             game_fields += _clear_judgment(game)

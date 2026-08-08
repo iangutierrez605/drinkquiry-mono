@@ -5,6 +5,10 @@ Connect: ws://host/ws/game/<CODE>/?token=<participant_token>
 Client -> server actions (JSON {"action": ..., ...}):
   player:
     buzz                       — register a buzz for the open question
+    buzz_check                 — §F3 (Handoff #21): the LOBBY test smash —
+                                 stamps the seat's buzz_checked_at so the
+                                 host/TV lobbies show the ✓ (the phone plays
+                                 its own sound locally; lobby-only)
     give_drink {target_participant_id}
                                — §G (Handoff #8): the winning team assigns
                                  the drink from their phone; any seat (host
@@ -26,6 +30,15 @@ Client -> server actions (JSON {"action": ..., ...}):
                                — §F (Handoff #11): soft-remove a player seat
                                  (services.remove_player). Works in lobby and
                                  active games; the host seat is unremovable
+    thunder_reveal             — §F2 (#21): fanfare → answering on a Thunder
+                                 cell (question enters the payload, buzzer
+                                 opens; the host screen auto-fires it when
+                                 its sting ends, with a manual fallback)
+    thunder_wager {seconds}    — §F2 (#21): the buzzed-in team's shouted chug
+                                 seconds (3–30), typed by the host referee
+    thunder_clock              — §F2 (#21): host-manual "Start the clock" —
+                                 stamps the server anchor the countdowns run
+                                 from (never automatic; the room gets ready)
     close_cell                 — return to board (marks cell answered)
     finish_game
 
@@ -67,12 +80,16 @@ from .services import (
     close_cell,
     finalize_game,
     judge_buzz,
+    mark_buzz_checked,
     open_cell,
     register_buzz,
     remove_player,
     reset_buzzer,
     reveal_answer,
     set_buzzer,
+    set_thunder_wager,
+    start_thunder_clock,
+    thunder_reveal,
 )
 
 
@@ -138,6 +155,11 @@ class GameConsumer(AsyncJsonWebsocketConsumer):
                         },
                     },
                 )
+            elif action == "buzz_check":
+                # §F3 (#21): lobby-only; body in services.mark_buzz_checked
+                # (the house rule). The phone already played its own sound
+                # on the tap — this just lands the ✓ on host + TV lobbies.
+                await self._handle_buzz_check()
             elif action == "give_drink":
                 # §G: player-initiated. assign_drink validates that the sender
                 # is the cell's judged-correct winner (the host seat comes in
@@ -181,6 +203,15 @@ class GameConsumer(AsyncJsonWebsocketConsumer):
                 # §F (#11): body in services.remove_player — soft flag, buzz/
                 # cell cleanup for the open round, per the house rule.
                 await self._host_remove_player(content.get("participant_id"))
+            elif action == "thunder_reveal":
+                # §F2 (#21): the three Thunder host beats — bodies in
+                # services (stage machine documented there); every one
+                # falls through to the snapshot broadcast like the rest.
+                await self._host_thunder_reveal()
+            elif action == "thunder_wager":
+                await self._host_thunder_wager(content.get("seconds"))
+            elif action == "thunder_clock":
+                await self._host_thunder_clock()
             elif action == "close_cell":
                 await self._host_close_cell()
             elif action == "finish_game":
@@ -244,7 +275,12 @@ class GameConsumer(AsyncJsonWebsocketConsumer):
             # "host" feeds the brand, "tournament" §I's identity block —
             # selected here so no snapshot pays an extra query for either
             # (the cells_remaining N+1 lesson).
-            .select_related("current_cell__question", "judged_participant", "host", "tournament")
+            # current_cell__thunder_chugger feeds §F2's chug block name —
+            # selected here so no snapshot pays an extra query for it.
+            .select_related(
+                "current_cell__question", "current_cell__thunder_chugger",
+                "judged_participant", "host", "tournament",
+            )
             .get(code=self.code)
         )
         data = GameStateSerializer(game).data
@@ -291,6 +327,22 @@ class GameConsumer(AsyncJsonWebsocketConsumer):
     @database_sync_to_async
     def _host_remove_player(self, participant_id):
         remove_player(code=self.code, participant_id=participant_id, actor=self.participant)
+
+    @database_sync_to_async
+    def _handle_buzz_check(self):
+        mark_buzz_checked(code=self.code, participant=self.participant)
+
+    @database_sync_to_async
+    def _host_thunder_reveal(self):
+        thunder_reveal(code=self.code)
+
+    @database_sync_to_async
+    def _host_thunder_wager(self, seconds):
+        set_thunder_wager(code=self.code, seconds=seconds)
+
+    @database_sync_to_async
+    def _host_thunder_clock(self):
+        start_thunder_clock(code=self.code)
 
     @database_sync_to_async
     def _host_close_cell(self):

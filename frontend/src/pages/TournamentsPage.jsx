@@ -32,6 +32,12 @@ function TournamentsBody({ auth }) {
   const [busy, setBusy] = useState(false);
   const [formError, setFormError] = useState(null);
 
+  // §F4c (#21): which LIVE tournament an ACTIVE pass is running — straight
+  // from the profile's additive usage.entitlements[].tournament block, so
+  // the blocked-create copy can LINK it ("open it") instead of hinting at
+  // the removed delete. Null when no pass is attached.
+  const [passTournament, setPassTournament] = useState(null);
+
   const reload = useCallback(() => {
     let alive = true;
     Promise.all([api.tournaments(auth.token), api.profile(auth.token)])
@@ -39,6 +45,10 @@ function TournamentsBody({ auth }) {
         if (!alive) return;
         setRows(list);
         setMeter(profile?.usage?.tournaments ?? null);
+        const attached = (profile?.usage?.entitlements ?? []).find(
+          (e) => e.kind === "tournament_pass" && e.is_active && e.tournament,
+        );
+        setPassTournament(attached?.tournament ?? null);
         setLoadError(null);
       })
       .catch((err) => alive && setLoadError(errorText(err)));
@@ -59,14 +69,16 @@ function TournamentsBody({ auth }) {
       reload();
     } catch (err) {
       const q = quotaError(err);
-      // §F8 (#18): the spent-pass corner returns code quota_tournaments
-      // with a specific, actionable detail ("already attached…") — show
-      // the server's own words for it instead of the generic count line.
+      // §F4c (#21), C-8: the copy stops saying "or delete" (that road is
+      // gone) — a pass holder's block NAMES their running tournament with
+      // a link (rendered below the form via passTournament; the server's
+      // 403 detail carries the same words for non-JSX surfaces), everyone
+      // else gets the plain count line ending in "Finish one first."
       setFormError(
         q
-          ? /pass/i.test(err?.data?.detail || "")
-            ? err.data.detail
-            : `You've used all ${q.limit} tournaments on your plan (${q.used} live). Finish or delete one first.`
+          ? passTournament || /pass/i.test(err?.data?.detail || "")
+            ? { passBlocked: true, detail: err?.data?.detail }
+            : `You've used all ${q.limit} tournaments on your plan (${q.used} live). Finish one first.`
           : errorText(err), // duplicate live name lands here as name: [...]
       );
     } finally {
@@ -147,7 +159,24 @@ function TournamentsBody({ auth }) {
                 placeholder="Ian's Bar Venue"
               />
             </label>
-            {formError && <p className="formerror">{formError}</p>}
+            {formError &&
+              (formError.passBlocked ? (
+                <p className="formerror">
+                  {passTournament ? (
+                    <>
+                      Your Tournament Pass is running{" "}
+                      <Link className="passlink" to={`/tournaments/${passTournament.id}`}>
+                        {passTournament.name}
+                      </Link>{" "}
+                      — open it. A new tournament needs a new pass.
+                    </>
+                  ) : (
+                    formError.detail
+                  )}
+                </p>
+              ) : (
+                <p className="formerror">{formError}</p>
+              ))}
             <button className="btn btn--gold" disabled={busy || !name.trim()}>
               {busy ? "Creating…" : "Create tournament"}
             </button>

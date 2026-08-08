@@ -90,17 +90,6 @@ function TournamentDetailBody({ auth }) {
     }
   };
 
-  const remove = async () => {
-    setBusy(true);
-    try {
-      await api.deleteTournament(auth.token, id);
-      navigate("/tournaments");
-    } catch (err) {
-      setLoadError(errorText(err));
-      setBusy(false);
-    }
-  };
-
   if (loadError)
     return (
       <div className="page">
@@ -158,8 +147,11 @@ function TournamentDetailBody({ auth }) {
           </p>
         </div>
         <div className="tournamenthead__actions">
+          {/* §F4b (#21), C-8: the Delete button is GONE (deliberately
+              removed, not deferred — the server 409s owner deletes too).
+              Deleting looked like the way to free a stuck pass, orphaned
+              real history, and the pass bug is fixed at the source now. */}
           {!finished && <ArmButton label="Finish tournament" armedLabel="Really finish?" onFire={finish} disabled={busy} />}
-          <ArmButton label="Delete" armedLabel="Really delete?" danger onFire={remove} disabled={busy} />
           <Link className="btn btn--ghost btn--sm" to="/tournaments">
             All tournaments
           </Link>

@@ -26,7 +26,9 @@ def user_entitlements(user):
     source_subscription). Anonymous users have none."""
     if not getattr(user, "is_authenticated", False):
         return Entitlement.objects.none()
-    return Entitlement.objects.filter(user=user).select_related("source_subscription")
+    # "tournament" rides along for the §F4 (#21) live-attachment checks +
+    # the usage summary's tournament block — one OneToOne join, no N+1.
+    return Entitlement.objects.filter(user=user).select_related("source_subscription", "tournament")
 
 
 def active_entitlements(user, kinds=None):
@@ -64,11 +66,33 @@ def venue_active(user) -> bool:
 
 def unconsumed_active_passes(user):
     """§F8 slice: tournament passes that are active and not yet bound to a
-    tournament — each permits exactly one tournament create."""
+    LIVE tournament — each permits exactly one tournament create.
+
+    §F4a (#21), the owner's stuck-pass fix: "bound" counts live tournaments
+    ONLY (deleted_at is null). Entitlement.tournament is SET_NULL on HARD
+    delete, but normal deletion is SOFT (Tournament.deleted_at) — so before
+    this, a pass whose tournament was soft-deleted read consumed forever.
+    A soft-deleted tournament now frees its pass retroactively, exactly the
+    owner's repro (pinned in games.TournamentDeleteAndPassTests). Note the
+    ledger itself is untouched: the FK stays pointing at the dead row for
+    history; only THIS liveness reading changed."""
     return [
         e
         for e in active_entitlements(user, (EntitlementKind.TOURNAMENT_PASS,))
-        if e.tournament_id is None
+        if e.tournament_id is None or e.tournament.deleted_at is not None
+    ]
+
+
+def attached_live_pass_tournaments(user):
+    """§F4c (#21): the tournaments the user's ACTIVE passes are currently
+    running (live attachments only) — feeds the create-blocked copy that
+    NAMES the tournament instead of hinting at deletion, and the usage
+    summary's tournament block. Newest attachment first (entitlement
+    ordering)."""
+    return [
+        e.tournament
+        for e in active_entitlements(user, (EntitlementKind.TOURNAMENT_PASS,))
+        if e.tournament_id is not None and e.tournament.deleted_at is None
     ]
 
 
@@ -263,6 +287,18 @@ def entitlement_usage_summary(user) -> list[dict]:
             "game_limit": ent.game_limit,
             "category_limit": category_limit_for_kind(ent.kind) if bound else None,
             "categories_used": pack_categories_used(ent) if bound else None,
+            # §F4c (#21), ADDITIVE: which LIVE tournament this pass is
+            # running — {id, name} | null. The frontend's blocked-create
+            # copy links it ("Your Tournament Pass is running <name> — open
+            # it"). Null for non-pass kinds, unconsumed passes, and passes
+            # whose tournament was (soft-)deleted — that pass reads free
+            # again, matching unconsumed_active_passes. Exact-set pins
+            # moved in this same commit (billing StatusViewTests).
+            "tournament": (
+                {"id": ent.tournament_id, "name": ent.tournament.name}
+                if ent.tournament_id is not None and ent.tournament.deleted_at is None
+                else None
+            ),
         }
         if ent.kind in VENUE_KINDS:
             row["active_questions"] = {

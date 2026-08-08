@@ -4,8 +4,8 @@ import { QRCodeSVG } from "qrcode.react";
 import { api, mediaUrl } from "../lib/api";
 import { loadSeat } from "../lib/storage";
 import { useGameSocket } from "../lib/useGameSocket";
-import { ensureAudio, playBuzz } from "../lib/sounds";
-import { BoardGrid, FinalStandings, MediaBlock } from "../components/shared";
+import { THUNDER_CHUG_URL, ensureAudio, loadTrack, playBuzz, playTrackFrom } from "../lib/sounds";
+import { BoardGrid, FinalStandings, MediaBlock, useChugRemaining } from "../components/shared";
 
 /**
  * Read-only projected view. It never sends actions.
@@ -63,7 +63,46 @@ export default function BoardPage() {
   // policy needs a user gesture ON THIS DEVICE before audio, so sound stays
   // behind a small enable control, default OFF, no persistence. Sound is
   // display-only side data (rule 1): nothing gates on it.
+  // §F2 (#21): the THUNDER FUCKED block + drift-proof countdown — both
+  // pure snapshot renders (rule 1); the hook runs before the early
+  // returns below.
+  const chug = (usePolling ? polled : ws.game)?.chug ?? null;
+  const chugRemaining = useChugRemaining(chug);
+
   const [soundOn, setSoundOn] = useState(false);
+
+  // #21.1: the TV plays the OFFICIAL chug track (frontend/public/
+  // thunder-chug.mp3) while the clock runs — behind the same 🔊 toggle as
+  // every board sound (the tap is this device's autoplay gesture). The
+  // start SEEKS to match the server anchor (elapsed since chug.started_at),
+  // so a board that notices late — or a toggle flipped mid-chug — lands IN
+  // the song at the right spot (the countdown's own C-5 trick), and playFor
+  // schedules the fade exactly at zero. Missing/undecodable file → silent
+  // countdown, numbers only (today's behavior). Cleanup fades out on close,
+  // stage change, or toggle-off.
+  const chugStopRef = useRef(null);
+  const chugRunning = chug?.stage === "running" && chug.started_at && chug.seconds != null;
+  useEffect(() => {
+    if (!chugRunning || !soundOn) return undefined;
+    let cancelled = false;
+    (async () => {
+      const buffer = await loadTrack(THUNDER_CHUG_URL);
+      if (cancelled || !buffer) return;
+      const elapsed = (Date.now() - new Date(chug.started_at).getTime()) / 1000;
+      const remaining = chug.seconds - elapsed;
+      if (remaining <= 0.3) return; // arrived after the glass went down
+      chugStopRef.current = playTrackFrom(buffer, {
+        offset: Math.max(0, elapsed),
+        playFor: remaining,
+      });
+    })();
+    return () => {
+      cancelled = true;
+      chugStopRef.current?.();
+      chugStopRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chugRunning, soundOn, chug?.started_at]);
   const soundOnRef = useRef(soundOn);
   soundOnRef.current = soundOn;
   const gameSoundRef = useRef(1);
@@ -245,6 +284,9 @@ export default function BoardPage() {
             ) : (
               players.map((p) => (
                 <span key={p.id} className={`tv__joiner ${p.connected ? "" : "tv__joiner--off"}`}>
+                  {/* §F3 (#21): the buzz-check ✓ — a visual aid, never a
+                      start gate (C-7). */}
+                  {p.buzz_checked && <span className="tv__joinercheck">✓</span>}
                   {p.name}
                 </span>
               ))
@@ -274,7 +316,44 @@ export default function BoardPage() {
           (close, reset, explicit reopen, next buzz, next cell) already
           handle every exit, so there is zero backend change and both WS and
           polling boards get it (snapshot-only inputs, §C2). */}
-      {game.status === "active" && cell && judgment?.correct && (
+      {/* §F2 (#21): the THUNDER FUCKED screens. Fanfare = the splash (the
+          question is server-withheld until the host's reveal); ready =
+          "<TEAM> CHUGS Ns" waiting on the host's clock; running = the
+          FULL-SCREEN countdown (computed locally off the server anchor —
+          C-5); zero = the done splash, client-side. These own the screen
+          over every other active-cell block. */}
+      {game.status === "active" && cell && chug && chug.stage === "fanfare" && (
+        <div className="tv__thunder" role="status">
+          <div className="tv__thunderbolt">⚡</div>
+          <div className="tv__thundername">THUNDER FUCKED</div>
+          <div className="tv__thundersub">someone's about to chug — eyes up</div>
+        </div>
+      )}
+      {game.status === "active" && cell && chug && chug.stage === "ready" && (
+        <div className="tv__thunder" role="status">
+          <div className="tv__thunderbolt">⚡</div>
+          <div className="tv__thundername">{chug.chugger_name} CHUGS {chug.seconds}s</div>
+          <div className="tv__thundersub">when the host starts the clock — get the song going</div>
+        </div>
+      )}
+      {game.status === "active" && cell && chug && chug.stage === "running" && (
+        <div className="tv__thunder tv__thunder--running" role="timer">
+          {chugRemaining === 0 ? (
+            <>
+              <div className="tv__thunderbolt">🍻</div>
+              <div className="tv__thundername">DONE!</div>
+              <div className="tv__thundersub">{chug.chugger_name} lives to buzz again</div>
+            </>
+          ) : (
+            <>
+              <div className="tv__chugcount">{chugRemaining}</div>
+              <div className="tv__thundername">{chug.chugger_name} CHUGS</div>
+            </>
+          )}
+        </div>
+      )}
+
+      {game.status === "active" && cell && (!chug || !["fanfare", "ready", "running"].includes(chug.stage)) && judgment?.correct && (
         <div className="tv__takeover" role="status">
           <div className="tv__takeoverEyebrow">✔ CORRECT</div>
           <div className="tv__takeoverName">{judgment.name}</div>
@@ -293,7 +372,7 @@ export default function BoardPage() {
         </div>
       )}
 
-      {game.status === "active" && cell && (
+      {game.status === "active" && cell && (!chug || !["fanfare", "ready", "running"].includes(chug.stage)) && (
         <div className={`tv__question ${revealedAnswer != null ? "tv__question--revealed" : ""}`}>
           {/* §F (#8): with a verdict (or a revealed answer) on screen, the
               board LEADS with it and the buzzer-lock chip disappears — no
@@ -315,9 +394,15 @@ export default function BoardPage() {
             </div>
           )}
           <div className="tv__qtop">
-            <span className="valuechip valuechip--tv">
-              {game.mode === "drinks" ? `${cell.value} DRINKS` : `${cell.value} POINTS`}
-            </span>
+            {chug ? (
+              <span className="valuechip valuechip--tv valuechip--thunder">
+                ⚡ {chug.wager != null ? `${chug.wager}s CHUG` : "THUNDER FUCKED"}
+              </span>
+            ) : (
+              <span className="valuechip valuechip--tv">
+                {game.mode === "drinks" ? `${cell.value} DRINKS` : `${cell.value} POINTS`}
+              </span>
+            )}
             {!verdictOnScreen && (
               <span className={`buzzstate buzzstate--tv ${game.buzzer_open ? "buzzstate--open" : "buzzstate--locked"}`}>
                 {game.buzzer_open ? "🟢 BUZZERS OPEN" : "🔒 BUZZERS LOCKED"}

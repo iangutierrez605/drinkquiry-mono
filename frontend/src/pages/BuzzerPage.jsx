@@ -4,7 +4,7 @@ import { api, errorText, ApiError, SUPPORT_EMAIL } from "../lib/api";
 import { clearSeat, loadSeat, saveSeat } from "../lib/storage";
 import { useGameSocket } from "../lib/useGameSocket";
 import { ensureAudio, playBuzz } from "../lib/sounds";
-import { FinalStandings, ScoreStrip, Toast } from "../components/shared";
+import { FinalStandings, ScoreStrip, Toast, useChugRemaining } from "../components/shared";
 
 export default function BuzzerPage() {
   const { code = "" } = useParams();
@@ -274,6 +274,12 @@ function BuzzerLive({ code, seat, onBadSeat }) {
   };
 
   const cell = game?.current_cell;
+  // §F2 (#21): the THUNDER FUCKED block + the drift-proof countdown — both
+  // straight from the snapshot (rule 1); the hook runs before the early
+  // returns below (C11 hook order).
+  const chug = game?.chug ?? null;
+  const chugRemaining = useChugRemaining(chug);
+  const inLobby = game?.status === "lobby";
   // §F/§G: everything below derives from the snapshot (rule 1) — the verdict
   // marker, the once-per-cell assigned flag, and the winner check all come
   // from server state; the server re-validates every give_drink (rule 4).
@@ -299,6 +305,19 @@ function BuzzerLive({ code, seat, onBadSeat }) {
     ensureAudio();
     playBuzz(game?.buzz_sound ?? 1);
     send("buzz");
+    setPressed(true);
+    clearTimeout(pressTimer.current);
+    pressTimer.current = setTimeout(() => setPressed(false), 250);
+  };
+
+  // §F3 (#21): the lobby test smash — the tap plays THIS phone's sound
+  // locally (that's the whole point of the check) and stamps the seat so
+  // the ✓ lands on the host screen and the TV. Restamping is harmless.
+  const testSmash = () => {
+    if (!inLobby) return;
+    ensureAudio();
+    playBuzz(game?.buzz_sound ?? 1);
+    send("buzz_check");
     setPressed(true);
     clearTimeout(pressTimer.current);
     pressTimer.current = setTimeout(() => setPressed(false), 250);
@@ -417,8 +436,12 @@ function BuzzerLive({ code, seat, onBadSeat }) {
   let stateLabel;
   let stateClass;
   if (game.status === "lobby") {
-    stateLabel = "Waiting for the host to start";
-    stateClass = "idle";
+    // §F3 (#21): "give it a test smash" — C-7's visual aid, tappable.
+    stateLabel = self?.buzz_checked ? "Checked ✓ — smash away" : "Give it a test smash";
+    stateClass = self?.buzz_checked ? "checked" : "check";
+  } else if (chug?.stage === "fanfare") {
+    stateLabel = "⚡ THUNDER FUCKED";
+    stateClass = "thunder";
   } else if (!cell) {
     stateLabel = "Watch the board…";
     stateClass = "idle";
@@ -444,19 +467,48 @@ function BuzzerLive({ code, seat, onBadSeat }) {
       </header>
 
       <div className="buzzstage">
-        <button
-          type="button"
-          className={`bigbuzz bigbuzz--${stateClass} ${pressed ? "bigbuzz--pressed" : ""}`}
-          disabled={!canBuzz}
-          onPointerDown={buzz}
-        >
-          <span className="bigbuzz__label">{stateLabel}</span>
-          {cell && !alreadyBuzzed && (
-            <span className="bigbuzz__value">
-              {game.mode === "drinks" ? `${cell.value} 🍺 on the line` : `${cell.value} pts on the line`}
-            </span>
-          )}
-        </button>
+        {chug?.stage === "running" ? (
+          /* §F2 (#21): the phone's mini-countdown mirrors the TV (C-5:
+             computed locally off the snapshot's server anchor). */
+          <div className="buzzchug" role="status">
+            {chugRemaining === 0 ? (
+              <>
+                <span className="buzzchug__count">🍻</span>
+                <span className="buzzchug__line">DONE — {chug.chugger_name} survived</span>
+              </>
+            ) : (
+              <>
+                <span className="buzzchug__count">{chugRemaining}</span>
+                <span className="buzzchug__line">{chug.chugger_name} CHUGS</span>
+              </>
+            )}
+          </div>
+        ) : (
+          <button
+            type="button"
+            className={`bigbuzz bigbuzz--${stateClass} ${pressed ? "bigbuzz--pressed" : ""}`}
+            disabled={!canBuzz && !inLobby}
+            onPointerDown={inLobby ? testSmash : buzz}
+          >
+            <span className="bigbuzz__label">{stateLabel}</span>
+            {inLobby && (
+              <span className="bigbuzz__value">hear your buzz — the host sees the ✓</span>
+            )}
+            {chug?.stage === "fanfare" && (
+              <span className="bigbuzz__value">a daily double is loose — hold tight</span>
+            )}
+            {cell && !chug && !alreadyBuzzed && (
+              <span className="bigbuzz__value">
+                {game.mode === "drinks" ? `${cell.value} 🍺 on the line` : `${cell.value} pts on the line`}
+              </span>
+            )}
+            {cell && chug && chug.stage === "answering" && !alreadyBuzzed && (
+              <span className="bigbuzz__value">
+                ⚡ {chug.wager != null ? `${chug.wager}s on the line` : "winner shouts their chug seconds"}
+              </span>
+            )}
+          </button>
+        )}
       </div>
 
       {judgment && (
@@ -471,9 +523,18 @@ function BuzzerLive({ code, seat, onBadSeat }) {
         </div>
       )}
 
+      {chug && (chug.stage === "ready" || chug.stage === "running") && (
+        <p className="buzzdrinkline buzzdrinkline--thunder">
+          ⚡ {chug.chugger_name === self?.name ? "YOU CHUG" : `${chug.chugger_name} CHUGS`} {chug.seconds}s
+          {chug.stage === "ready" ? " — clock's with the host" : ""}
+        </p>
+      )}
+
       {canGiveDrink && (
         <div className="drinkpick">
-          <h2 className="h2 drinkpick__title">Who drinks {cell.value} 🍺? Your call.</h2>
+          <h2 className="h2 drinkpick__title">
+            {chug ? `Who chugs ${chug.wager}s? Your call. ⚡` : `Who drinks ${cell.value} 🍺? Your call.`}
+          </h2>
           <div className="drinkpick__btns">
             {game.participants.map((p) => (
               <button
