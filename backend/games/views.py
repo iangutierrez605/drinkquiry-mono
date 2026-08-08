@@ -19,7 +19,7 @@ from rest_framework.views import APIView
 from trivia.models import Category as TriviaCategory
 
 from .emails import send_board_email
-from .models import Game, GameStatus, Participant, ParticipantRole, Tournament
+from .models import Game, GameStatus, Participant, ParticipantRole, Tournament, TournamentAdvancer
 from .serializers import (
     BoardDetailCellSerializer,
     BoardDetailColumnSerializer,
@@ -268,7 +268,17 @@ class GameJoinView(APIView):
 
 
 class GameStateView(APIView):
-    """GET /api/games/<code>/ — full board snapshot (also pushed over WS)."""
+    """GET /api/games/<code>/ — full board snapshot (also pushed over WS).
+
+    §F3b (Handoff #20): `?seat=<participant_token>` — optional, and the ONE
+    way the additive `my_advancement` key stops being null: the token must
+    resolve to an ACTIVE participant of THIS game, and only that seat's own
+    advancement is disclosed (rank + target code/status + claimed — never
+    anyone's ids or tokens, §B rule 5). Everyone else, including every WS
+    broadcast (which is group-shared by construction), gets null. The
+    buzzer's finish screen polls this — advancement happens minutes after
+    the last snapshot broadcast, so a passive payload could never carry it.
+    """
 
     permission_classes = (permissions.AllowAny,)
 
@@ -280,7 +290,164 @@ class GameStateView(APIView):
             .select_related("current_cell__question", "judged_participant", "host", "tournament"),
             code=code.upper(),
         )
-        return Response(GameStateSerializer(game, context={"request": request}).data)
+        context = {"request": request}
+        seat_token = request.query_params.get("seat")
+        if seat_token:
+            context["seat_participant"] = next(
+                (
+                    p
+                    for p in game.participants.all()
+                    if p.token == seat_token and p.removed_at is None
+                ),
+                None,
+            )
+        return Response(GameStateSerializer(game, context=context).data)
+
+
+class GameClaimView(APIView):
+    """POST /api/games/<target-code>/claim/  {participant_token}
+
+    §F3a (Handoff #20): a qualifier seats THEMSELVES into the next round —
+    no account, no re-typing. The ROUND-1 participant token is the proof
+    (the same no-account auth every game surface uses; #19's C-2 keeps it
+    on the phone through logout). Server verifies, in the handoff's order:
+    token → active participant P (401 otherwise); P's game FINISHED; an
+    advancer row links source_participant=P to THIS game; the target is in
+    LOBBY (C-5 — manual join-by-code keeps working the whole time and after);
+    the claim is unspent (the §F1c partial unique is the DB truth behind the
+    check); the advancer's NAME is free among active seats (C-8: structured
+    error naming the conflict, no silent suffixing — the host resolves).
+    Chosen ruling (flagged): the MAX_PLAYERS cap applies to claims too, with
+    the exact pinned game_full shape — a 7th seat is a 7th seat however it
+    arrives; the host kicks a walk-up to free one (the C-8 pattern).
+    Then: create the seat (role=player, name=advancer.name, claimed_from=P,
+    the join round-robin buzzer_sound) and answer EXACTLY like the join
+    endpoint — the buzzer stores it via the normal saveSeat path.
+    """
+
+    permission_classes = (permissions.AllowAny,)
+
+    def post(self, request, code):
+        target = get_object_or_404(
+            Game.objects.select_related("host", "tournament"), code=code.upper()
+        )
+        token = request.data.get("participant_token") or ""
+        source = (
+            Participant.objects.select_related("game")
+            .filter(token=token, removed_at__isnull=True)
+            .first()
+        )
+        if source is None:
+            return Response(
+                {"detail": "That buzzer token isn't valid anymore."},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        if source.game.status != GameStatus.FINISHED:
+            return Response(
+                {
+                    "detail": "Your game hasn't finished yet — seats open once it has.",
+                    "code": "claim_source_unfinished",
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        advancer = (
+            TournamentAdvancer.objects.filter(source_participant=source, target_game=target)
+            .order_by("-id")
+            .first()
+        )
+        if advancer is None:
+            # One honest code for both "didn't qualify" and "wrong target" —
+            # either way, no advancer row routes THIS seat into THIS game.
+            return Response(
+                {
+                    "detail": "This seat didn't advance into that game — check with your host.",
+                    "code": "claim_not_qualified",
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if target.status != GameStatus.LOBBY:
+            return Response(
+                {
+                    "detail": "That game has already started — join it by code if your host says so.",
+                    "code": "claim_target_started",
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        if Participant.objects.filter(game=target, claimed_from=source).exists():
+            return Response(
+                {
+                    "detail": "This seat was already claimed for that game.",
+                    "code": "claim_already_claimed",
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        try:
+            with transaction.atomic():
+                locked = Game.objects.select_for_update().get(pk=target.pk)
+                if locked.status != GameStatus.LOBBY:
+                    return Response(
+                        {
+                            "detail": "That game has already started — join it by code if your host says so.",
+                            "code": "claim_target_started",
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+                active = list(
+                    locked.participants.filter(
+                        role=ParticipantRole.PLAYER, removed_at__isnull=True
+                    )
+                )
+                if any(p.name == advancer.name for p in active):
+                    # C-8: fail LOUD and structured; two "TEAM A (2)"s on a
+                    # bracket is worse than a 10-second host fix.
+                    return Response(
+                        {
+                            "detail": (
+                                f"“{advancer.name}” is already seated in that game — "
+                                "ask your host to sort the seat, then tap again."
+                            ),
+                            "code": "claim_name_taken",
+                            "name": advancer.name,
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+                if len(active) >= settings.MAX_PLAYERS_PER_GAME:
+                    return Response(
+                        {
+                            "detail": (
+                                f"This game already has {settings.MAX_PLAYERS_PER_GAME} teams — "
+                                "join an existing team and share their buzzer."
+                            ),
+                            "code": "game_full",
+                            "limit": settings.MAX_PLAYERS_PER_GAME,
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+                participant = Participant.objects.create(
+                    game=locked,
+                    name=advancer.name,
+                    claimed_from=source,
+                    buzzer_sound=(len(active) % 4) + 1,
+                )
+        except IntegrityError:
+            # OUTSIDE the atomic block (house rule). Either partial unique
+            # (name, or the §F1c claim ledger) racing another request lands
+            # here; the room's next tap tells the truth.
+            return Response(
+                {
+                    "detail": "That seat was just taken — ask your host, then try again.",
+                    "code": "claim_conflict",
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(
+            {
+                "participant": ParticipantSerializer(participant).data,
+                "participant_token": participant.token,
+                "game": GameStateSerializer(target, context={"request": request}).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class GameAnswerView(APIView):
@@ -563,7 +730,12 @@ class TournamentDetailView(APIView):
                         "participants"
                     ),
                 ),
-                "advancers",
+                # §F2 (#20): advancer rows now render source AND target codes —
+                # select both here so the serializer stays query-free.
+                Prefetch(
+                    "advancers",
+                    queryset=TournamentAdvancer.objects.select_related("source_game", "target_game"),
+                ),
             ),
             pk=pk,
         )
@@ -589,6 +761,44 @@ class TournamentFinishView(APIView):
             tournament.finished_at = timezone.now()
             tournament.save(update_fields=["finished_at"])
         return Response(TournamentSerializer(tournament).data)
+
+
+class TournamentAdvancerTargetView(APIView):
+    """POST /api/tournaments/<pk>/advancers/<advancer_id>/target/
+    {game: "<CODE>" | null} — §F2 (#20): the host routes ONE qualifier into
+    one next-round game (C-4's multi-game lane; single-game rounds auto-set
+    and never need this). Owner-scoped like every tournament surface; the
+    game must belong to THIS tournament and sit in round N+1 (400 otherwise);
+    null clears back to "ask your host". A finished tournament rejects with
+    the pinned tournament_finished 409, exactly like advance."""
+
+    permission_classes = (permissions.IsAuthenticated,)
+
+    def post(self, request, pk, advancer_id):
+        tournament = _own_live_tournament(request, pk)
+        if tournament.finished_at is not None:
+            return Response(TOURNAMENT_FINISHED, status=status.HTTP_409_CONFLICT)
+        advancer = get_object_or_404(
+            TournamentAdvancer.objects.filter(tournament=tournament), pk=advancer_id
+        )
+        raw = request.data.get("game")
+        if raw is None or raw == "":
+            advancer.target_game = None
+        else:
+            game = tournament.games.filter(code=str(raw).upper()).first()
+            if game is None:
+                return Response(
+                    {"game": ["No such game in this tournament."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if game.round_number != advancer.round_number + 1:
+                return Response(
+                    {"game": [f"Pick a round {advancer.round_number + 1} game."]},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            advancer.target_game = game
+        advancer.save(update_fields=["target_game"])
+        return Response(TournamentAdvancerSerializer(advancer).data)
 
 
 class TournamentAdvanceView(APIView):

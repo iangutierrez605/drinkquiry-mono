@@ -346,6 +346,15 @@ export const api = {
       authToken: token,
       body: { per_game: perGame },
     }),
+  // §F2 (#20): route ONE qualifier into one next-round game (C-4's
+  // multi-game lane; single-game rounds auto-target server-side).
+  // gameCode null/undefined clears the target back to "ask your host".
+  setAdvancerTarget: (token, id, advancerId, gameCode) =>
+    request(`/api/tournaments/${id}/advancers/${advancerId}/target/`, {
+      method: "POST",
+      authToken: token,
+      body: { game: gameCode ?? null },
+    }),
 
   // ---- Games ----
   // §H (#13): buzz_sound (1–4) is the host's per-game sound choice; the
@@ -375,7 +384,20 @@ export const api = {
         ...(hand_picked && Object.keys(hand_picked).length ? { hand_picked } : {}),
       },
     }),
-  gameSnapshot: (code) => request(`/api/games/${code.toUpperCase()}/`),
+  // §F3b (#20): `seatToken` (optional) unlocks the snapshot's additive
+  // `my_advancement` block — the caller's OWN seat only. One-arg calls
+  // build the exact same URL as before (qs drops empties).
+  gameSnapshot: (code, seatToken) =>
+    request(`/api/games/${code.toUpperCase()}/${qs({ seat: seatToken })}`),
+  // §F3a (#20): a qualifier claims their next-round seat with their
+  // PREVIOUS round's participant token; the response mirrors joinGame
+  // ({participant, participant_token, game}) so the buzzer stores the new
+  // seat via the normal saveSeat path.
+  claimSeat: (code, participantToken) =>
+    request(`/api/games/${code.toUpperCase()}/claim/`, {
+      method: "POST",
+      body: { participant_token: participantToken },
+    }),
   // Host-private answer for the open cell (Handoff #6 §F1). Knox-authed and
   // host-checked server-side; works pre-reveal — that's its whole point. The
   // answer never rides a snapshot or WS payload before reveal (rule 5).

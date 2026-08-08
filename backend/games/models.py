@@ -185,6 +185,21 @@ class Participant(models.Model):
     # removed_at__isnull=True; history surfaces (the finished report, cell
     # attribution via the snapshot's `former_players`) keep the row.
     removed_at = models.DateTimeField(null=True, blank=True)
+    # §F1c (Handoff #20): the one-time-claim ledger. Set ONLY by the claim
+    # endpoint — this seat was created by a qualifier proving identity with
+    # their previous round's token (claimed_from = that round's Participant).
+    # Self-FK ACROSS games (source lives in the feeder game, this row in the
+    # target). SET_NULL: deleting an old game must never delete a claimed
+    # seat. The partial unique below is what makes claims one-time: a
+    # wholesale advance_round re-run may replace ADVANCER rows, but the claim
+    # lives here on the created participant, so re-running advancement can
+    # never duplicate or orphan a seat. Deliberately NOT filtered on
+    # removed_at anywhere: a kicked claimed seat still spends the claim (the
+    # constraint would block a re-claim regardless) — the team re-joins by
+    # code, the C-6 fallback.
+    claimed_from = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
     connected = models.BooleanField(default=False)
     joined_at = models.DateTimeField(auto_now_add=True)
 
@@ -198,6 +213,16 @@ class Participant(models.Model):
                 fields=["game", "name"],
                 condition=models.Q(removed_at__isnull=True),
                 name="unique_participant_name_per_game",
+            ),
+            # §F1c (Handoff #20): one claim per (target game, source seat) —
+            # the fifth house partial unique. Not on claimed_from alone: a
+            # host retargeting after a re-run may legitimately route the same
+            # qualifier into a DIFFERENT game (the stale seat is a 10-second
+            # host fix, the C-8 spirit).
+            models.UniqueConstraint(
+                fields=["game", "claimed_from"],
+                condition=models.Q(claimed_from__isnull=False),
+                name="unique_claim_per_game_source",
             ),
         ]
 
@@ -293,6 +318,27 @@ class TournamentAdvancer(models.Model):
     name = models.CharField(max_length=50)
     source_game = models.ForeignKey(Game, on_delete=models.CASCADE, related_name="+")
     rank = models.PositiveSmallIntegerField()
+    # §F1a (Handoff #20): the #13 names-not-FKs ruling UPGRADED, not
+    # reversed — the NAME still goes through and is still what the next
+    # round's seat is called; this FK additionally remembers WHICH seat
+    # earned it, so that seat's token (already on the winning phone — #19
+    # C-2 keeps player seats through logout) can prove identity to the claim
+    # endpoint. SET_NULL + null: an advancer must survive anything that
+    # happens to the seat row. INTERNAL/host-side only (§B): public
+    # tournament standings stay {name, score, rank}; no participant id or
+    # token ever rides a public tournament payload.
+    source_participant = models.ForeignKey(
+        Participant, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    # §F1b: where this qualifier claims INTO. Auto-set when the next round
+    # has exactly ONE game (computed at advance time AND when a next-round
+    # game is later created — whichever happens second closes the gap;
+    # services.advance_round + services.create_game). With multiple games
+    # the host assigns per advancer (C-4) via the tournament console; null =
+    # "ask your host" on the qualifier's phone.
+    target_game = models.ForeignKey(
+        Game, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

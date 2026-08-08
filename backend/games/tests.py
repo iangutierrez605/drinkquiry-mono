@@ -1895,11 +1895,17 @@ class TournamentAdvanceTests(TournamentTestBase):
         self.assertEqual(body["round_number"], 1)
         self.assertEqual(body["per_game"], 1)
         rows = body["advancers"]
+        # §F2 (#20): rows gained `id` + `target_game` ADDITIVELY — this
+        # exact assertion moved in the same session (the #17 precedent).
+        # No round-2 game exists here, so every target is null; ids are
+        # asserted by type (autoincrement) and popped for the exact match.
+        for row in rows:
+            self.assertIsInstance(row.pop("id"), int)
         self.assertEqual(
             rows,
-            [{"round_number": 1, "name": "A", "rank": 1, "source_game": g1.code},
-             {"round_number": 1, "name": "C", "rank": 1, "source_game": g2.code},
-             {"round_number": 1, "name": "D", "rank": 1, "source_game": g2.code}],
+            [{"round_number": 1, "name": "A", "rank": 1, "source_game": g1.code, "target_game": None},
+             {"round_number": 1, "name": "C", "rank": 1, "source_game": g2.code, "target_game": None},
+             {"round_number": 1, "name": "D", "rank": 1, "source_game": g2.code, "target_game": None}],
         )
 
     def test_top_2_uses_competition_ranks(self):
@@ -2003,9 +2009,16 @@ class TournamentDetailAndRule5Tests(TournamentTestBase):
             [{"name": "A", "score": 5, "rank": 1}, {"name": "B", "score": 3, "rank": 2}],
         )
         self.assertIsNone(by_code[live.code]["standings"])
+        # §F2 (#20): advancer rows gained id/target_game/claimed ADDITIVELY —
+        # assertion moved in the same session. `live` is the ONLY round-2
+        # game when Advance runs, so §F1b's auto-target fires (advance-time
+        # direction) and shows up right here; nothing is claimed yet.
+        (adv_row,) = body["advancers"]
+        self.assertIsInstance(adv_row.pop("id"), int)
         self.assertEqual(
-            body["advancers"],
-            [{"round_number": 1, "name": "A", "rank": 1, "source_game": g1.code}],
+            adv_row,
+            {"round_number": 1, "name": "A", "rank": 1, "source_game": g1.code,
+             "target_game": live.code, "claimed": False},
         )
 
     def test_no_question_content_anywhere_in_tournament_payloads(self):
@@ -2092,6 +2105,318 @@ class SnapshotTournamentTests(TournamentTestBase):
         self.assertEqual(self.client.get(f"/api/tournaments/{snap_id}/").status_code, 401)
         self.as_rival()
         self.assertEqual(self.client.get(f"/api/tournaments/{snap_id}/").status_code, 404)
+
+
+# --- Handoff #20: §F1 advancer↔participant linkage + §F3 seat claims --------
+
+
+class AdvancerLinkageTests(TournamentTestBase):
+    """§F1d: source_participant on every row, C-1's inclusive cut PINNED
+    (advance_round was already `rank <= per_game` — this stops a refactor
+    from unpinning it), re-run correctness, the §F1c claim-ledger
+    constraint, and C-4's auto-target from BOTH directions."""
+
+    def setUp(self):
+        super().setUp()
+        self.t = self.make_tournament(name="Linkage Cup")
+
+    def test_advancers_carry_source_participant(self):
+        game = self.attached_game(self.t)
+        players = self.score_and_finish(game, {"A": 5, "B": 3})
+        rows = advance_round(tournament=self.t, round_number=1, per_game=2)
+        by_name = {r.name: r for r in rows}
+        self.assertEqual(by_name["A"].source_participant_id, players["A"].pk)
+        self.assertEqual(by_name["B"].source_participant_id, players["B"].pk)
+
+    def test_tie_at_the_qualifying_cut_advances_everyone_in_it(self):
+        # C-1: two teams share rank 2 under per_game=2 → BOTH advance
+        # (three rows total from this game).
+        game = self.attached_game(self.t)
+        self.score_and_finish(game, {"A": 9, "B": 4, "C": 4, "D": 1})
+        rows = advance_round(tournament=self.t, round_number=1, per_game=2)
+        self.assertEqual({(r.name, r.rank) for r in rows}, {("A", 1), ("B", 2), ("C", 2)})
+
+    def test_rerun_replace_keeps_source_participant_correct(self):
+        game = self.attached_game(self.t)
+        players = self.score_and_finish(game, {"A": 5, "B": 3})
+        advance_round(tournament=self.t, round_number=1, per_game=1)
+        rows = advance_round(tournament=self.t, round_number=1, per_game=2)
+        self.assertEqual(TournamentAdvancer.objects.filter(tournament=self.t).count(), 2)
+        by_name = {r.name: r for r in rows}
+        self.assertEqual(by_name["A"].source_participant_id, players["A"].pk)
+        self.assertEqual(by_name["B"].source_participant_id, players["B"].pk)
+
+    def test_claim_ledger_constraint_holds(self):
+        # §F1c: one claim per (target game, source seat) — the DB says no
+        # to a duplicate even if every endpoint check were bypassed.
+        from django.db import IntegrityError, transaction as _tx
+
+        g1 = self.attached_game(self.t)
+        players = self.score_and_finish(g1, {"A": 5})
+        g2 = self.attached_game(self.t, round_number=2)
+        Participant.objects.create(game=g2, name="A", claimed_from=players["A"])
+        with self.assertRaises(IntegrityError):
+            with _tx.atomic():
+                Participant.objects.create(game=g2, name="A COPY", claimed_from=players["A"])
+        # …but the SAME source claiming into a DIFFERENT game is allowed
+        # (the host-retarget lane the (game, claimed_from) pair exists for).
+        g3 = self.attached_game(self.t, round_number=2)
+        Participant.objects.create(game=g3, name="A", claimed_from=players["A"])
+
+    def test_auto_target_fires_at_advance_time(self):
+        # Direction 1: the round-2 game already exists when Advance runs.
+        g1 = self.attached_game(self.t)
+        self.score_and_finish(g1, {"A": 5, "B": 3})
+        g2 = self.attached_game(self.t, round_number=2)
+        rows = advance_round(tournament=self.t, round_number=1, per_game=2)
+        self.assertEqual({r.target_game_id for r in rows}, {g2.pk})
+
+    def test_auto_target_fires_when_next_round_game_is_created_later(self):
+        # Direction 2 (the common flow): Advance first, build the board after.
+        g1 = self.attached_game(self.t)
+        self.score_and_finish(g1, {"A": 5, "B": 3})
+        advance_round(tournament=self.t, round_number=1, per_game=2)
+        self.assertEqual(
+            set(
+                TournamentAdvancer.objects.filter(tournament=self.t).values_list(
+                    "target_game", flat=True
+                )
+            ),
+            {None},
+        )
+        g2 = self.attached_game(self.t, round_number=2)
+        self.assertEqual(
+            set(
+                TournamentAdvancer.objects.filter(tournament=self.t).values_list(
+                    "target_game", flat=True
+                )
+            ),
+            {g2.pk},
+        )
+
+    def test_second_next_round_game_clears_auto_targets(self):
+        # C-4a (flagged ruling): the moment a round splits into TWO games,
+        # single-game auto-targets stop being meaningful — C-4 says
+        # multi-game rounds are host-assigned, so targets clear and the
+        # console's selector takes over. ONLY the 1→2 transition clears:
+        # a third board added to an already-host-managed round leaves the
+        # host's manual routing alone (pinned below).
+        g1 = self.attached_game(self.t)
+        self.score_and_finish(g1, {"A": 5, "B": 3})
+        g2 = self.attached_game(self.t, round_number=2)
+        advance_round(tournament=self.t, round_number=1, per_game=2)
+        g2b = self.attached_game(self.t, round_number=2)  # the split
+        targets = lambda: set(  # noqa: E731 — tiny local reader
+            TournamentAdvancer.objects.filter(tournament=self.t).values_list(
+                "target_game", flat=True
+            )
+        )
+        self.assertEqual(targets(), {None})
+        self.assertTrue(Game.objects.filter(pk=g2.pk).exists())  # nothing else touched
+        # Host routes both qualifiers by hand; a THIRD board leaves it alone.
+        TournamentAdvancer.objects.filter(tournament=self.t, name="A").update(target_game=g2)
+        TournamentAdvancer.objects.filter(tournament=self.t, name="B").update(target_game=g2b)
+        self.attached_game(self.t, round_number=2)
+        self.assertEqual(targets(), {g2.pk, g2b.pk})
+
+    def test_rerun_preserves_host_routing_in_multi_game_rounds(self):
+        # "Top-1 → top-2" must not force re-routing the winner: rows the
+        # re-run rebuilds keep their (source_game, name)-matched target;
+        # only genuinely NEW qualifiers arrive unrouted.
+        g1 = self.attached_game(self.t)
+        self.score_and_finish(g1, {"A": 5, "B": 3})
+        g2 = self.attached_game(self.t, round_number=2)
+        self.attached_game(self.t, round_number=2)  # two targets → host-assigned lane
+        advance_round(tournament=self.t, round_number=1, per_game=1)
+        TournamentAdvancer.objects.filter(tournament=self.t, name="A").update(target_game=g2)
+        rows = advance_round(tournament=self.t, round_number=1, per_game=2)
+        by_name = {r.name: r for r in rows}
+        self.assertEqual(by_name["A"].target_game_id, g2.pk)  # preserved
+        self.assertIsNone(by_name["B"].target_game_id)  # new qualifier, unrouted
+
+
+class ClaimEndpointTests(TournamentTestBase):
+    """§F3d: the full checklist — happy path end-to-end, then every
+    rejection with its structured code, plus the my_advancement block and
+    the host's target-assignment endpoint."""
+
+    def setUp(self):
+        super().setUp()
+        self.t = self.make_tournament(name="Claim Cup")
+        self.g1 = self.attached_game(self.t)
+        self.players = self.score_and_finish(self.g1, {"WINNERS": 9, "ALSO": 5, "LOSERS": 1})
+        self.g2 = self.attached_game(self.t, round_number=2)
+        advance_round(tournament=self.t, round_number=1, per_game=2)  # auto-targets g2
+
+    def claim(self, code=None, token=None):
+        return self.client.post(
+            f"/api/games/{(code or self.g2.code)}/claim/",
+            {"participant_token": token if token is not None else self.players["WINNERS"].token},
+            format="json",
+        )
+
+    def test_happy_path_finish_advance_claim_seated(self):
+        res = self.claim()
+        self.assertEqual(res.status_code, 201, res.data)
+        body = res.json()
+        # EXACTLY the join response contract: participant + token + snapshot.
+        self.assertEqual(set(body), {"participant", "participant_token", "game"})
+        seat = Participant.objects.get(game=self.g2, name="WINNERS")
+        self.assertEqual(seat.role, ParticipantRole.PLAYER)
+        self.assertEqual(seat.claimed_from_id, self.players["WINNERS"].pk)
+        self.assertEqual(body["participant"]["id"], seat.pk)
+        self.assertEqual(body["participant_token"], seat.token)
+        self.assertEqual(body["game"]["code"], self.g2.code)
+        # The new token is a REAL seat token: it rejoins like any other.
+        rejoin = self.client.post(
+            f"/api/games/{self.g2.code}/join/",
+            {"name": "WINNERS", "participant_token": seat.token},
+            format="json",
+        )
+        self.assertEqual(rejoin.status_code, 200)
+
+    def test_double_claim_409(self):
+        self.assertEqual(self.claim().status_code, 201)
+        res = self.claim()
+        self.assertEqual(res.status_code, 409)
+        self.assertEqual(res.json()["code"], "claim_already_claimed")
+
+    def test_losers_token_403(self):
+        res = self.claim(token=self.players["LOSERS"].token)
+        self.assertEqual(res.status_code, 403)
+        self.assertEqual(res.json()["code"], "claim_not_qualified")
+
+    def test_wrong_target_403(self):
+        other = self.attached_game(self.make_tournament(name="Other Cup"))
+        res = self.claim(code=other.code)
+        self.assertEqual(res.status_code, 403)
+        self.assertEqual(res.json()["code"], "claim_not_qualified")
+
+    def test_forged_and_removed_tokens_401(self):
+        self.assertEqual(self.claim(token="forged-token").status_code, 401)
+        winner = self.players["WINNERS"]
+        winner.removed_at = timezone.now()
+        winner.save(update_fields=["removed_at"])
+        self.assertEqual(self.claim().status_code, 401)  # a removed seat's token is dead
+
+    def test_target_started_409(self):
+        self.g2.status = GameStatus.ACTIVE
+        self.g2.save(update_fields=["status"])
+        res = self.claim()
+        self.assertEqual(res.status_code, 409)
+        self.assertEqual(res.json()["code"], "claim_target_started")
+
+    def test_source_unfinished_409(self):
+        # Only reachable with a hand-crafted advancer (advance requires a
+        # finished round) — pinned anyway: the check order is the contract.
+        fresh = self.attached_game(self.t)  # round 1, lobby
+        seat = Participant.objects.create(game=fresh, name="EARLY")
+        TournamentAdvancer.objects.create(
+            tournament=self.t, round_number=1, name="EARLY", source_game=fresh,
+            rank=1, source_participant=seat, target_game=self.g2,
+        )
+        res = self.claim(token=seat.token)
+        self.assertEqual(res.status_code, 409)
+        self.assertEqual(res.json()["code"], "claim_source_unfinished")
+
+    def test_name_conflict_exact_shape(self):
+        # C-8: a walk-up already took the name → structured, NAMED, no
+        # silent suffixing; the host resolves and the team re-taps.
+        self.client.post(f"/api/games/{self.g2.code}/join/", {"name": "WINNERS"}, format="json")
+        res = self.claim()
+        self.assertEqual(res.status_code, 409)
+        body = res.json()
+        self.assertEqual(set(body), {"detail", "code", "name"})
+        self.assertEqual(body["code"], "claim_name_taken")
+        self.assertEqual(body["name"], "WINNERS")
+        # host kicks the walk-up → the claim goes through
+        walkup = Participant.objects.get(game=self.g2, name="WINNERS")
+        walkup.removed_at = timezone.now()
+        walkup.save(update_fields=["removed_at"])
+        self.assertEqual(self.claim().status_code, 201)
+
+    def test_full_target_gets_the_pinned_game_full_shape(self):
+        # Flagged ruling: the cap holds for claims too, with the EXACT
+        # game_full contract the join endpoint pins.
+        for i in range(6):
+            self.client.post(f"/api/games/{self.g2.code}/join/", {"name": f"WALKUP {i}"}, format="json")
+        res = self.claim()
+        self.assertEqual(res.status_code, 409)
+        body = res.json()
+        self.assertEqual(set(body), {"detail", "code", "limit"})
+        self.assertEqual(body["code"], "game_full")
+
+    def test_unassigned_advancer_cannot_claim(self):
+        # C-4: no target (round split, host hasn't routed yet) → the phone
+        # shows "ask your host"; a direct POST is claim_not_qualified.
+        TournamentAdvancer.objects.filter(tournament=self.t).update(target_game=None)
+        res = self.claim()
+        self.assertEqual(res.status_code, 403)
+        self.assertEqual(res.json()["code"], "claim_not_qualified")
+
+    def test_my_advancement_block_and_privacy(self):
+        code = self.g1.code
+        winner_token = self.players["WINNERS"].token
+        # No seat param → null (the WS-broadcast equivalence).
+        self.assertIsNone(self.client.get(f"/api/games/{code}/").json()["my_advancement"])
+        # Loser's token → null (indistinguishable from not-yet-advanced).
+        loser = self.client.get(f"/api/games/{code}/?seat={self.players['LOSERS'].token}").json()
+        self.assertIsNone(loser["my_advancement"])
+        # Winner's token → the pinned block; rank + target + claimed only —
+        # never ids, never tokens (§B rule 5).
+        snap = self.client.get(f"/api/games/{code}/?seat={winner_token}").json()
+        block = snap["my_advancement"]
+        self.assertEqual(set(block), {"rank", "target", "claimed"})
+        self.assertEqual(block["rank"], 1)
+        self.assertFalse(block["claimed"])
+        self.assertEqual(
+            block["target"], {"code": self.g2.code, "status": "lobby", "round_number": 2}
+        )
+        self.assertNotIn(winner_token, json.dumps(snap["my_advancement"]))
+        # After the claim, the same poll flips claimed.
+        self.claim()
+        block = self.client.get(f"/api/games/{code}/?seat={winner_token}").json()["my_advancement"]
+        self.assertTrue(block["claimed"])
+        # A bogus seat token → null, not an error (display-only sugar).
+        self.assertIsNone(
+            self.client.get(f"/api/games/{code}/?seat=nonsense").json()["my_advancement"]
+        )
+        # Unfinished tournament game → null even for a real seat.
+        g3 = self.attached_game(self.t, round_number=2)
+        seat = Participant.objects.create(game=g3, name="EAGER")
+        self.assertIsNone(
+            self.client.get(f"/api/games/{g3.code}/?seat={seat.token}").json()["my_advancement"]
+        )
+
+    def test_target_assignment_endpoint(self):
+        advancer = TournamentAdvancer.objects.filter(tournament=self.t, name="WINNERS").get()
+        url = f"/api/tournaments/{self.t.pk}/advancers/{advancer.pk}/target/"
+        g2b = self.attached_game(self.t, round_number=2)  # split → targets cleared (C-4a)
+        advancer.refresh_from_db()
+        self.assertIsNone(advancer.target_game_id)
+        # Assign to the second round-2 game.
+        res = self.client.post(url, {"game": g2b.code.lower()}, format="json")  # case-insensitive
+        self.assertEqual(res.status_code, 200, res.data)
+        self.assertEqual(res.json()["target_game"], g2b.code)
+        # Wrong round → 400; foreign game → 400.
+        res = self.client.post(url, {"game": self.g1.code}, format="json")
+        self.assertEqual(res.status_code, 400)
+        foreign = make_game(self.rival)
+        res = self.client.post(url, {"game": foreign.code}, format="json")
+        self.assertEqual(res.status_code, 400)
+        # Clear with null.
+        res = self.client.post(url, {"game": None}, format="json")
+        self.assertEqual(res.status_code, 200)
+        self.assertIsNone(res.json()["target_game"])
+        # Owner-scoped 404 + the pinned finished 409.
+        self.as_rival()
+        self.assertEqual(self.client.post(url, {"game": g2b.code}, format="json").status_code, 404)
+        self.as_host()
+        self.t.finished_at = timezone.now()
+        self.t.save(update_fields=["finished_at"])
+        res = self.client.post(url, {"game": g2b.code}, format="json")
+        self.assertEqual(res.status_code, 409)
+        self.assertEqual(res.json()["code"], "tournament_finished")
 
 
 # --- Handoff #18: §F5 hand-picked boards + §F4/§F7/§F8 hosting gates --------

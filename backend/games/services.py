@@ -298,6 +298,8 @@ def create_game(
             BoardCell.objects.create(
                 game=game, column=column, question=question, row=row, value=_cell_value(mode, row)
             )
+    if tournament is not None:
+        _auto_target_advancers(tournament=tournament, next_round=round_number)
     return game
 
 
@@ -715,28 +717,42 @@ def finalize_game(*, code: str) -> Game:
 # --- §I (Handoff #13): tournament standings + advancement -------------------
 
 
-def game_standings(game) -> list[dict]:
-    """§I2: {name, score, rank} rows for one game's ACTIVE players, best
-    first — computed from the SAME truths finalize_game uses (highest score
-    among role=player, removed excluded; the documented drinks-mode reading:
-    score is the credit side, so highest score == most drinks dealt).
-    Competition ranking (1, 1, 3): ties share a rank, exactly as ties share
-    the winners crown. Names only + scores — rule 5: no question content on
-    any tournament surface. Filters the PREFETCHED participants in Python
-    (the get_participants convention) so detail views pay no extra query."""
+def ranked_players(game) -> list[tuple]:
+    """§F1a (Handoff #20): the ONE ranking computation, now returning the
+    Participant rows themselves — [(participant, rank), ...] best first —
+    so advance_round can link advancers to the seats that earned them.
+    Everything §I2 documented is unchanged and lives here: ACTIVE players
+    only (role=player, removed excluded), the SAME truths finalize_game
+    uses (the documented drinks-mode reading: score is the credit side, so
+    highest score == most drinks dealt), competition ranking (1, 1, 3) —
+    ties share a rank, exactly as ties share the winners crown. Filters the
+    PREFETCHED participants in Python (the get_participants convention) so
+    detail views pay no extra query. INTERNAL: participants never leave the
+    server through this — public callers go through game_standings below."""
     players = [
         p for p in game.participants.all()
         if p.role == ParticipantRole.PLAYER and p.removed_at is None
     ]
     players.sort(key=lambda p: (-p.score, p.name))
-    standings = []
+    ranked = []
     prev_score = None
     prev_rank = 0
     for position, player in enumerate(players, start=1):
         rank = prev_rank if player.score == prev_score else position
-        standings.append({"name": player.name, "score": player.score, "rank": rank})
+        ranked.append((player, rank))
         prev_score, prev_rank = player.score, rank
-    return standings
+    return ranked
+
+
+def game_standings(game) -> list[dict]:
+    """§I2: {name, score, rank} rows for one game's ACTIVE players, best
+    first — the PUBLIC projection of ranked_players above, and the pinned
+    shape for every tournament surface (rule 5: names + scores only; no
+    question content, no participant ids, no tokens)."""
+    return [
+        {"name": player.name, "score": player.score, "rank": rank}
+        for player, rank in ranked_players(game)
+    ]
 
 
 @transaction.atomic
@@ -778,18 +794,66 @@ def advance_round(*, tournament, round_number: int, per_game: int) -> list:
             f"Round {round_number} isn't finished — still playing: {', '.join(sorted(unfinished))}.",
             "tournament_round_incomplete",
         )
+    prior_targets = {
+        (a.source_game_id, a.name): a.target_game_id
+        for a in TournamentAdvancer.objects.filter(
+            tournament=locked, round_number=round_number, target_game__isnull=False
+        )
+    }
     TournamentAdvancer.objects.filter(tournament=locked, round_number=round_number).delete()
+    # §F1a (#20): rows now carry the SEAT that earned them (ranked_players,
+    # the same computation game_standings projects) — the linkage the claim
+    # endpoint verifies. Names stay what advances (the #13 ruling, upgraded).
     rows = [
         TournamentAdvancer(
             tournament=locked,
             round_number=round_number,
-            name=entry["name"],
+            name=player.name,
             source_game=game,
-            rank=entry["rank"],
+            rank=rank,
+            source_participant=player,
         )
         for game in games
-        for entry in game_standings(game)
-        if entry["rank"] <= per_game
+        for player, rank in ranked_players(game)
+        if rank <= per_game
     ]
+    # §F1b/C-4: exactly one next-round game already there → every advancer
+    # auto-targets it, set BEFORE the insert (one write, and a re-run
+    # re-derives it — replaced rows would otherwise come back targetless).
+    # Multi-game next round: a re-run PRESERVES the host's routing for rows
+    # that survive it, matched by (source_game, name) — "top-1 → top-2"
+    # must not force re-routing the winner who was already assigned; only
+    # genuinely new qualifiers arrive unrouted.
+    next_games = list(locked.games.filter(round_number=round_number + 1))
+    if len(next_games) == 1:
+        for row in rows:
+            row.target_game = next_games[0]
+    elif prior_targets:
+        for row in rows:
+            row.target_game_id = prior_targets.get((row.source_game_id, row.name))
     TournamentAdvancer.objects.bulk_create(rows)
     return rows
+
+
+def _auto_target_advancers(*, tournament, next_round: int) -> None:
+    """§F1b (Handoff #20), the CREATION side of C-4's gap-closer: called
+    after a tournament game is created in `next_round`. If that round now
+    has exactly ONE game, every round-(N-1) advancer targets it (the common
+    flow: host advances first, builds the next board second). The moment a
+    SECOND game appears in the round, single-game auto-targets stop being
+    meaningful — C-4 says multi-game rounds are host-assigned — so targets
+    pointing into the round are CLEARED and the console's per-advancer
+    selector takes over (flagged ruling C-4a in CHANGES: qualifiers see
+    "ask your host" until assigned, which beats phones claiming into a game
+    the host is about to split)."""
+    from .models import TournamentAdvancer  # local, matching advance_round
+
+    round_games = list(tournament.games.filter(round_number=next_round))
+    prior = TournamentAdvancer.objects.filter(tournament=tournament, round_number=next_round - 1)
+    if len(round_games) == 1:
+        prior.update(target_game=round_games[0])
+    elif len(round_games) == 2:
+        # Exactly the 1→2 transition: whatever targets exist were the
+        # single-game AUTO ones, now stale. Rounds already at 2+ games are
+        # host-managed — adding a 4th board must not wipe manual routing.
+        prior.filter(target_game__round_number=next_round).update(target_game=None)

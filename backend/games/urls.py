@@ -5,12 +5,14 @@ from .views import (
     ColumnCategoryReplaceView,
     GameAnswerView,
     GameBoardDetailView,
+    GameClaimView,
     GameCreateView,
     GameHistoryView,
     GameHostSeatView,
     GameJoinView,
     GameReportView,
     GameStateView,
+    TournamentAdvancerTargetView,
     TournamentAdvanceView,
     TournamentDetailView,
     TournamentFinishView,
@@ -24,6 +26,10 @@ urlpatterns = [
     path("games/history/", GameHistoryView.as_view(), name="game-history"),
     path("games/<str:code>/", GameStateView.as_view(), name="game-state"),
     path("games/<str:code>/join/", GameJoinView.as_view(), name="game-join"),
+    # §F3a (#20): a qualifier claims their next-round seat, authenticated by
+    # their previous round's participant token (body). Static child segment
+    # under <code> like join/answer — no swallowing risk.
+    path("games/<str:code>/claim/", GameClaimView.as_view(), name="game-claim"),
     path("games/<str:code>/answer/", GameAnswerView.as_view(), name="game-answer"),
     path("games/<str:code>/report/", GameReportView.as_view(), name="game-report"),
     # Handoff #8: §I host-seat recovery, §J3 lobby preview + replace.
@@ -48,5 +54,11 @@ urlpatterns = [
         "tournaments/<int:pk>/rounds/<int:round_number>/advance/",
         TournamentAdvanceView.as_view(),
         name="tournament-advance",
+    ),
+    # §F2 (#20): per-advancer target assignment (C-4's multi-game lane).
+    path(
+        "tournaments/<int:pk>/advancers/<int:advancer_id>/target/",
+        TournamentAdvancerTargetView.as_view(),
+        name="tournament-advancer-target",
     ),
 ]

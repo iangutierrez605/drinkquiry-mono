@@ -821,7 +821,7 @@ code { font-family: var(--font-mono); color: var(--accent); font-size: 0.9em; }
    ~12–16 of them, the ellipsis handles the rest). */
 .tv__takeoverName {
   font-family: var(--font-display);
-  font-size: clamp(56px, 13vw, 200px);
+  font-size: clamp(56px, 13vw, 100px);
   line-height: 1.02;
   letter-spacing: 0.04em;
   color: var(--accent);
@@ -1559,3 +1559,31 @@ code { font-family: var(--font-mono); color: var(--accent); font-size: 0.9em; }
 .packstrip__item strong { color: var(--accent); font-weight: 600; }
 .packhint { font-size: 13px; color: var(--dim); margin: -4px 0 10px; }
 .badge--pack { color: var(--accent); border-color: var(--accent); margin-left: 8px; }
+
+/* ---------- Handoff #20 ---------- */
+
+/* --- §F3b: the buzzer's self-seeding CTA --- */
+.claimbox {
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  background: var(--ink-3); border: 1px solid var(--warn);
+  border-radius: 14px; padding: 14px 18px; margin: 4px 0 10px;
+}
+.claimbox__line { margin: 0; font-weight: 600; text-align: center; }
+
+/* --- §F2: console qualifier lists + target routing --- */
+.quallist {
+  list-style: none; margin: 8px 0 0; padding: 8px 10px;
+  background: var(--ink-4); border: 1px solid var(--line); border-radius: 10px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.qualrow { display: flex; justify-content: space-between; gap: 10px; font-size: 14px; }
+.qualrow__state { color: var(--dim); font-size: 13px; }
+.qualrow__state--claimed { color: var(--accent); font-weight: 600; }
+.targetpick { margin-left: 8px; font-size: 13px; padding: 2px 6px; }
+
+/* --- §F6: pricing "how packs work" --- */
+.packsexplainer {
+  background: var(--ink-3); border: 1px solid var(--line); border-radius: 14px;
+  padding: 16px 20px; margin: 22px 0 6px;
+}
+.packsexplainer p { margin: 8px 0 0; color: var(--dim); line-height: 1.55; }

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import { api, errorText, ApiError, SUPPORT_EMAIL } from "../lib/api";
 import { clearSeat, loadSeat, saveSeat } from "../lib/storage";
 import { useGameSocket } from "../lib/useGameSocket";
@@ -9,16 +9,24 @@ import { FinalStandings, ScoreStrip, Toast } from "../components/shared";
 export default function BuzzerPage() {
   const { code = "" } = useParams();
   const upper = code.toUpperCase();
-  const [seat, setSeat] = useState(() => loadSeat(upper));
+  // §F3b (#20): key by code — the claim CTA navigates this SAME route to a
+  // NEW code, and the seat state (a useState initializer reading
+  // localStorage) must re-initialize for it. A key remount is the honest
+  // way; without it the old game's seat would leak into the new code.
+  return <BuzzerSeatGate key={upper} code={upper} />;
+}
+
+function BuzzerSeatGate({ code }) {
+  const [seat, setSeat] = useState(() => loadSeat(code));
 
   const dropSeat = useCallback(() => {
-    clearSeat(upper);
+    clearSeat(code);
     setSeat(null);
-  }, [upper]);
+  }, [code]);
 
   if (!seat?.token || !seat?.participantId)
-    return <JoinForm code={upper} existing={seat} onJoined={setSeat} onDropSeat={dropSeat} />;
-  return <BuzzerLive code={upper} seat={seat} onBadSeat={dropSeat} />;
+    return <JoinForm code={code} existing={seat} onJoined={setSeat} onDropSeat={dropSeat} />;
+  return <BuzzerLive code={code} seat={seat} onBadSeat={dropSeat} />;
 }
 
 /* ---------------- Join ---------------- */
@@ -205,6 +213,66 @@ function BuzzerLive({ code, seat, onBadSeat }) {
     () => game?.participants.find((p) => p.id === seat.participantId),
     [game, seat.participantId],
   );
+
+  // §F3b (#20): tournament self-seeding. Advancement happens MINUTES after
+  // the last snapshot broadcast (the host runs Advance from the console),
+  // so the finish screen POLLS the REST snapshot with our own seat token —
+  // the one request that unlocks the additive `my_advancement` block (our
+  // seat only; rule 5 keeps everyone else's ids/tokens out of it). Hooks
+  // sit above the early returns like everything else here.
+  const [adv, setAdv] = useState(null);
+  const [claimBusy, setClaimBusy] = useState(false);
+  const [claimError, setClaimError] = useState(null);
+  const navigate = useNavigate();
+  const isFinishedTournament = game?.status === "finished" && game?.tournament != null;
+  useEffect(() => {
+    if (!isFinishedTournament) return undefined;
+    let alive = true;
+    const tick = () =>
+      api
+        .gameSnapshot(code, seat.token)
+        .then((snap) => alive && setAdv(snap.my_advancement ?? null))
+        .catch(() => {}); // display-only sugar — a failed poll just tries again
+    tick();
+    const timer = setInterval(tick, 5000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, [isFinishedTournament, code, seat.token]);
+
+  const claim = async () => {
+    if (!adv?.target) return;
+    setClaimBusy(true);
+    setClaimError(null);
+    try {
+      const res = await api.claimSeat(adv.target.code, seat.token);
+      saveSeat(adv.target.code, {
+        token: res.participant_token,
+        participantId: res.participant.id,
+        name: res.participant.name,
+        role: res.participant.role,
+      });
+      // Same route, new code — BuzzerPage's key remounts the seat gate,
+      // which finds the seat we just saved: the seamless swap.
+      navigate(`/game/buzzer/${adv.target.code}`);
+    } catch (err) {
+      const codeErr = err?.data?.code;
+      if (codeErr === "claim_name_taken") {
+        setClaimError(
+          `“${err.data.name}” is already seated in the next game — ask your host to sort it, then tap again.`,
+        );
+      } else if (codeErr === "claim_already_claimed") {
+        setClaimError("This seat was already claimed — if that wasn't your team, ask your host.");
+      } else if (codeErr === "claim_target_started") {
+        setClaimError("The next game already started — your host can still seat you by code.");
+      } else {
+        setClaimError(errorText(err));
+      }
+      setClaimBusy(false);
+    }
+  };
+
   const cell = game?.current_cell;
   // §F/§G: everything below derives from the snapshot (rule 1) — the verdict
   // marker, the once-per-cell assigned flag, and the winner check all come
@@ -290,6 +358,45 @@ function BuzzerLive({ code, seat, onBadSeat }) {
         {iAmWinner && <div className="buzzover__trophy">🏆</div>}
         <div className="buzzover__title">GAME OVER 🍻</div>
         {iAmWinner && <p className="buzzover__winner">Champions — that's you!</p>}
+        {/* §F3b (#20): the self-seeding CTA. `adv` is null until the host
+            runs Advance AND this seat qualified — losers (and everyone,
+            pre-advance) just see the normal finale. One tap when the next
+            board is in its lobby; "your host will call it" otherwise. */}
+        {adv && (
+          <div className="claimbox">
+            {adv.claimed ? (
+              <>
+                <p className="claimbox__line">Seat claimed ✓ — see you in Round {adv.target?.round_number}!</p>
+                {adv.target && (
+                  <button
+                    type="button"
+                    className="btn btn--gold btn--big"
+                    onClick={() => navigate(`/game/buzzer/${adv.target.code}`)}
+                  >
+                    Open your Round {adv.target.round_number} buzzer
+                  </button>
+                )}
+              </>
+            ) : adv.target && adv.target.status === "lobby" ? (
+              <>
+                <p className="claimbox__line">You finished #{adv.rank} — you're through! 🏆</p>
+                <button
+                  type="button"
+                  className="btn btn--gold btn--big"
+                  disabled={claimBusy}
+                  onClick={claim}
+                >
+                  {claimBusy ? "Taking your seat…" : `Take your Round ${adv.target.round_number} seat`}
+                </button>
+              </>
+            ) : (
+              <p className="claimbox__line">
+                You finished #{adv.rank} — you're through! Your host will call the next round.
+              </p>
+            )}
+            {claimError && <p className="formerror">{claimError}</p>}
+          </div>
+        )}
         <FinalStandings game={game} />
         {self && (
           <p className="buzzfinal">

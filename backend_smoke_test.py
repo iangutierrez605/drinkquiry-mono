@@ -557,9 +557,11 @@ def tournament_story(knox, fknox):
                                        "round_number": 1}, d["game"]["tournament"]
     ok(f"round-1 game {tcode} attached; snapshot tournament block exact {{id, name, location, round_number}} (§I3, amended §F4b #17)")
 
-    # One team, so advancement has someone to advance.
+    # One team, so advancement has someone to advance. #20: KEEP its token —
+    # that token is the claim credential (the whole §F3 premise).
     r = requests.post(f"{BASE}/api/games/{tcode}/join/", json={"name": "Cup Team"})
     assert r.status_code == 201, r.text
+    team_tok = r.json()["participant_token"]
 
     # Advancing before the round's games finish → the pinned 409.
     r = requests.post(f"{BASE}/api/tournaments/{tid}/rounds/1/advance/", headers=hh, json={"per_game": 1})
@@ -597,6 +599,68 @@ def tournament_story(knox, fknox):
     assert "question_text" not in blob and "SECRET" not in blob, \
         "rule 5: no question content in tournament payloads"
     ok("detail: game standings + advancers; NO question content anywhere in the payload (§I2, rule 5)")
+
+    # --- Handoff #20: the winners seat THEMSELVES ---------------------------
+    # 1) Pre-round-2: the buzzer's poll (snapshot + own seat token) says
+    #    "through, no target yet" — and says NOTHING to anyone else.
+    r = requests.get(f"{BASE}/api/games/{tcode}/?seat={team_tok}")
+    adv_block = r.json()["my_advancement"]
+    assert adv_block == {"rank": 1, "target": None, "claimed": False}, adv_block
+    assert requests.get(f"{BASE}/api/games/{tcode}/").json()["my_advancement"] is None
+    ok("my_advancement: {rank 1, target null, claimed false} for the OWN seat token; null without it (§F3b, rule 5)")
+
+    # 2) Create the round-2 game — C-4's creation-side auto-target closes
+    #    the gap (advance ran first; this is the common host flow).
+    r = requests.post(f"{BASE}/api/games/", headers=hh,
+                      json={"mode": "points", "categories": [cats[0]["id"]],
+                            "questions_per_category": 1, "tournament": tid, "round_number": 2})
+    assert r.status_code == 201, r.text
+    r2code = r.json()["game"]["code"]
+    adv_block = requests.get(f"{BASE}/api/games/{tcode}/?seat={team_tok}").json()["my_advancement"]
+    assert adv_block == {"rank": 1,
+                         "target": {"code": r2code, "status": "lobby", "round_number": 2},
+                         "claimed": False}, adv_block
+    ok(f"round-2 game {r2code} created → auto-target fired (creation direction, §F1b/C-4); poll shows the lobby target")
+
+    # 3) Denials FIRST (order-independent of the happy claim): the host's
+    #    seat never advances (403), a forged token is 401.
+    r = requests.post(f"{BASE}/api/games/{r2code}/claim/", json={"participant_token": ttok})
+    assert r.status_code == 403 and r.json()["code"] == "claim_not_qualified", r.text
+    r = requests.post(f"{BASE}/api/games/{r2code}/claim/", json={"participant_token": "forged"})
+    assert r.status_code == 401, r.text
+    ok("claim denials: host seat → 403 claim_not_qualified; forged token → 401 (§F3a)")
+
+    # 4) The one tap: round-1 token in, round-2 seat out — the join contract.
+    r = requests.post(f"{BASE}/api/games/{r2code}/claim/", json={"participant_token": team_tok})
+    assert r.status_code == 201, r.text
+    claim = r.json()
+    assert set(claim) == {"participant", "participant_token", "game"}, claim.keys()
+    assert claim["participant"]["name"] == "CUP TEAM" and claim["game"]["code"] == r2code, claim
+    r2names = [p["name"] for p in requests.get(f"{BASE}/api/games/{r2code}/").json()["participants"]
+               if p["role"] == "player"]
+    assert r2names == ["CUP TEAM"], r2names
+    ok(f"CLAIM: round-1 token → seated in {r2code} as CUP TEAM, join-shaped response (§F3a)")
+
+    # 5) Double-claim 409; the poll now says claimed; the console shows ✓.
+    r = requests.post(f"{BASE}/api/games/{r2code}/claim/", json={"participant_token": team_tok})
+    assert r.status_code == 409 and r.json()["code"] == "claim_already_claimed", r.text
+    adv_block = requests.get(f"{BASE}/api/games/{tcode}/?seat={team_tok}").json()["my_advancement"]
+    assert adv_block["claimed"] is True, adv_block
+    (adv_row,) = requests.get(f"{BASE}/api/tournaments/{tid}/", headers=hh).json()["advancers"]
+    assert adv_row["target_game"] == r2code and adv_row["claimed"] is True, adv_row
+    ok("double-claim → 409 claim_already_claimed; poll + console both read claimed ✓ (§F1c ledger)")
+
+    # 6) Re-run Advance (the host changed their mind): rows REPLACE, the
+    #    target re-derives, and the claimed seat neither duplicates nor
+    #    orphans — the §F1c design claim, live.
+    r = requests.post(f"{BASE}/api/tournaments/{tid}/rounds/1/advance/", headers=hh, json={"per_game": 2})
+    assert r.status_code == 200, r.text
+    (adv_row,) = requests.get(f"{BASE}/api/tournaments/{tid}/", headers=hh).json()["advancers"]
+    assert adv_row["target_game"] == r2code and adv_row["claimed"] is True, adv_row
+    r2names = [p["name"] for p in requests.get(f"{BASE}/api/games/{r2code}/").json()["participants"]
+               if p["role"] == "player"]
+    assert r2names == ["CUP TEAM"], r2names
+    ok("re-run Advance → rows replaced, target re-derived, ONE seat still — nothing duplicated (§F1c)")
 
 def password_flows(knox, fknox):
     """Handoff #9 §K4 — RE-RUNNABLE by construction: the smoke user's

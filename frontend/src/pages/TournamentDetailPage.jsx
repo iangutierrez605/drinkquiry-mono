@@ -129,6 +129,20 @@ function TournamentDetailBody({ auth }) {
   const rounds = [...byRound.keys()].sort((a, b) => a - b);
   const nextRound = rounds.length ? rounds[rounds.length - 1] + 1 : 1;
   const advancersFor = (round) => t.advancers.filter((a) => a.round_number === round);
+  // §F2 (#20): the host routes qualifiers when a round splits into several
+  // games (C-4; one game auto-targets server-side). Same reload-after-write
+  // convention as advance — the server's payload is the truth.
+  const setTarget = async (advancerId, gameCode) => {
+    setBusy(true);
+    try {
+      await api.setAdvancerTarget(auth.token, id, advancerId, gameCode || null);
+      reload();
+    } catch (err) {
+      setLoadError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <div className="page page--wide">
@@ -213,6 +227,28 @@ function TournamentDetailBody({ auth }) {
                 ) : (
                   <p className="footnote">Standings appear when the game finishes.</p>
                 )}
+                {/* §F2b (#20): who belongs in THIS lobby — the qualifiers
+                    routed here, each with claim state. This list is the
+                    truth teams re-join by if phones go missing (C-6). */}
+                {g.status === "lobby" &&
+                  (() => {
+                    const quals = t.advancers.filter((a) => a.target_game === g.code);
+                    if (!quals.length) return null;
+                    return (
+                      <ul className="quallist">
+                        {quals.map((a) => (
+                          <li key={a.id} className="qualrow">
+                            <span>{a.name}</span>
+                            {a.claimed ? (
+                              <span className="qualrow__state qualrow__state--claimed">claimed ✓</span>
+                            ) : (
+                              <span className="qualrow__state">waiting</span>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    );
+                  })()}
               </div>
             ))}
 
@@ -220,11 +256,36 @@ function TournamentDetailBody({ auth }) {
               <div className="advancerbox">
                 <strong>Going through:</strong>
                 <ul className="advancerlist">
-                  {advancersFor(round).map((a) => (
-                    <li key={`${a.source_game}-${a.name}`}>
-                      {a.name} <span className="footnote">(#{a.rank} in {a.source_game})</span>
-                    </li>
-                  ))}
+                  {advancersFor(round).map((a) => {
+                    // §F2a (#20): with several next-round games the host
+                    // routes each qualifier (C-4); with exactly one the
+                    // server auto-targets and this just shows it.
+                    const nextGames = byRound.get(round + 1) || [];
+                    return (
+                      <li key={a.id ?? `${a.source_game}-${a.name}`}>
+                        {a.name} <span className="footnote">(#{a.rank} in {a.source_game})</span>
+                        {a.claimed && <span className="qualrow__state qualrow__state--claimed"> claimed ✓</span>}
+                        {!finished && !a.claimed && nextGames.length > 1 && (
+                          <select
+                            className="targetpick"
+                            value={a.target_game || ""}
+                            disabled={busy}
+                            onChange={(e) => setTarget(a.id, e.target.value || null)}
+                          >
+                            <option value="">— ask your host —</option>
+                            {nextGames.map((ng) => (
+                              <option key={ng.code} value={ng.code}>
+                                → {ng.code}
+                              </option>
+                            ))}
+                          </select>
+                        )}
+                        {!a.claimed && nextGames.length <= 1 && a.target_game && (
+                          <span className="footnote"> → {a.target_game}</span>
+                        )}
+                      </li>
+                    );
+                  })}
                 </ul>
               </div>
             )}
@@ -252,8 +313,8 @@ function TournamentDetailBody({ auth }) {
           <section className="roundcol roundcol--next">
             <h2 className="roundcol__title">Round {nextRound}</h2>
             <p className="footnote">
-              Advance round {nextRound - 1} first, then build the next board — advancing teams re-join the new
-              game's code under the same name.
+              Advance round {nextRound - 1} first, then build the next board — winning phones get a
+              one-tap "take your seat" the moment it's in the lobby (joining by code always works too).
             </p>
             <Link className="btn btn--gold" to={`/host?tournament=${t.id}&round=${nextRound}`}>
               New game in round {nextRound}

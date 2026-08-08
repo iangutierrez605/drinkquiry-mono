@@ -160,16 +160,22 @@ def pack_question_denial(entitlement, count: int = 1) -> dict | None:
     return {"detail": detail, "code": code, "used": used, "limit": limit}
 
 
-def pack_category_denial(entitlement) -> dict | None:
-    """§F4: bound-category count is small-capped (catalog category_limit,
-    default 5 — flagged). Same house shape, code quota_pack_categories."""
+def category_limit_for_kind(kind):
+    """§F5 (#20): the catalog's category cap for a pack kind — the ONE
+    lookup pack_category_denial and entitlement_usage_summary share
+    (10 / 20 / 40 after C-7; None for account-scoped kinds)."""
     from .catalog import PRODUCTS
 
-    limit = None
     for entry in PRODUCTS.values():
-        if entry["kind"] == entitlement.kind and not entry.get("reactivation_of"):
-            limit = entry.get("category_limit")
-            break
+        if entry["kind"] == kind and not entry.get("reactivation_of"):
+            return entry.get("category_limit")
+    return None
+
+
+def pack_category_denial(entitlement) -> dict | None:
+    """§F4: bound-category count is small-capped (catalog category_limit).
+    Same house shape, code quota_pack_categories."""
+    limit = category_limit_for_kind(entitlement.kind)
     if limit is None:
         return None
     used = pack_categories_used(entitlement)
@@ -238,10 +244,14 @@ def entitlement_usage_summary(user) -> list[dict]:
     """§F2/§F7: the profile `usage.entitlements` block AND the /status/
     entitlements list share this shape (pinned by tests):
     {id, kind, is_active, active_from, active_until, question_limit,
-     questions_used, game_limit, active_questions?} — active_questions only
-    on venue kinds."""
+     questions_used, game_limit, category_limit, categories_used,
+     active_questions?} — active_questions only on venue kinds; the §F5
+    (#20) category pair mirrors questions_used (bound kinds count, the
+    rest read null). ADDITIVE per §B — the pinned shape assertions moved
+    in this same commit (billing StatusViewTests)."""
     rows = []
     for ent in user_entitlements(user).order_by("-created_at", "-id"):
+        bound = ent.kind in BOUND_KINDS
         row = {
             "id": ent.id,
             "kind": ent.kind,
@@ -249,8 +259,10 @@ def entitlement_usage_summary(user) -> list[dict]:
             "active_from": ent.active_from.isoformat() if ent.active_from else None,
             "active_until": ent.active_until.isoformat() if ent.active_until else None,
             "question_limit": ent.question_limit,
-            "questions_used": pack_questions_used(ent) if ent.kind in BOUND_KINDS else None,
+            "questions_used": pack_questions_used(ent) if bound else None,
             "game_limit": ent.game_limit,
+            "category_limit": category_limit_for_kind(ent.kind) if bound else None,
+            "categories_used": pack_categories_used(ent) if bound else None,
         }
         if ent.kind in VENUE_KINDS:
             row["active_questions"] = {

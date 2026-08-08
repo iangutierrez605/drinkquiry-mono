@@ -118,6 +118,21 @@ export default function PricingPage() {
           </div>
         </div>
       )}
+      {/* §F6 (#20): how packs actually work — the four facts buyers ask
+          about, in product voice (the PLAIN money copy stays below). */}
+      <section className="packsexplainer">
+        <h2 className="h2">How packs work</h2>
+        <p>
+          A pack is a question budget that lives inside its own private pack
+          categories — your questions, kept in their own corner. Boards can
+          mix and match: pack columns next to free-library columns on the
+          same night, no ceremony. The one rule is that a single question
+          picks a side — it lives in pack categories or in your regular
+          ones, never both. Packs run for 30 days of hosting and editing;
+          after that everything you wrote is kept safe and read-only, ready
+          the moment you reactivate.
+        </p>
+      </section>
       <div className="pricing-fineprint">
         {/* Plain voice from here down (rule 8). */}
         <p>

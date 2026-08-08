@@ -85,9 +85,21 @@ function ProfileBody({ auth, onAuthGone }) {
               {profile.display_name || (profile.email || "").split("@")[0]}
             </div>
             <div className="idblock__mail">{profile.email}</div>
-            <span className={`planchip ${profile.plan !== "free" ? "planchip--paid" : ""}`}>
-              {profile.plan} plan
-            </span>
+            {/* §F4 (#20): EFFECTIVE standing, not the raw plan field —
+                buyers stay plan:"free" forever (§A.1), so a paying Big
+                Game buyer must not read "free plan" here. Precedence:
+                manual plan name → best ACTIVE entitlement (venue kinds,
+                else the soonest-expiring pack) → free. Cosmetic only; the
+                capability gates were already right. ManageUsers keeps the
+                raw plan column on purpose (ops needs the manual lane). */}
+            {(() => {
+              const standing = effectiveStanding(profile);
+              return (
+                <span className={`planchip ${standing.paid ? "planchip--paid" : ""}`}>
+                  {standing.label}
+                </span>
+              );
+            })()}
           </div>
           <DisplayNameEdit
             token={auth.token}
@@ -173,6 +185,30 @@ function daysLeft(iso) {
   if (!iso) return null;
   const ms = new Date(iso).getTime() - Date.now();
   return Math.max(0, Math.ceil(ms / 86400000));
+}
+
+/**
+ * §F4 (#20): what the idblock chip should SAY. A manual plan keeps its
+ * honest name; else the best ACTIVE entitlement speaks — venue kinds as
+ * "Venue · active", else the soonest-expiring pack as "Big Game pack ·
+ * 23 days left" (KIND_LABELS + daysLeft reused); else "free plan".
+ */
+function effectiveStanding(profile) {
+  if (profile.plan !== "free") return { label: `${profile.plan} plan`, paid: true };
+  const active = (profile.usage?.entitlements || []).filter((e) => e.is_active);
+  const venue = active.find((e) => e.kind === "venue" || e.kind === "venue_tournament");
+  if (venue) return { label: `${KIND_LABELS[venue.kind] || venue.kind} · active`, paid: true };
+  const packs = active
+    .filter((e) => e.active_until)
+    .sort((a, b) => new Date(a.active_until) - new Date(b.active_until));
+  if (packs.length) {
+    const left = daysLeft(packs[0].active_until);
+    return {
+      label: `${KIND_LABELS[packs[0].kind] || packs[0].kind} pack · ${left} day${left === 1 ? "" : "s"} left`,
+      paid: true,
+    };
+  }
+  return { label: "free plan", paid: false };
 }
 
 /**

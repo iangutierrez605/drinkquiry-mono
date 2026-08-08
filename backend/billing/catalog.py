@@ -42,7 +42,7 @@ PRODUCTS = {
         "kind": EntitlementKind.BIG_PACK,
         "mode": "payment",
         "price_env": "STRIPE_PRICE_BIG_GAME_100",
-        "display_price": "$19.99",
+        "display_price": "$14.99",
         "interval": None,
         "question_limit": 100,
         "game_limit": None,
@@ -78,7 +78,10 @@ PRODUCTS = {
         "game_limit": 6,
         "window_days": 30,
         "storage_bytes": 200 * MB,
-        "category_limit": 5,
+        # C-7 (#20, flagged): 5 → 40, completing the #19.1 ratio the other
+        # packs follow (5 questions per category: 50/10, 100/20, 200/40).
+        # One number to change if the owner rules otherwise.
+        "category_limit": 40,
         "enabled": True,
         "blurb": "One full tournament: up to 6 games and 200 questions, 30 days to run it.",
     },

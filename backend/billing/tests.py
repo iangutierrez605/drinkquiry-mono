@@ -182,6 +182,26 @@ class CatalogTests(Base):
         coming = {row["key"]: row["coming_soon"] for row in rows}
         self.assertTrue(coming["venue_tournament_monthly"])  # C-4
 
+    def test_category_caps_follow_the_five_per_category_ratio(self):
+        # #19.1 set 50/10 and 100/20; C-7 (#20) completes the ratio for the
+        # tournament pass: 200 questions / 40 categories. ONE place to edit
+        # if the owner rules otherwise — this pin moves with it.
+        from .catalog import PRODUCTS
+
+        self.assertEqual(PRODUCTS["party_game_50"]["category_limit"], 10)
+        self.assertEqual(PRODUCTS["big_game_100"]["category_limit"], 20)
+        self.assertEqual(PRODUCTS["tournament_pass"]["category_limit"], 40)
+
+    def test_category_limit_for_kind_reads_the_catalog(self):
+        # §F5 (#20): the shared lookup entitlement_usage_summary and
+        # pack_category_denial both ride — reactivation rows never shadow
+        # the real product entry; account-scoped kinds read None.
+        from .access import category_limit_for_kind
+
+        self.assertEqual(category_limit_for_kind(EntitlementKind.PARTY_PACK), 10)
+        self.assertEqual(category_limit_for_kind(EntitlementKind.TOURNAMENT_PASS), 40)
+        self.assertIsNone(category_limit_for_kind(EntitlementKind.VENUE))
+
 
 class BillingDisabledTests(Base):
     def test_keyless_checkout_and_portal_503(self):
@@ -672,14 +692,19 @@ class StatusViewTests(Base):
         body = self.client.get("/api/billing/status/?session=cs_test_1").json()
         self.assertTrue(body["session"]["paid"])
         ent_row = body["entitlements"][0]
+        # §F5 (#20): the ADDITIVE category pair — this exact-set assertion
+        # moved in the same commit that added the keys (§B rule).
         self.assertEqual(
             set(ent_row),
             {
                 "id", "kind", "is_active", "active_from", "active_until",
                 "question_limit", "questions_used", "game_limit",
+                "category_limit", "categories_used",
             },
         )
         self.assertEqual(ent_row["questions_used"], 0)
+        self.assertEqual(ent_row["categories_used"], 0)
+        self.assertEqual(ent_row["category_limit"], 10)  # party_game_50, #19.1's cap
         # A foreign session id resolves to null, not someone else's purchase.
         other = User.objects.create_user("other@test.com", "sturdy-pass-123")
         purchase.user = other

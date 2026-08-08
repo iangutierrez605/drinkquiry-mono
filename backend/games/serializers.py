@@ -147,6 +147,17 @@ class GameStateSerializer(serializers.ModelSerializer):
     # plan-gated on serve: creation was the gate — hiding "Round 2" on a
     # mid-tournament plan lapse would break a live event (CHANGES.md).
     tournament = serializers.SerializerMethodField()
+    # §F3b (Handoff #20): tournament self-seeding, YOUR OWN seat only —
+    # null on every snapshot EXCEPT the REST GET carrying a valid
+    # `?seat=<participant_token>` for a FINISHED tournament game (the view
+    # resolves the token to `seat_participant` in context; WS broadcasts are
+    # group-shared, so they can never carry it by construction). Shape:
+    # null | {"rank", "target": {"code","status","round_number"}|null,
+    # "claimed"} — the target's join code is projector-public already; no
+    # participant ids or tokens, ever (§B rule 5). Null is deliberately
+    # ambiguous between "host hasn't advanced yet" and "didn't qualify" —
+    # the host announces results, not this payload.
+    my_advancement = serializers.SerializerMethodField()
     # §H1 (Handoff #10): cells not yet ANSWERED — derived here, never stored,
     # so the snapshot stays the source of truth and BOTH transports (WS and
     # the polling board) get it for free (C2). An OPEN cell still counts as
@@ -168,7 +179,7 @@ class GameStateSerializer(serializers.ModelSerializer):
             # a public field is #14 territory after clients migrate — §M).
             "code", "mode", "status", "questions_per_category", "buzz_sound", "max_players",
             "cells_remaining", "buzzer_open", "current_cell", "revealed_answer", "columns",
-            "participants", "former_players", "brand", "tournament", "created_at",
+            "participants", "former_players", "brand", "tournament", "my_advancement", "created_at",
         )
 
     def get_participants(self, game):
@@ -234,6 +245,38 @@ class GameStateSerializer(serializers.ModelSerializer):
         # backend_smoke_test.py's tournament story.
         return {"id": t.id, "name": t.name, "location": location, "round_number": game.round_number}
 
+    def get_my_advancement(self, game):
+        seat = self.context.get("seat_participant")
+        if (
+            seat is None
+            or seat.game_id != game.id
+            or game.status != GameStatus.FINISHED
+            or game.tournament_id is None
+        ):
+            return None
+        advancer = (
+            TournamentAdvancer.objects.select_related("target_game")
+            .filter(source_participant=seat, source_game=game)
+            .order_by("-id")
+            .first()
+        )
+        if advancer is None:
+            return None
+        target = advancer.target_game
+        claimed = (
+            target is not None
+            and Participant.objects.filter(game=target, claimed_from=seat).exists()
+        )
+        return {
+            "rank": advancer.rank,
+            "target": (
+                {"code": target.code, "status": target.status, "round_number": target.round_number}
+                if target is not None
+                else None
+            ),
+            "claimed": claimed,
+        }
+
     def get_cells_remaining(self, game):
         # Counted from the SAME prefetched columns/cells `columns` serializes
         # in this pass (every snapshot caller prefetches columns__cells) —
@@ -295,10 +338,18 @@ class TournamentSerializer(serializers.ModelSerializer):
 
 class TournamentAdvancerSerializer(serializers.ModelSerializer):
     source_game = serializers.CharField(source="source_game.code", read_only=True)
+    # §F2 (#20), additive: `id` so the host's target selector can address a
+    # row; `target_game` as a CODE (a projected join code — the one currency
+    # tournament payloads already speak; §F1's participant linkage stays
+    # internal, §B). Null target = "ask your host" on the qualifier's phone.
+    target_game = serializers.SerializerMethodField()
 
     class Meta:
         model = TournamentAdvancer
-        fields = ("round_number", "name", "rank", "source_game")
+        fields = ("id", "round_number", "name", "rank", "source_game", "target_game")
+
+    def get_target_game(self, advancer):
+        return advancer.target_game.code if advancer.target_game_id else None
 
 
 class TournamentGameSerializer(serializers.ModelSerializer):
@@ -328,10 +379,30 @@ class TournamentDetailSerializer(TournamentSerializer):
     queries."""
 
     games = TournamentGameSerializer(many=True, read_only=True)
-    advancers = TournamentAdvancerSerializer(many=True, read_only=True)
+    # §F2 (#20): the control room additionally needs claim STATE — one bulk
+    # query over the tournament's claimed seats, matched to advancer rows in
+    # Python (never per-row queries). "Claimed" reads the §F1c ledger
+    # directly, removed seats included: the ledger is the truth (a kicked
+    # claimed seat still spent its claim; C-6's join-by-code is the recovery).
+    advancers = serializers.SerializerMethodField()
 
     class Meta(TournamentSerializer.Meta):
         fields = TournamentSerializer.Meta.fields + ("games", "advancers")
+
+    def get_advancers(self, tournament):
+        rows = list(tournament.advancers.all())
+        claimed_pairs = set(
+            Participant.objects.filter(
+                claimed_from__isnull=False, game__tournament=tournament
+            ).values_list("game_id", "claimed_from_id")
+        )
+        data = TournamentAdvancerSerializer(rows, many=True).data
+        for row, advancer in zip(data, rows):
+            row["claimed"] = (
+                advancer.target_game_id is not None
+                and (advancer.target_game_id, advancer.source_participant_id) in claimed_pairs
+            )
+        return data
 
 
 class JoinGameSerializer(serializers.Serializer):

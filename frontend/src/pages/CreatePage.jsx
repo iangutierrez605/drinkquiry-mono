@@ -266,6 +266,8 @@ function PackMeterStrip({ entitlements }) {
       {active.map((e) => {
         const bits = [];
         if (e.question_limit != null) bits.push(`${e.questions_used}/${e.question_limit} questions`);
+        // §F5 (#20): the category pair, straight from the same usage row.
+        if (e.category_limit != null) bits.push(`${e.categories_used}/${e.category_limit} categories`);
         if (e.active_questions)
           bits.push(`${e.active_questions.used}/${e.active_questions.limit} active questions`);
         const left = daysLeft(e.active_until);
@@ -380,9 +382,13 @@ function CategoryForm({ auth, entitlements, accountOpen, onSaved, onToast }) {
               <option value="account">My library (account plan)</option>
               {packs.map((p) => {
                 const left = daysLeft(p.active_until);
+                // §F5 (#20): the option says how much category room the
+                // pack has left — the same numbers as the strip above.
+                const cats =
+                  p.category_limit != null ? ` · ${p.categories_used}/${p.category_limit} categories` : "";
                 return (
                   <option key={p.id} value={String(p.id)}>
-                    {KIND_LABELS[p.kind] || p.kind} pack
+                    {KIND_LABELS[p.kind] || p.kind} pack{cats}
                     {left != null ? ` · ${left} day${left === 1 ? "" : "s"} left` : ""}
                   </option>
                 );
